@@ -22,7 +22,7 @@ $running = @(Get-EmulatorSerials)
 if ($running) {
     $name = (& $Adb -s $running[0] emu avd name 2>$null | Select-Object -First 1)
     if ($name) { $name = $name.Trim() }
-    if ($name -eq $Avd) { Write-Host "$Avd is already running."; Write-Output $running[0]; return }
+    if ($name -eq $Avd) { Write-Host "$Avd is already running."; Write-Output $running[0]; exit 0 }
     throw "Emulator $($running -join ', ') ($name) is already running. Run .\stop.ps1 -All first (plain .\stop.ps1 only stops kin_* AVDs)."
 }
 
