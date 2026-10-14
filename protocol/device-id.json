@@ -1,0 +1,85 @@
+{
+  "description": "Device ID and encoding vectors. Spec: docs/protocol.md, \"Encodings\". deviceId = base64url-no-padding(SHA-256(DER SubjectPublicKeyInfo)); shortId = first 8 characters of RFC 4648 base32 (uppercase, no padding) of the same raw 32-byte hash.",
+  "WARNING": "TEST-ONLY KEYS. Every private key in this file was generated just for these vectors, is public, and must never be used by the apps or for anything real. Secret scanners will flag them; that is expected.",
+  "specVersion": 1,
+  "howToRead": "keys[]: from privateKeyPkcs8Pem derive the public key and its DER SPKI (must equal spkiDerHex, 91 bytes for P-256), then deviceId and shortId. certificatePem is a self-signed certificate over the same key: extracting its SPKI must give the same spkiDerHex (this is how the PC reads a phone certificate and the phone reads the PC certificate). Every certificatePem follows the certificate profile in docs/protocol.md, Transport: X.509 v3, ECDSA P-256 key, ecdsa-with-SHA256, serial positive and at most 20 bytes, no critical extension. certificateVariant is minimal (no extensions at all, 307 or 308 bytes: use it as the template for a hand-written DER) or with-noncritical-extension (one non-critical subjectKeyIdentifier, to prove that non-critical extensions are accepted). hashVectors[]: raw 32-byte hash in, deviceId and shortId out. tokenVectors[]: 16 raw bytes in, 22-character base64url token out. shapeVectors[]: is this string a valid-shaped device ID or token (length and alphabet only).",
+  "keys": [
+    {
+      "name": "test-key-1 (used as the PC in the other vector files; id has both - and _)",
+      "testOnly": true,
+      "privateKeyPkcs8Pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg6N19BuJMIltGy6QN\nUKtUGkcSTDMPxgUhYSj6Yi5EZrqhRANCAATJNbV2RgYOnX94CHPLhh+cztp/qcpr\nkSORkGkUbluyH+dPofaX5Gozn3ZABDjNReOVhFf3CW5oOEutWFdxfa6J\n-----END PRIVATE KEY-----\n",
+      "certificatePem": "-----BEGIN CERTIFICATE-----\nMIIBMzCB2qADAgECAhRytkTyhVtBUE4Yy2yc102wh5rWADAKBggqhkjOPQQDAjAZ\nMRcwFQYDVQQDDA5raW4tdGVzdC1rZXktMTAgFw0yNjEwMTQxNDM2MjdaGA8yMTI2\nMDkyMDE0MzYyN1owGTEXMBUGA1UEAwwOa2luLXRlc3Qta2V5LTEwWTATBgcqhkjO\nPQIBBggqhkjOPQMBBwNCAATJNbV2RgYOnX94CHPLhh+cztp/qcprkSORkGkUbluy\nH+dPofaX5Gozn3ZABDjNReOVhFf3CW5oOEutWFdxfa6JMAoGCCqGSM49BAMCA0gA\nMEUCIQDNhu/XIgAgQHhC+ZEoYXCrTZbI/RwCWOU5+UuMBkkMEgIgSNzbkQmJZ/29\ndldBe4+tKMy0k+1ajSBzDlzACxBBaGM=\n-----END CERTIFICATE-----\n",
+      "certificateVariant": "minimal",
+      "spkiDerHex": "3059301306072a8648ce3d020106082a8648ce3d03010703420004c935b57646060e9d7f780873cb861f9cceda7fa9ca6b9123919069146e5bb21fe74fa1f697e46a339f76400438cd45e3958457f7096e68384bad5857717dae89",
+      "spkiLength": 91,
+      "sha256Hex": "c9eb4ec091cefb796259ab9e7cbbf666cf3f34d224458bf2eff8b94411be7cff",
+      "deviceId": "yetOwJHO-3liWauefLv2Zs8_NNIkRYvy7_i5RBG-fP8",
+      "shortId": "ZHVU5QER"
+    },
+    {
+      "name": "test-key-2 (used as the paired phone in the other vector files; id has both - and _)",
+      "testOnly": true,
+      "privateKeyPkcs8Pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgGV/ZQZBltrHZHYAS\ni3CAWSGc/No7n7S6nMIesa5NVOKhRANCAARwqQXpSVYhZ0M3yXzc2+zOLUW/scZN\nzGSg5cqaH5fFNBjQMT6ISDoAiZTfzHCU0GJ1MnxbeMIsjnKei6oyn+NB\n-----END PRIVATE KEY-----\n",
+      "certificatePem": "-----BEGIN CERTIFICATE-----\nMIIBMzCB2qADAgECAhRZPwNmHsWWoPPSmy6n9rREcOrgHzAKBggqhkjOPQQDAjAZ\nMRcwFQYDVQQDDA5raW4tdGVzdC1rZXktMjAgFw0yNjEwMTQxNDM2MjdaGA8yMTI2\nMDkyMDE0MzYyN1owGTEXMBUGA1UEAwwOa2luLXRlc3Qta2V5LTIwWTATBgcqhkjO\nPQIBBggqhkjOPQMBBwNCAARwqQXpSVYhZ0M3yXzc2+zOLUW/scZNzGSg5cqaH5fF\nNBjQMT6ISDoAiZTfzHCU0GJ1MnxbeMIsjnKei6oyn+NBMAoGCCqGSM49BAMCA0gA\nMEUCIQCx5d2/qEGvsFR+Sh79Marx4dkwxOY+CGWmoItL3e5fTwIgMOUPR2it2KMK\nh5yIsZ7bmXn0VKqEf99nKt8ak/qOgJU=\n-----END CERTIFICATE-----\n",
+      "certificateVariant": "minimal",
+      "spkiDerHex": "3059301306072a8648ce3d020106082a8648ce3d0301070342000470a905e9495621674337c97cdcdbecce2d45bfb1c64dcc64a0e5ca9a1f97c53418d0313e88483a008994dfcc7094d06275327c5b78c22c8e729e8baa329fe341",
+      "spkiLength": 91,
+      "sha256Hex": "62826a7eed95fd8f82816ba72e85d58b1e118aea94381fce9da2faf1eb67f4ee",
+      "deviceId": "YoJqfu2V_Y-CgWunLoXVix4RiuqUOB_OnaL68etn9O4",
+      "shortId": "MKBGU7XN"
+    },
+    {
+      "name": "test-key-3 (id has - but no _)",
+      "testOnly": true,
+      "privateKeyPkcs8Pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg6Z2qHvRPtPZ6t7GX\nkJqqT7BOeGJjQaM4C5k07X7zH2uhRANCAASHVsMAeNmOBLPbrIpm3xFxxVFkU+Pc\noyKNVtBiOcrGXDLpwcth0U5sC1g7SCKE0UPCUbGxSTNY7gMtRf82w+W1\n-----END PRIVATE KEY-----\n",
+      "certificatePem": "-----BEGIN CERTIFICATE-----\nMIIBNDCB2qADAgECAhRld2v2SDDtBytlrxu+5BR4FYmDrTAKBggqhkjOPQQDAjAZ\nMRcwFQYDVQQDDA5raW4tdGVzdC1rZXktMzAgFw0yNjEwMTQxNDM2MjdaGA8yMTI2\nMDkyMDE0MzYyN1owGTEXMBUGA1UEAwwOa2luLXRlc3Qta2V5LTMwWTATBgcqhkjO\nPQIBBggqhkjOPQMBBwNCAASHVsMAeNmOBLPbrIpm3xFxxVFkU+PcoyKNVtBiOcrG\nXDLpwcth0U5sC1g7SCKE0UPCUbGxSTNY7gMtRf82w+W1MAoGCCqGSM49BAMCA0kA\nMEYCIQCrh1wqY7i1tWZkaTgaGOkK5Lwmaj1bvQlKx3T+WXf7QgIhAKt9dQLgLy8p\nXl0+jvHfy6+Jsix9pgqbtb5yZUjWgQ+w\n-----END CERTIFICATE-----\n",
+      "certificateVariant": "minimal",
+      "spkiDerHex": "3059301306072a8648ce3d020106082a8648ce3d030107034200048756c30078d98e04b3dbac8a66df1171c5516453e3dca3228d56d06239cac65c32e9c1cb61d14e6c0b583b482284d143c251b1b1493358ee032d45ff36c3e5b5",
+      "spkiLength": 91,
+      "sha256Hex": "3f5dd1d237c69fc529e3ab1b10dce51a00f28bee60129a16e9dd22d9432bee97",
+      "deviceId": "P13R0jfGn8Up46sbENzlGgDyi-5gEpoW6d0i2UMr7pc",
+      "shortId": "H5O5DURX"
+    },
+    {
+      "name": "test-key-4 (id has _ but no -)",
+      "testOnly": true,
+      "privateKeyPkcs8Pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgqK0GQ0LIZjBCWeXJ\nSM8aDEvZvAdTHzKfmRsilGmBGwWhRANCAATNKSkt/fm2o4nmESdqitOsY0oLvXVC\nM57q2q8M/St7MF26Aaqd9rOrqaQZ2dvt0SChDW9oKSjF96MWIbWozIwH\n-----END PRIVATE KEY-----\n",
+      "certificatePem": "-----BEGIN CERTIFICATE-----\nMIIBVzCB/aADAgECAhRXDlc8qiiZbpQiBQfLtrujSsLqFDAKBggqhkjOPQQDAjAZ\nMRcwFQYDVQQDDA5raW4tdGVzdC1rZXktNDAgFw0yNjEwMTQxNDM2MjdaGA8yMTI2\nMDkyMDE0MzYyN1owGTEXMBUGA1UEAwwOa2luLXRlc3Qta2V5LTQwWTATBgcqhkjO\nPQIBBggqhkjOPQMBBwNCAATNKSkt/fm2o4nmESdqitOsY0oLvXVCM57q2q8M/St7\nMF26Aaqd9rOrqaQZ2dvt0SChDW9oKSjF96MWIbWozIwHoyEwHzAdBgNVHQ4EFgQU\nFw5LeMq8pQHTPoeT99Mhkoe9p/EwCgYIKoZIzj0EAwIDSQAwRgIhAMhQ7ozzAh5T\nif9SKzNEozwm+qRb9LY3MR9at870gGCWAiEAqHCIehIhA7LhHav71U5r29GTdpP8\nFuDWzd9TOkR9bNk=\n-----END CERTIFICATE-----\n",
+      "certificateVariant": "with-noncritical-extension",
+      "spkiDerHex": "3059301306072a8648ce3d020106082a8648ce3d03010703420004cd29292dfdf9b6a389e611276a8ad3ac634a0bbd7542339eeadaaf0cfd2b7b305dba01aa9df6b3aba9a419d9dbedd120a10d6f682928c5f7a31621b5a8cc8c07",
+      "spkiLength": 91,
+      "sha256Hex": "54ed4f2ffe5a47013f8c6456f613d93d00d40e27376dfbd49172fdcef3422d3d",
+      "deviceId": "VO1PL_5aRwE_jGRW9hPZPQDUDic3bfvUkXL9zvNCLT0",
+      "shortId": "KTWU6L76"
+    }
+  ],
+  "hashVectors": [
+    {"name":"all-zero-hash","sha256Hex":"0000000000000000000000000000000000000000000000000000000000000000","deviceId":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","shortId":"AAAAAAAA"},
+    {"name":"all-ff-hash","sha256Hex":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","deviceId":"__________________________________________8","shortId":"77777777"},
+    {"name":"ascending-bytes-00-to-1f","sha256Hex":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","deviceId":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8","shortId":"AAAQEAYE"},
+    {"name":"pattern-fb-ef-forces-plus-and-slash-in-standard-base64","sha256Hex":"fbeffbeffbeffbeffbeffbeffbeffbeffbeffbeffbeffbeffbeffbeffbeffbef","deviceId":"--_77_vv--_77_vv--_77_vv--_77_vv--_77_vv--8","shortId":"7PX7X373"},
+    {"name":"sha256-of-empty-input-as-arbitrary-bytes","sha256Hex":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","deviceId":"47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU","shortId":"4OYMIQUY"}
+  ],
+  "tokenVectors": [
+    {"name":"all-zero-token","bytesHex":"00000000000000000000000000000000","token":"AAAAAAAAAAAAAAAAAAAAAA"},
+    {"name":"all-ff-token","bytesHex":"ffffffffffffffffffffffffffffffff","token":"_____________________w"},
+    {"name":"ascending-bytes-00-to-0f","bytesHex":"000102030405060708090a0b0c0d0e0f","token":"AAECAwQFBgcICQoLDA0ODw"},
+    {"name":"pattern-fb-ef","bytesHex":"fbeffbeffbeffbeffbeffbeffbeffbef","token":"--_77_vv--_77_vv--_77w"},
+    {"name":"bytes-f8-to-07","bytesHex":"f8f9fafbfcfdfeff0001020304050607","token":"-Pn6-_z9_v8AAQIDBAUGBw"}
+  ],
+  "shapeVectors": [
+    {"kind":"deviceId","value":"yetOwJHO-3liWauefLv2Zs8_NNIkRYvy7_i5RBG-fP8","valid":true},
+    {"kind":"deviceId","value":"yetOwJHO-3liWauefLv2Zs8_NNIkRYvy7_i5RBG-fP","valid":false,"reason":"42 characters"},
+    {"kind":"deviceId","value":"yetOwJHO-3liWauefLv2Zs8_NNIkRYvy7_i5RBG-fP8A","valid":false,"reason":"44 characters"},
+    {"kind":"deviceId","value":"yetOwJHO-3liWauefLv2Zs8_NNIkRYvy7_i5RBG-fP8=","valid":false,"reason":"padding is not allowed"},
+    {"kind":"deviceId","value":"yetOwJHO+3liWauefLv2Zs8_NNIkRYvy7_i5RBG-fP8","valid":false,"reason":"+ is standard base64, not base64url"},
+    {"kind":"deviceId","value":"yetOwJHO-3liWauefLv2Zs8/NNIkRYvy7_i5RBG-fP8","valid":false,"reason":"/ is standard base64, not base64url"},
+    {"kind":"deviceId","value":"yetOwJHO-3liWauefLv2Zs8_NNIkRYvy7_i5RBG-fP ","valid":false,"reason":"space"},
+    {"kind":"deviceId","value":"","valid":false,"reason":"empty"},
+    {"kind":"token","value":"AAECAwQFBgcICQoLDA0ODw","valid":true},
+    {"kind":"token","value":"AAECAwQFBgcICQoLDA0OD","valid":false,"reason":"21 characters"},
+    {"kind":"token","value":"AAECAwQFBgcICQoLDA0ODwA","valid":false,"reason":"23 characters"},
+    {"kind":"token","value":"AAECAwQFBgcICQoLDA0ODw==","valid":false,"reason":"padding is not allowed"},
+    {"kind":"token","value":"yetOwJHO-3liWauefLv2Zs8_NNIkRYvy7_i5RBG-fP8","valid":false,"reason":"a device ID is not a token (wrong length)"}
+  ]
+}
