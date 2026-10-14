@@ -12,7 +12,7 @@ use serde_json::json;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use crate::connections::{ConnCommand, PingOutcome};
+use crate::connections::{ConnCommand, SendOutcome};
 use crate::core::{APP_VERSION, Core, Event, short};
 use crate::encoding::{unix_ms, uuid_v7};
 use crate::messages::{self, Action, Dedup, Frame, Outcome, Receiver, Role};
@@ -47,7 +47,7 @@ impl Dedup for DbDedup<'_> {
 
 struct Pending {
     sent: Instant,
-    reply: oneshot::Sender<PingOutcome>,
+    reply: oneshot::Sender<SendOutcome>,
 }
 
 /// How a connection ended, for the log and for what to send.
@@ -178,7 +178,7 @@ impl Conn {
                     self.pending.iter().filter(|(_, p)| now >= p.sent + ACK_TIMEOUT).map(|(id, _)| id.clone()).collect();
                 for id in late {
                     if let Some(p) = self.pending.remove(&id) {
-                        let _ = p.reply.send(PingOutcome::NoReply);
+                        let _ = p.reply.send(SendOutcome::NoReply);
                     }
                 }
                 End::Close { code: messages::CLOSE_NORMAL, reason: "no ack within 5 s".into() }
@@ -215,7 +215,7 @@ impl Conn {
             Action::HandshakeOk => self.on_hello(),
             Action::MarkDelivered { reference } => {
                 if let Some(p) = self.pending.remove(&reference) {
-                    let _ = p.reply.send(PingOutcome::Ack(p.sent.elapsed()));
+                    let _ = p.reply.send(SendOutcome::Ack(p.sent.elapsed()));
                 } else if self.unpair.as_ref().is_some_and(|(id, _)| *id == reference) {
                     return Some(End::Close { code: messages::CLOSE_NORMAL, reason: "unpaired".into() });
                 }
@@ -223,7 +223,7 @@ impl Conn {
             Action::MarkFailed { reference, code } => {
                 log::warn!("phone answered with an error ({code})");
                 if let Some(p) = self.pending.remove(&reference) {
-                    let _ = p.reply.send(PingOutcome::Failed(code));
+                    let _ = p.reply.send(SendOutcome::Failed(code));
                 }
             }
             Action::ShowPingToast => {
@@ -231,14 +231,11 @@ impl Conn {
                 log::info!("ping from {name}");
                 self.core.emit(Event::Toast(format!("Ping from {name}")));
             }
-            // Acked as the protocol says. What to do with the text (clipboard, history) is milestone 1.2, and the text itself
-            // is never logged.
-            Action::DeliverText { text, .. } => {
-                log::info!(
-                    "text message from device {}: {} characters (not delivered anywhere yet)",
-                    short(&self.device_id),
-                    text.chars().count()
-                );
+            // The `ack` is out already (acks are due as soon as the message is valid and recorded). Now the text goes to the
+            // clipboard and a toast. The text itself is never logged.
+            Action::DeliverText { id, text, is_url } => {
+                let from = self.receiver.peer().map_or("phone".to_string(), |p| p.name.clone());
+                self.core.receive_text(&self.device_id, &from, &id, text, is_url).await;
             }
             Action::RemovePeerAndClose => {
                 self.unpaired = true;
@@ -248,7 +245,8 @@ impl Conn {
                 }
                 self.core.emit(Event::PairingChanged);
             }
-            Action::None | Action::ShowErrorOnly | Action::IgnoreDuplicate | Action::CloseOnly => {}
+            // A `clipboard` message only goes PC to phone: the receiver answers `unsupported_type` before it gets here.
+            Action::None | Action::ShowErrorOnly | Action::IgnoreDuplicate | Action::CloseOnly | Action::SetClipboard { .. } => {}
         }
         outcome.close.map(|code| End::Close { code, reason: close_reason(code).into() })
     }
@@ -282,21 +280,17 @@ impl Conn {
         match cmd {
             ConnCommand::Close { code, reason } => Some(End::Close { code, reason: reason.into() }),
             ConnCommand::Ping(reply) => {
-                if !self.receiver.is_open() {
-                    let _ = reply.send(PingOutcome::NotConnected);
-                    return None;
-                }
                 let id = uuid_v7(unix_ms());
-                let sent = Instant::now();
                 let frame = json!({ "type": "ping", "id": id, "sentAt": unix_ms() });
-                if let Err(e) = self.send(&frame).await {
-                    let _ = reply.send(PingOutcome::NotConnected);
-                    return Some(End::Error(e));
-                }
-                log::info!("ping sent to device {}", short(&self.device_id));
-                self.pending.insert(id, Pending { sent, reply });
-                None
+                self.send_tracked(id, frame, reply).await
             }
+            ConnCommand::Send { frame, reply } => match frame.get("id").and_then(|v| v.as_str()).map(str::to_string) {
+                Some(id) => self.send_tracked(id, frame, reply).await,
+                None => {
+                    let _ = reply.send(SendOutcome::Failed("internal".into()));
+                    None
+                }
+            },
             ConnCommand::Unpair => {
                 let id = uuid_v7(unix_ms());
                 match self.send(&json!({ "type": "unpair", "id": id })).await {
@@ -309,6 +303,23 @@ impl Conn {
                 }
             }
         }
+    }
+
+    /// Sends a message that needs an `ack` and waits for it: `Timer::Ack` ends the connection after 5 s, and `on_message`
+    /// resolves it when the `ack` (or an `error`) with this `ref` arrives. The frame's content is not logged, only its type.
+    async fn send_tracked(&mut self, id: String, frame: serde_json::Value, reply: oneshot::Sender<SendOutcome>) -> Option<End> {
+        if !self.receiver.is_open() {
+            let _ = reply.send(SendOutcome::NotConnected);
+            return None;
+        }
+        let sent = Instant::now();
+        if let Err(e) = self.send(&frame).await {
+            let _ = reply.send(SendOutcome::NotConnected);
+            return Some(End::Error(e));
+        }
+        log::info!("{} {id} sent to device {}", frame["type"].as_str().unwrap_or("message"), short(&self.device_id));
+        self.pending.insert(id, Pending { sent, reply });
+        None
     }
 
     async fn send(&mut self, value: &serde_json::Value) -> Result<(), String> {
@@ -333,7 +344,7 @@ impl Conn {
             End::Error(text) => (text, None),
         };
         for (_, p) in self.pending.drain() {
-            let _ = p.reply.send(PingOutcome::NotConnected);
+            let _ = p.reply.send(SendOutcome::NotConnected);
         }
         let current = self.core.connections.remove(&self.device_id, self.conn_id);
         if self.hello_accepted {

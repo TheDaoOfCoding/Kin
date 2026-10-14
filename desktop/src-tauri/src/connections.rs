@@ -10,11 +10,12 @@ use tokio::sync::oneshot;
 
 use crate::messages::{CLOSE_REPLACED, CLOSE_UNAUTHORIZED};
 
-#[derive(Debug)]
-pub enum PingOutcome {
-    /// The round-trip time, measured with a monotonic clock from sending the `ping` to the matching `ack`.
+/// How a message that needs an `ack` (`ping`, `text`, `clipboard`) ended.
+#[derive(Debug, PartialEq)]
+pub enum SendOutcome {
+    /// The round-trip time, measured with a monotonic clock from sending the message to the matching `ack`.
     Ack(Duration),
-    /// No `ack` within 5 seconds. The connection is closed as dead right after.
+    /// No `ack` within 5 seconds. The connection is closed as dead right after, so the phone counts as offline.
     NoReply,
     /// The phone answered with an `error` instead of an `ack`.
     Failed(String),
@@ -26,7 +27,13 @@ pub enum ConnCommand {
         code: u16,
         reason: &'static str,
     },
-    Ping(oneshot::Sender<PingOutcome>),
+    Ping(oneshot::Sender<SendOutcome>),
+    /// Send this message (it has an `id`) and report the `ack`. Used for `text` and `clipboard`. The connection checks that
+    /// it is open, and that is all it does with the frame.
+    Send {
+        frame: serde_json::Value,
+        reply: oneshot::Sender<SendOutcome>,
+    },
     /// Tell the phone it was removed: an `unpair` message, then close after the `ack` (or 5 seconds).
     Unpair,
 }

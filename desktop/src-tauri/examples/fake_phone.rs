@@ -1,9 +1,16 @@
 //! A fake phone for manual checks of a running Kin, with no Android involved. It pairs from a pairing URL, opens the WebSocket,
-//! says `hello`, acks every `ping` it gets, and can send pings of its own.
+//! says `hello`, acks every `ping`, `text` and `clipboard` it gets, and can send pings and `text` messages of its own.
 //!
 //! ```text
 //! cargo run --example fake_phone -- "<kinrelay://pair?...>" --host 127.0.0.1 [--name "Fake Phone"] [--seconds 30] [--ping-every 5]
+//!     [--send-text "some text" [--send-text-after 2]] [--no-ack]
 //! ```
+//!
+//! * `--send-text <text>` sends one `text` message `--send-text-after` seconds (default 2) after the `hello`, with `isUrl` set when the
+//!   whole text is one http(s) link, and prints how long its `ack` took. Repeat the flag to send several, one per second.
+//! * `--no-ack` doesn't ack `text` and `clipboard` from the PC (to see the PC's 5 s ack timeout and its notice).
+//! * What it receives is printed on one line each, for scripts to look for: `received clipboard id=<id> text=<text>` and
+//!   `received text id=<id> isUrl=<bool> text=<text>`. (This is a developer tool: it prints the text. Kin itself never logs it.)
 //!
 //! `--host` replaces the host of the first address in the URL (in developer mode that is `10.0.2.2`, the emulator's alias for
 //! the PC, which the PC itself can't reach). The port is the one in the URL. The phone's key is made fresh on every run.
@@ -72,6 +79,16 @@ fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
 }
 
+/// Every value of a flag that can be given more than once.
+fn all_args(args: &[String], name: &str) -> Vec<String> {
+    args.iter().enumerate().filter(|(_, a)| *a == name).filter_map(|(i, _)| args.get(i + 1)).cloned().collect()
+}
+
+/// The same rule as `isUrl` in protocol.md, for this tool: the whole text, trimmed, is one http(s) URL.
+fn is_url(text: &str) -> bool {
+    kin_lib::links::is_http_url(text)
+}
+
 fn param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     query.split('&').find_map(|p| p.strip_prefix(name)?.strip_prefix('='))
 }
@@ -92,6 +109,9 @@ async fn main() {
     let name = arg(&args, "--name").unwrap_or_else(|| "Fake Phone".to_string());
     let seconds: u64 = arg(&args, "--seconds").map_or(30, |s| s.parse().unwrap());
     let ping_every: Option<u64> = arg(&args, "--ping-every").map(|s| s.parse().unwrap());
+    let texts = all_args(&args, "--send-text");
+    let send_text_after: u64 = arg(&args, "--send-text-after").map_or(2, |s| s.parse().unwrap());
+    let no_ack = args.iter().any(|a| a == "--no-ack");
 
     let me = Identity::generate().unwrap();
     say(&format!("my device ID is {}", me.device_id));
@@ -140,11 +160,29 @@ async fn main() {
     let mut next_ping = ping_every.map(|s| Instant::now() + Duration::from_secs(s));
     let mut sent: Option<(String, Instant)> = None;
     let mut counter = 0;
+    let mut texts = texts.into_iter().enumerate();
+    let mut next_text = Instant::now() + Duration::from_secs(send_text_after);
+    let mut text_sent: Option<(String, Instant)> = None;
+    let mut pending_text = texts.next();
     loop {
-        let wake = next_ping.map_or(deadline, |p| p.min(deadline));
+        let mut wake = next_ping.map_or(deadline, |p| p.min(deadline));
+        if pending_text.is_some() {
+            wake = wake.min(next_text);
+        }
         tokio::select! {
             () = tokio::time::sleep_until(wake.into()) => {
                 if Instant::now() >= deadline { break; }
+                if let Some((i, text)) = pending_text.take().filter(|_| Instant::now() >= next_text) {
+                    let id = format!("fake-text-{}", i + 1);
+                    let frame = json!({ "type": "text", "id": id, "text": text, "isUrl": is_url(&text) });
+                    ws.send(Message::Text(frame.to_string().into())).await.unwrap();
+                    say(&format!("sent text id={id} isUrl={}", is_url(&text)));
+                    text_sent = Some((id, Instant::now()));
+                    pending_text = texts.next();
+                    next_text = Instant::now() + Duration::from_secs(1);
+                    continue;
+                }
+                if pending_text.is_some() && next_ping.is_none_or(|p| Instant::now() < p) { continue; }
                 counter += 1;
                 let id = format!("fake-ping-{counter}");
                 ws.send(Message::Text(json!({ "type": "ping", "id": id, "sentAt": kin_lib::encoding::unix_ms() }).to_string().into())).await.unwrap();
@@ -162,6 +200,21 @@ async fn main() {
                         Some("ack") => {
                             if let Some((id, at)) = sent.take().filter(|(id, _)| v["ref"] == *id) {
                                 say(&format!("ack for {id} after {} ms", at.elapsed().as_millis()));
+                            } else if let Some((id, at)) = text_sent.take().filter(|(id, _)| v["ref"] == *id) {
+                                say(&format!("ack for text {id} after {} ms", at.elapsed().as_millis()));
+                            }
+                        }
+                        Some(kind @ ("clipboard" | "text")) => {
+                            let text = v["text"].as_str().unwrap_or("");
+                            if kind == "text" {
+                                say(&format!("received text id={} isUrl={} text={text}", v["id"], v["isUrl"]));
+                            } else {
+                                say(&format!("received clipboard id={} text={text}", v["id"]));
+                            }
+                            if no_ack {
+                                say("not acking (--no-ack)");
+                            } else {
+                                ws.send(Message::Text(json!({ "type": "ack", "ref": v["id"] }).to_string().into())).await.unwrap();
                             }
                         }
                         Some("unpair") => {

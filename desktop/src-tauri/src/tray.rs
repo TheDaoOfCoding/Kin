@@ -1,7 +1,8 @@
 //! The tray icon: its icon and tooltip show the state (not paired, phone connected, phone offline), and the menu has the
-//! status line, "Pair new phone", "Ping phone", "Open log folder" and "Quit".
+//! status line, "Send clipboard to phone", "Pair new phone", "Ping phone", the clipboard sync check item, "Open log folder"
+//! and "Quit".
 use tauri::image::Image;
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{App, AppHandle, Wry};
 
@@ -10,6 +11,8 @@ use crate::core::{LinkState, Snapshot};
 pub const TRAY_ID: &str = "kin";
 pub const MENU_PAIR: &str = "pair";
 pub const MENU_PING: &str = "ping";
+pub const MENU_SEND_CLIPBOARD: &str = "send_clipboard";
+pub const MENU_AUTO_SYNC: &str = "auto_sync";
 pub const MENU_LOGS: &str = "logs";
 pub const MENU_QUIT: &str = "quit";
 
@@ -18,6 +21,8 @@ const ICON_SIZE: usize = 64;
 
 pub struct Tray {
     status: MenuItem<Wry>,
+    /// "Sync clipboard automatically". Windows flips the check by itself when it is clicked.
+    pub auto_sync: CheckMenuItem<Wry>,
     /// The icon without a state dot, at `ICON_SIZE`.
     base: (Vec<u8>, usize),
 }
@@ -98,13 +103,26 @@ fn status_line(snapshot: &Snapshot) -> String {
 
 pub fn build(app: &App, snapshot: &Snapshot) -> tauri::Result<Tray> {
     let status = MenuItem::with_id(app, "status", status_line(snapshot), false, None::<&str>)?;
+    let send = MenuItem::with_id(app, MENU_SEND_CLIPBOARD, "Send clipboard to phone", true, None::<&str>)?;
     let pair = MenuItem::with_id(app, MENU_PAIR, "Pair new phone", true, None::<&str>)?;
     let ping = MenuItem::with_id(app, MENU_PING, "Ping phone", true, None::<&str>)?;
+    let auto_sync =
+        CheckMenuItem::with_id(app, MENU_AUTO_SYNC, "Sync clipboard automatically", true, snapshot.auto_clipboard_sync, None::<&str>)?;
     let logs = MenuItem::with_id(app, MENU_LOGS, "Open log folder", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, MENU_QUIT, "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
-        &[&status, &PredefinedMenuItem::separator(app)?, &pair, &ping, &logs, &PredefinedMenuItem::separator(app)?, &quit],
+        &[
+            &status,
+            &PredefinedMenuItem::separator(app)?,
+            &send,
+            &pair,
+            &ping,
+            &auto_sync,
+            &logs,
+            &PredefinedMenuItem::separator(app)?,
+            &quit,
+        ],
     )?;
 
     let window_icon = app.default_window_icon().expect("the bundle has an icon");
@@ -116,7 +134,7 @@ pub fn build(app: &App, snapshot: &Snapshot) -> tauri::Result<Tray> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| crate::app::on_menu(app, event.id().as_ref()))
         .build(app)?;
-    Ok(Tray { status, base })
+    Ok(Tray { status, auto_sync, base })
 }
 
 impl Tray {
@@ -128,6 +146,7 @@ impl Tray {
         let _ = tray.set_tooltip(Some(tooltip(snapshot)));
         let _ = tray.set_icon(Some(icon(&self.base, &snapshot.state)));
         let _ = self.status.set_text(status_line(snapshot));
+        let _ = self.auto_sync.set_checked(snapshot.auto_clipboard_sync);
     }
 }
 
@@ -142,7 +161,7 @@ mod tests {
 
     #[test]
     fn text_follows_the_state() {
-        let s = |state, devices| Snapshot { state, devices };
+        let s = |state, devices| Snapshot { state, devices, auto_clipboard_sync: true };
         assert_eq!(tooltip(&s(LinkState::NotPaired, vec![])), "Kin: not paired");
         assert_eq!(tooltip(&s(LinkState::PhoneConnected, vec![device("Pixel 8", true)])), "Kin: Pixel 8 connected");
         assert_eq!(status_line(&s(LinkState::PhoneOffline, vec![device("Pixel 8", false)])), "Phone offline: Pixel 8");

@@ -6,9 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kin_lib::cli::Config;
-use kin_lib::core::{Core, Event};
+use kin_lib::clipboard::{MemoryClipboard, MonotonicClock};
+use kin_lib::core::{Core, Event, Services};
 use kin_lib::encoding::{device_id_from_spki, spki_of_certificate};
 use kin_lib::identity::Identity;
+use kin_lib::links::RecordingOpener;
 use kin_lib::server::{self, ServerHandle};
 use kin_lib::storage::Db;
 use kin_lib::tls::crypto_provider;
@@ -75,11 +77,14 @@ pub fn identity_of(key: &TestKey) -> Identity {
 // ----- a server in the test process -------------------------------------------------------------------------------
 
 /// A core with an in-memory database that binds to a random loopback port. Nothing is exposed to the network. The data
-/// directory is a temporary one, and the developer hook that writes `pair-url.txt` is on.
+/// directory is a temporary one, and the developer hook that writes `pair-url.txt` is on. The clipboard is in memory (the real
+/// one is never touched) and the "browser" only records which links it was asked to open.
 pub struct TestEnv {
     pub core: Arc<Core>,
     pub events: UnboundedReceiver<Event>,
     pub dir: tempfile::TempDir,
+    pub clipboard: Arc<MemoryClipboard>,
+    pub opener: Arc<RecordingOpener>,
 }
 
 pub fn test_core(identity: Identity, pc_name: &str) -> TestEnv {
@@ -90,8 +95,11 @@ pub fn test_core(identity: Identity, pc_name: &str) -> TestEnv {
     config.dev_port = Some(0);
     config.dev_print_pair_url = true;
     let (tx, events) = tokio::sync::mpsc::unbounded_channel();
-    let core = Arc::new(Core::new(config, identity, Db::open_in_memory().unwrap(), pc_name.to_string(), tx));
-    TestEnv { core, events, dir }
+    let clipboard = Arc::new(MemoryClipboard::default());
+    let opener = Arc::new(RecordingOpener::default());
+    let services = Services { clipboard: clipboard.clone(), opener: opener.clone(), clock: Arc::new(MonotonicClock::new()) };
+    let core = Arc::new(Core::new(config, identity, Db::open_in_memory().unwrap(), pc_name.to_string(), tx, services));
+    TestEnv { core, events, dir, clipboard, opener }
 }
 
 pub async fn start(core: &Arc<Core>) -> ServerHandle {

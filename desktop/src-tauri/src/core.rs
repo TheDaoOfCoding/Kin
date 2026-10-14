@@ -1,8 +1,8 @@
 //! The app's shared state and what it can do, with no UI in it: the tray, the windows and the toasts live in
 //! `app.rs` and listen to the [`Event`]s sent from here.
 use std::net::{SocketAddr, SocketAddrV4};
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -11,12 +11,16 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::Result;
 use crate::cli::Config;
-use crate::connections::{Connections, PingOutcome};
+use crate::clipboard::{Clipboard, Clock, LoopGuard};
+use crate::connections::{Connections, SendOutcome};
 use crate::encoding::{self, unix_ms};
 use crate::identity::Identity;
+use crate::links::UrlOpener;
 use crate::netaddr;
 use crate::pairing::{self, PairError, Pairing};
+use crate::settings::Settings;
 use crate::storage::{Db, Device, NewDevice};
+use crate::sync::{HotkeyStatus, LinkToasts, Stats};
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_PORT: u16 = 47821;
@@ -32,6 +36,14 @@ pub enum Event {
     /// A phone paired. The UI shows the "New device paired" notice.
     DevicePaired(DeviceRow),
     Toast(String),
+    /// "Text from <phone>" with a preview. With `has_link` a click on the toast opens the link (`Core::toast_clicked`). The
+    /// preview is the user's own text: it goes to the toast and nowhere else (never to a log).
+    TextToast {
+        id: u32,
+        from: String,
+        preview: String,
+        has_link: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +78,8 @@ pub struct DeviceRow {
 pub struct Snapshot {
     pub state: LinkState,
     pub devices: Vec<DeviceRow>,
+    /// For the tray's check item.
+    pub auto_clipboard_sync: bool,
 }
 
 impl Snapshot {
@@ -79,7 +93,8 @@ impl Snapshot {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairingView {
-    /// `waiting`, `expired`, `paired`, `removed` (the device that just paired was removed) or `no_network`.
+    /// `waiting`, `expired`, `locked` (five wrong guesses killed the token), `paired`, `removed` (the device that just paired
+    /// was removed) or `no_network`.
     pub status: &'static str,
     pub svg: Option<String>,
     pub pc_name: String,
@@ -140,9 +155,26 @@ pub struct Core {
     last_ping: Mutex<Option<(u64, PingReport)>>,
     port: AtomicU16,
     events: UnboundedSender<Event>,
+    // Text, links and clipboard (sync.rs). The fields are used there.
+    pub(crate) settings: Mutex<Settings>,
+    pub(crate) hotkey: Mutex<HotkeyStatus>,
+    pub(crate) stats: Mutex<Stats>,
+    pub(crate) loop_guard: Mutex<LoopGuard>,
+    pub(crate) link_toasts: Mutex<LinkToasts>,
+    pub(crate) next_toast_id: AtomicU32,
+    pub(crate) clipboard: Arc<dyn Clipboard>,
+    pub(crate) opener: Arc<dyn UrlOpener>,
+    pub(crate) clock: Arc<dyn Clock>,
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+/// What the core uses from the outside world. The app passes the real ones, the tests pass fakes.
+pub struct Services {
+    pub clipboard: Arc<dyn Clipboard>,
+    pub opener: Arc<dyn UrlOpener>,
+    pub clock: Arc<dyn Clock>,
+}
+
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -156,7 +188,9 @@ pub fn computer_name() -> String {
 }
 
 impl Core {
-    pub fn new(config: Config, identity: Identity, db: Db, pc_name: String, events: UnboundedSender<Event>) -> Core {
+    pub fn new(config: Config, identity: Identity, db: Db, pc_name: String, events: UnboundedSender<Event>, services: Services) -> Core {
+        let settings = Settings::load(&config.data_dir);
+        let hotkey = HotkeyStatus { accelerator: settings.hotkey.clone(), registered: false, error: None };
         Core {
             config,
             identity,
@@ -168,6 +202,15 @@ impl Core {
             last_ping: Mutex::new(None),
             port: AtomicU16::new(0),
             events,
+            settings: Mutex::new(settings),
+            hotkey: Mutex::new(hotkey),
+            stats: Mutex::new(Stats::default()),
+            loop_guard: Mutex::new(LoopGuard::default()),
+            link_toasts: Mutex::new(LinkToasts::default()),
+            next_toast_id: AtomicU32::new(0),
+            clipboard: services.clipboard,
+            opener: services.opener,
+            clock: services.clock,
         }
     }
 
@@ -204,7 +247,7 @@ impl Core {
         } else {
             LinkState::PhoneOffline
         };
-        Snapshot { state, devices }
+        Snapshot { state, devices, auto_clipboard_sync: self.auto_clipboard_sync() }
     }
 
     /// The contents of `status.json`, for scripts that want to know what the app is doing.
@@ -213,6 +256,7 @@ impl Core {
         let now = Instant::now();
         let pairing_expires_ms =
             lock(&self.pairing).active_expiry(now).map(|e| unix_ms() + e.saturating_duration_since(now).as_millis() as u64);
+        let sync = self.sync_status();
         let last_ping = lock(&self.last_ping).as_ref().map(|(at, report)| {
             let mut v = json!({ "at": at, "result": report.text() });
             if let PingReport::Rtt(d) = report {
@@ -232,6 +276,11 @@ impl Core {
             "pairing": pairing_expires_ms.map(|e| json!({ "active": true, "expiresAtMs": e })),
             "devices": snap.devices,
             "lastPing": last_ping,
+            "settings": sync["settings"],
+            "hotkey": sync["hotkey"],
+            "lastSent": sync["lastSent"],
+            "lastReceived": sync["lastReceived"],
+            "clipboardSync": sync["clipboardSync"],
             "updatedAtMs": unix_ms(),
         })
     }
@@ -285,6 +334,21 @@ impl Core {
         }
     }
 
+    /// When the token on screen runs out, if one can still be used. The app wakes up then and calls
+    /// [`Core::pairing_expired`], so the window and `status.json` stop showing a code that no longer works.
+    pub fn pairing_deadline(&self) -> Option<Instant> {
+        lock(&self.pairing).active_expiry(Instant::now())
+    }
+
+    /// The token ran out (or was shut down): tell the window and rewrite `status.json`.
+    pub fn pairing_expired(&self) {
+        if lock(&self.session).is_some() {
+            log::info!("pairing: the code expired");
+        }
+        self.emit(Event::PairingChanged);
+        self.emit(Event::StateChanged);
+    }
+
     /// Ends the pairing (the window closed). An unused token stops working.
     pub fn end_pairing(&self) {
         lock(&self.pairing).end(Instant::now());
@@ -295,13 +359,20 @@ impl Core {
     }
 
     pub fn pairing_view(&self) -> Option<PairingView> {
+        // Whether the token can still be used is `Pairing`'s to say: it runs out after 5 minutes and it is shut down by 5 wrong
+        // guesses. Taken before the session lock, and never while holding it.
+        let (usable, locked) = {
+            let pairing = lock(&self.pairing);
+            (pairing.active_expiry(Instant::now()).is_some(), pairing.is_invalidated())
+        };
         let guard = lock(&self.session);
         let s = guard.as_ref()?;
         let status = match (&s.paired, &s.svg) {
             (Some(d), _) if self.db.is_paired(&d.device_id).unwrap_or(true) => "paired",
             (Some(_), _) => "removed",
             (None, None) => "no_network",
-            (None, Some(_)) if unix_ms() >= s.expires_ms => "expired",
+            (None, Some(_)) if locked => "locked",
+            (None, Some(_)) if !usable => "expired",
             (None, Some(_)) => "waiting",
         };
         Some(PairingView {
@@ -320,6 +391,7 @@ impl Core {
         let name = encoding::truncate_chars(&req.name, MAX_NAME_CHARS);
         // The lock is held from the check to the "used" mark, so two requests can't both use the token.
         let mut pairing = lock(&self.pairing);
+        let was_usable = pairing.active_expiry(now).is_some();
         let result = pairing.check(now, &req.token).map_err(PairFailure::Rejected).and_then(|()| {
             self.db
                 .upsert_device(
@@ -340,7 +412,15 @@ impl Core {
         if result.is_ok() {
             pairing.consume(now);
         }
+        // The failure that shut the token down (the fifth wrong guess): the window stops showing the QR code and `pairing.active`
+        // leaves status.json, the same as when the token runs out.
+        let shut_down = result.is_err() && was_usable && pairing.active_expiry(now).is_none();
         drop(pairing);
+        if shut_down {
+            log::warn!("pairing: too many wrong codes, this code no longer works");
+            self.emit(Event::PairingChanged);
+            self.emit(Event::StateChanged);
+        }
 
         let outcome = match &result {
             Ok(()) => "ok",
@@ -395,10 +475,10 @@ impl Core {
                     let outcome = tokio::time::timeout(Duration::from_secs(7), reply_rx).await;
                     log::info!("ping to {}: {:?}", short(&id), outcome);
                     match outcome {
-                        Ok(Ok(PingOutcome::Ack(rtt))) => PingReport::Rtt(rtt),
-                        Ok(Ok(PingOutcome::Failed(code))) => PingReport::Failed(code),
-                        Ok(Ok(PingOutcome::NotConnected)) => PingReport::NotConnected,
-                        Ok(Ok(PingOutcome::NoReply)) | Ok(Err(_)) | Err(_) => PingReport::NoReply,
+                        Ok(Ok(SendOutcome::Ack(rtt))) => PingReport::Rtt(rtt),
+                        Ok(Ok(SendOutcome::Failed(code))) => PingReport::Failed(code),
+                        Ok(Ok(SendOutcome::NotConnected)) => PingReport::NotConnected,
+                        Ok(Ok(SendOutcome::NoReply)) | Ok(Err(_)) | Err(_) => PingReport::NoReply,
                     }
                 }
             }

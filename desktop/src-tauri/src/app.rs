@@ -1,16 +1,21 @@
-//! The Tauri side: start-up, the single instance, the tray menu, toasts, and what the core's events do to the UI.
+//! The Tauri side: start-up, the single instance, the tray menu, the global hotkey, toasts (and clicks on them), and what the
+//! core's events do to the UI.
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::cli::{self, Command, Parsed};
-use crate::core::{Core, Event, computer_name, short};
+use crate::clipboard::{MonotonicClock, WinClipboard};
+use crate::core::{Core, Event, Services, computer_name, short};
 use crate::identity::Identity;
+use crate::links::ShellOpener;
 use crate::mdns::Advertiser;
 use crate::server::{self, ServerHandle};
 use crate::storage::Db;
+use crate::sync::{HotkeyStatus, Tap};
 use crate::tray::{self, Tray};
 use crate::{Result, filelog, ui};
 
@@ -33,6 +38,16 @@ pub fn run(parsed: Parsed) {
             }
         }))
         .plugin(tauri_plugin_notification::init())
+        // One shortcut is ever registered (the "send clipboard" hotkey), so the handler doesn't look at which one it was.
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state() == ShortcutState::Pressed {
+                        send_clipboard(app, "hotkey");
+                    }
+                })
+                .build(),
+        )
         .invoke_handler(tauri::generate_handler![ui::pairing_view, ui::new_pairing, ui::remove_device, ui::close_window])
         .setup(move |app| setup(app, parsed).map_err(|e| -> Box<dyn std::error::Error> { e }))
         .on_window_event(|window, event| {
@@ -94,7 +109,11 @@ fn setup(app: &mut tauri::App, parsed: Parsed) -> Result<()> {
     );
     let db = Db::open(&config.data_dir.join("kin.db"))?;
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
-    let core = Arc::new(Core::new(config, loaded.identity, db, computer_name(), events_tx));
+    // A message-only window listens for clipboard changes (`AddClipboardFormatListener`). It also owns the clipboard when the app
+    // writes to it.
+    let (win_clipboard, clipboard_changes) = WinClipboard::start()?;
+    let services = Services { clipboard: Arc::new(win_clipboard), opener: Arc::new(ShellOpener), clock: Arc::new(MonotonicClock::new()) };
+    let core = Arc::new(Core::new(config, loaded.identity, db, computer_name(), events_tx, services));
 
     let server = tauri::async_runtime::block_on(server::start(core.clone()))?;
     // mDNS opens multicast sockets on every interface, which developer mode (loopback only) must not do.
@@ -110,14 +129,33 @@ fn setup(app: &mut tauri::App, parsed: Parsed) -> Result<()> {
 
     let handle = app.handle().clone();
     tauri::async_runtime::spawn(event_loop(handle.clone(), core.clone(), events_rx));
+    {
+        let core = core.clone();
+        tauri::async_runtime::spawn(async move { core.run_clipboard_sync(clipboard_changes).await });
+    }
+    register_toast_clicks(&handle, &core);
+    register_hotkey(&handle, &core);
     refresh(&handle, &core);
     handle_commands(&handle, &commands);
     Ok(())
 }
 
-/// What the core's events do to the UI.
+/// What the core's events do to the UI. It also wakes up when the pairing code runs out, so the window and `status.json` stop
+/// showing a code that no longer works.
 async fn event_loop(app: AppHandle, core: Arc<Core>, mut events: tokio::sync::mpsc::UnboundedReceiver<Event>) {
-    while let Some(event) = events.recv().await {
+    loop {
+        let deadline = core.pairing_deadline().map(tokio::time::Instant::from_std);
+        let wait_until = deadline.unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
+        let event = tokio::select! {
+            event = events.recv() => match event {
+                Some(event) => event,
+                None => break,
+            },
+            () = tokio::time::sleep_until(wait_until), if deadline.is_some() => {
+                core.pairing_expired();
+                continue;
+            }
+        };
         match event {
             Event::StateChanged => refresh(&app, &core),
             Event::PairingChanged => {
@@ -130,6 +168,7 @@ async fn event_loop(app: AppHandle, core: Arc<Core>, mut events: tokio::sync::mp
                 ui::open_pairing_window(&app, false);
             }
             Event::Toast(text) => toast(&app, &core, &text),
+            Event::TextToast { id, from, preview, has_link } => text_toast(&app, &core, id, &from, &preview, has_link),
         }
     }
 }
@@ -157,6 +196,79 @@ fn write_status(core: &Core, stopped: bool) {
     }
 }
 
+/// "Text from <phone>" with a preview. With a link, a click opens it (`register_toast_clicks`). The preview is the user's own
+/// text and is shown only here: the log gets the title and a length.
+fn text_toast(app: &AppHandle, core: &Core, id: u32, from: &str, preview: &str, has_link: bool) {
+    let title = format!("Text from {from}");
+    log::info!("toast: {title} ({} characters shown{})", preview.chars().count(), if has_link { ", click opens the link" } else { "" });
+    if core.config.dev_no_windows {
+        return;
+    }
+    if let Err(e) = app.notification().builder().id(id as i32).title(title).body(preview).show() {
+        log::warn!("showing a toast failed: {e}");
+    }
+}
+
+/// A click on a toast ("tap") opens its link, if it had one. The plugin reports a click only while the toast is on screen, not
+/// once it has moved to the Action Center.
+fn register_toast_clicks(app: &AppHandle, core: &Arc<Core>) {
+    let core = core.clone();
+    let registered = app.notification().on_action(move |performed| {
+        if performed.action_id() != "tap" {
+            return;
+        }
+        let id = performed.notification().map(|n| n.id() as u32).or_else(|| core.newest_link_toast());
+        if let Some(id) = id {
+            core.toast_clicked(id);
+        }
+    });
+    if let Err(e) = registered {
+        log::warn!("toast clicks are not available: {e}");
+    }
+}
+
+/// Registers the global hotkey from the settings. If it can't be registered (another program has it, or the text isn't an
+/// accelerator) the app carries on without it, says so once, and `status.json` shows why.
+fn register_hotkey(app: &AppHandle, core: &Core) {
+    let accelerator = core.hotkey_accelerator();
+    let mut status = HotkeyStatus { accelerator: accelerator.clone(), registered: false, error: None };
+    if accelerator.is_empty() {
+        log::info!("hotkey: turned off in settings.json");
+    } else {
+        let outcome = crate::settings::parse_hotkey(&accelerator).and_then(|shortcut| {
+            app.global_shortcut()
+                .register(shortcut)
+                .map_err(|e| format!("{accelerator} could not be registered ({e}). Another program may use it"))
+        });
+        match outcome {
+            Ok(()) => {
+                log::info!("hotkey {accelerator} registered: sends the clipboard text to the phone");
+                status.registered = true;
+            }
+            Err(e) => {
+                log::warn!("hotkey: {e}");
+                toast(app, core, &format!("The hotkey doesn't work: {e}. Change \"hotkey\" in settings.json."));
+                status.error = Some(e);
+            }
+        }
+    }
+    core.set_hotkey_status(status);
+}
+
+/// The hotkey, the tray item and `--send-clipboard` all end up here. The tap is now: the time from here to the phone's `ack` is
+/// what targets.md calls arrival time.
+fn send_clipboard(app: &AppHandle, trigger: &'static str) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let core = state.core.clone();
+    let tap = Tap::now();
+    log::info!("send clipboard ({trigger})");
+    tauri::async_runtime::spawn(async move {
+        core.send_clipboard_text(trigger, tap).await;
+    });
+}
+
 fn toast(app: &AppHandle, core: &Core, text: &str) {
     log::info!("toast: {text}");
     if core.config.dev_no_windows {
@@ -169,6 +281,14 @@ fn toast(app: &AppHandle, core: &Core, text: &str) {
 
 pub fn on_menu(app: &AppHandle, id: &str) {
     match id {
+        tray::MENU_SEND_CLIPBOARD => send_clipboard(app, "tray"),
+        tray::MENU_AUTO_SYNC => {
+            // Windows has already flipped the check by the time the click arrives.
+            if let Some(state) = app.try_state::<AppState>() {
+                let on = state.tray.auto_sync.is_checked().unwrap_or(true);
+                state.core.set_auto_clipboard_sync(on);
+            }
+        }
         tray::MENU_PAIR => handle_commands(app, &[Command::Pair]),
         tray::MENU_PING => handle_commands(app, &[Command::Ping]),
         tray::MENU_LOGS => open_log_folder(app),
@@ -198,7 +318,8 @@ pub fn handle_commands(app: &AppHandle, commands: &[Command]) {
         return;
     };
     for command in commands {
-        log::info!("command: {command:?}");
+        // The name only: a developer command can carry clipboard text.
+        log::info!("command: {}", command.name());
         let core = state.core.clone();
         match command {
             Command::Ping => {
@@ -209,6 +330,14 @@ pub fn handle_commands(app: &AppHandle, commands: &[Command]) {
             Command::Pair => ui::open_pairing_window(app, true),
             Command::StartPairing => {
                 core.start_pairing();
+            }
+            Command::SendClipboard => send_clipboard(app, "command"),
+            Command::DevSetClipboard { text, mark } => {
+                let (text, mark) = (text.clone(), *mark);
+                tauri::async_runtime::spawn(async move { core.dev_set_clipboard(text, mark).await });
+            }
+            Command::DevGetClipboard => {
+                tauri::async_runtime::spawn(async move { core.dev_get_clipboard().await });
             }
             Command::Quit => quit(app),
         }

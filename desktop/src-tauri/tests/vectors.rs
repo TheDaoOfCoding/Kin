@@ -1,6 +1,7 @@
-//! The vectors in `protocol/` that are in scope for milestone 1.1 (see protocol/README.md, "What each milestone needs"),
-//! run against the real code: the encodings, the certificate profile, the pairing URL, the error table, the WebSocket
-//! receiver and the HTTP endpoints (in-process, without TLS: the TLS cases are in `tls_vectors.rs`).
+//! The vectors in `protocol/` that are in scope for milestones 1.1 and 1.2 (see protocol/README.md, "What each milestone
+//! needs"), run against the real code: the encodings, the certificate profile, the pairing URL, the error table, the WebSocket
+//! receiver (1.2 adds the `text` and `clipboard` cases) and the HTTP endpoints (in-process, without TLS: the TLS cases are in
+//! `tls_vectors.rs`).
 mod common;
 
 use std::collections::HashMap;
@@ -174,7 +175,8 @@ fn input_of(case: &Value) -> (Input, Option<String>) {
         base[s["field"].as_str().unwrap()] = Value::String(filler);
         let text = base.to_string();
         assert_eq!(text.len() as u64, s["totalBytes"].as_u64().unwrap(), "the synthesized frame has the stated size");
-        (Input::Text(text.into_bytes()), None)
+        let id = base["id"].as_str().map(String::from);
+        (Input::Text(text.into_bytes()), id)
     } else {
         panic!("case without an input: {}", case["name"]);
     }
@@ -274,6 +276,18 @@ const MESSAGES_SEQUENCE_SCOPE: &[&str] = &[
     "duplicate-ping-shows-one-toast",
 ];
 
+/// Milestone 1.2: the `text` and `clipboard` cases. (`text-frame-exactly-1-MiB`, `text-frame-multibyte-under-limit` and
+/// `text-valid-surrogate-pair-escape` are among the `text-*` ones.) The `offer`, `complete` and `cancel` cases and
+/// `duplicate-offer-is-acked-not-restarted` are 1.3.
+const MESSAGES_VALID_SCOPE_1_2: &[&str] = &["text-*", "clipboard-*", "duplicate-keys-*"];
+const MESSAGES_INVALID_SCOPE_1_2: &[&str] = &["text-*", "clipboard-*"];
+const MESSAGES_SEQUENCE_SCOPE_1_2: &[&str] =
+    &["handshake-then-text-then-duplicate", "invalid-message-keeps-connection-open", "rejected-message-id-is-not-remembered"];
+
+fn with(a: &[&'static str], b: &[&'static str]) -> Vec<&'static str> {
+    a.iter().chain(b).copied().collect()
+}
+
 fn names(cases: &Value) -> Vec<&str> {
     cases.as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect()
 }
@@ -281,7 +295,9 @@ fn names(cases: &Value) -> Vec<&str> {
 #[test]
 fn messages_valid_and_invalid() {
     let root = load("messages.json");
-    for (key, scope) in [("valid", MESSAGES_VALID_SCOPE), ("invalid", MESSAGES_INVALID_SCOPE)] {
+    let valid = with(MESSAGES_VALID_SCOPE, MESSAGES_VALID_SCOPE_1_2);
+    let invalid = with(MESSAGES_INVALID_SCOPE, MESSAGES_INVALID_SCOPE_1_2);
+    for (key, scope) in [("valid", valid.as_slice()), ("invalid", invalid.as_slice())] {
         assert_patterns_match(key, scope, &names(&root[key]));
         let mut run = 0;
         for case in root[key].as_array().unwrap() {
@@ -295,13 +311,39 @@ fn messages_valid_and_invalid() {
     }
 }
 
+/// The 1.2 cases are in the run above. This pins which ones they are, so a renamed or dropped vector is noticed here and not
+/// by a count that quietly goes down.
+#[test]
+fn messages_1_2_scope_is_what_the_readme_says() {
+    let root = load("messages.json");
+    for (key, scope, at_least) in [
+        ("valid", MESSAGES_VALID_SCOPE_1_2, 14),
+        ("invalid", MESSAGES_INVALID_SCOPE_1_2, 24),
+        ("sequences", MESSAGES_SEQUENCE_SCOPE_1_2, 3),
+    ] {
+        assert_patterns_match(key, scope, &names(&root[key]));
+        let n = root[key].as_array().unwrap().iter().filter(|c| matches(c["name"].as_str().unwrap(), scope)).count();
+        assert!(n >= at_least, "messages.json {key}[]: {n} cases in the 1.2 scope, expected at least {at_least}");
+    }
+    // None of the 1.3 cases (offer, complete, cancel) is in this scope: those still answer `unsupported_type` on the PC.
+    for key in ["valid", "invalid"] {
+        for case in root[key].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            if name.starts_with("offer-") || name.starts_with("complete-") || name.starts_with("cancel-") {
+                assert!(!matches(name, MESSAGES_VALID_SCOPE_1_2) && !matches(name, MESSAGES_INVALID_SCOPE_1_2), "{name} is a 1.3 case");
+            }
+        }
+    }
+}
+
 #[test]
 fn messages_sequences() {
     let root = load("messages.json");
-    assert_patterns_match("sequences", MESSAGES_SEQUENCE_SCOPE, &names(&root["sequences"]));
+    let scope = with(MESSAGES_SEQUENCE_SCOPE, MESSAGES_SEQUENCE_SCOPE_1_2);
+    assert_patterns_match("sequences", &scope, &names(&root["sequences"]));
     for seq in root["sequences"].as_array().unwrap() {
         let seq_name = seq["name"].as_str().unwrap();
-        if !matches(seq_name, MESSAGES_SEQUENCE_SCOPE) {
+        if !matches(seq_name, &scope) {
             continue;
         }
         // Each role has its own receiver, with its own state and memory of IDs. `from` is the sender.

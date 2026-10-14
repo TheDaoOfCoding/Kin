@@ -3,6 +3,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
+use crate::clipboard::Exclusion;
 use crate::netaddr;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -41,7 +42,7 @@ impl Config {
 }
 
 /// What another launch can ask the running instance to do.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     /// Send a `ping` to the connected phone and show the round-trip time.
     Ping,
@@ -49,8 +50,42 @@ pub enum Command {
     Pair,
     /// Start a pairing without a window. The URL goes to `pair-url.txt`.
     StartPairing,
+    /// Send the text on the clipboard to the phone as a `text` message. The same as the hotkey and "Send clipboard to phone"
+    /// in the tray, and what the integration agent uses to press the hotkey without a keyboard.
+    SendClipboard,
+    /// Developer hook: set the PC clipboard as if the user had copied this text. `mark` adds the format a password manager
+    /// would add, so the "not sent" rule can be tested.
+    DevSetClipboard { text: String, mark: Option<Exclusion> },
+    /// Developer hook: write the PC clipboard text to `dev-clipboard.txt` in the data directory.
+    DevGetClipboard,
     /// Quit.
     Quit,
+}
+
+impl Command {
+    /// A word for the log. (The `Debug` form of `DevSetClipboard` would print the text.)
+    pub fn name(&self) -> &'static str {
+        match self {
+            Command::Ping => "ping",
+            Command::Pair => "pair",
+            Command::StartPairing => "start pairing",
+            Command::SendClipboard => "send clipboard",
+            Command::DevSetClipboard { .. } => "dev set clipboard",
+            Command::DevGetClipboard => "dev get clipboard",
+            Command::Quit => "quit",
+        }
+    }
+}
+
+/// The values of `--dev-clipboard-mark`.
+pub fn parse_mark(value: &str) -> Option<Exclusion> {
+    match value {
+        "exclude" => Some(Exclusion::ExcludeFromMonitor),
+        "no-history" => Some(Exclusion::NotInHistory),
+        "no-cloud" => Some(Exclusion::NotToCloud),
+        "viewer-ignore" => Some(Exclusion::ViewerIgnore),
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -78,6 +113,7 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
     let mut print_url = truthy(env("KIN_DEV_PRINT_PAIR_URL"));
     let mut no_windows = truthy(env("KIN_DEV_NO_WINDOWS"));
     let (mut commands, mut unknown) = (Vec::new(), Vec::new());
+    let mut mark: Option<Exclusion> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -98,8 +134,31 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
             "--ping" => commands.push(Command::Ping),
             "--pair" => commands.push(Command::Pair),
             "--dev-start-pairing" => commands.push(Command::StartPairing),
+            "--send-clipboard" => commands.push(Command::SendClipboard),
+            "--dev-set-clipboard" => commands.push(Command::DevSetClipboard { text: value(name)?, mark: None }),
+            "--dev-clipboard-mark" => {
+                let v = value(name)?;
+                mark =
+                    Some(parse_mark(&v).ok_or_else(|| {
+                        format!("--dev-clipboard-mark: {v:?} is not one of exclude, no-history, no-cloud, viewer-ignore")
+                    })?);
+            }
+            "--dev-get-clipboard" => commands.push(Command::DevGetClipboard),
             "--quit" => commands.push(Command::Quit),
             _ => unknown.push(arg.clone()),
+        }
+    }
+
+    if let Some(mark) = mark {
+        let mut applied = false;
+        for c in &mut commands {
+            if let Command::DevSetClipboard { mark: m, .. } = c {
+                *m = Some(mark);
+                applied = true;
+            }
+        }
+        if !applied {
+            return Err("--dev-clipboard-mark needs --dev-set-clipboard".to_string());
         }
     }
 
@@ -190,6 +249,27 @@ mod tests {
         }
         assert!(parse(&args("--data-dir x --dev-bind ::1"), &no_env).is_ok());
         assert!(parse(&args("--data-dir x --dev-qr-address 8.8.8.8"), &no_env).is_err());
+    }
+
+    #[test]
+    fn the_clipboard_commands() {
+        let p = parse(&args("--data-dir x --send-clipboard --dev-get-clipboard"), &no_env).unwrap();
+        assert_eq!(p.commands, [Command::SendClipboard, Command::DevGetClipboard]);
+        let argv = vec!["--dev-set-clipboard".to_string(), "two words".to_string(), "--dev-clipboard-mark=no-history".to_string()];
+        let p = parse(&[vec!["--data-dir".to_string(), "x".to_string()], argv].concat(), &no_env).unwrap();
+        assert_eq!(p.commands, [Command::DevSetClipboard { text: "two words".into(), mark: Some(Exclusion::NotInHistory) }]);
+        let p = parse(&args("--data-dir x --dev-set-clipboard plain"), &no_env).unwrap();
+        assert_eq!(p.commands, [Command::DevSetClipboard { text: "plain".into(), mark: None }]);
+        assert!(parse(&args("--data-dir x --dev-clipboard-mark exclude"), &no_env).is_err(), "a mark with nothing to mark");
+        assert!(parse(&args("--data-dir x --dev-set-clipboard a --dev-clipboard-mark nope"), &no_env).is_err());
+        assert!(parse(&args("--data-dir x --dev-set-clipboard"), &no_env).is_err(), "no text");
+    }
+
+    #[test]
+    fn a_command_is_logged_by_name_and_never_with_its_text() {
+        let c = Command::DevSetClipboard { text: "secret".into(), mark: None };
+        assert_eq!(c.name(), "dev set clipboard");
+        assert!(!c.name().contains("secret"));
     }
 
     #[test]

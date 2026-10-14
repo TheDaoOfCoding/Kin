@@ -52,6 +52,14 @@ impl ClientCertVerifier for P256ClientVerifier {
         if !is_p256_spki(spki) {
             return Err(Error::InvalidCertificate(CertificateError::ApplicationVerificationFailure));
         }
+        // The signature check below parses the certificate with webpki, and the device ID is computed from the SPKI that
+        // webpki found. If x509-parser sees a different one, the certificate is ambiguous: refuse it here. (A certificate that
+        // webpki can't parse at all fails in `verify_tls13_signature`, with webpki's own reason.)
+        if let Ok(parsed) = webpki::EndEntityCert::try_from(end_entity)
+            && parsed.subject_public_key_info().as_ref() != spki
+        {
+            return Err(Error::InvalidCertificate(CertificateError::ApplicationVerificationFailure));
+        }
         Ok(ClientCertVerified::assertion())
     }
 
@@ -97,9 +105,28 @@ pub fn server_config(identity: &Identity) -> Result<Arc<ServerConfig>> {
     Ok(Arc::new(config))
 }
 
-/// The device ID of the client, from the leaf certificate it presented in the handshake.
+/// The SPKI of a certificate, but only if the two parsers in the program agree on it. rustls-webpki checks the handshake
+/// signature against the key *it* finds in the certificate, and x509-parser is what the rest of the app uses to read a
+/// certificate. A certificate that the two read differently could make the device ID belong to another key than the one that
+/// signed, so any difference means `None`.
+pub fn agreed_spki(webpki_spki: Option<&[u8]>, x509_spki: Option<&[u8]>) -> Option<Vec<u8>> {
+    match (webpki_spki, x509_spki) {
+        (Some(a), Some(b)) if a == b => Some(a.to_vec()),
+        _ => None,
+    }
+}
+
+/// The SPKI of the client's leaf certificate: the one webpki verified the signature against, and equal byte for byte to what
+/// x509-parser reads.
+pub fn client_spki(cert: &CertificateDer<'_>) -> Option<Vec<u8>> {
+    let from_webpki = webpki::EndEntityCert::try_from(cert).ok().map(|c| c.subject_public_key_info().as_ref().to_vec());
+    agreed_spki(from_webpki.as_deref(), encoding::spki_of_certificate(cert))
+}
+
+/// The device ID of the client, from the leaf certificate it presented in the handshake. It's computed from the SPKI that
+/// webpki used to verify the signature (see [`agreed_spki`]), so the ID is the ID of the key that proved itself.
 pub fn peer_device_id(chain: &[CertificateDer<'_>]) -> Option<String> {
-    encoding::spki_of_certificate(chain.first()?).map(encoding::device_id_from_spki)
+    client_spki(chain.first()?).map(|spki| encoding::device_id_from_spki(&spki))
 }
 
 /// What the certificate profile of protocol.md says a certificate must look like, as a list of violations
@@ -146,6 +173,30 @@ mod tests {
         assert_eq!(id.device_id.len(), 43);
         assert_eq!(id.short_id.len(), 8);
         assert!(is_p256_spki(encoding::spki_of_certificate(&id.cert_der).unwrap()));
+    }
+
+    #[test]
+    fn the_device_id_comes_from_the_spki_both_parsers_agree_on() {
+        let id = Identity::generate().unwrap();
+        let cert = CertificateDer::from(id.cert_der.clone());
+        let spki = client_spki(&cert).expect("a certificate of our own profile is read the same by both parsers");
+        assert_eq!(spki, encoding::spki_of_certificate(&id.cert_der).unwrap());
+        assert_eq!(peer_device_id(std::slice::from_ref(&cert)).as_deref(), Some(id.device_id.as_str()));
+        // Garbage is refused by webpki, and so there is no ID.
+        assert_eq!(peer_device_id(&[CertificateDer::from(vec![0x30, 0x03, 0x02, 0x01, 0x00])]), None);
+        assert_eq!(peer_device_id(&[]), None);
+    }
+
+    #[test]
+    fn two_parsers_that_disagree_give_no_device_id() {
+        let a = [1u8, 2, 3];
+        let b = [1u8, 2, 4];
+        assert_eq!(agreed_spki(Some(&a), Some(&a)), Some(a.to_vec()));
+        assert_eq!(agreed_spki(Some(&a), Some(&b)), None, "different bytes");
+        assert_eq!(agreed_spki(Some(&a), Some(&a[..2])), None, "one is a prefix of the other");
+        assert_eq!(agreed_spki(Some(&a), None), None, "x509-parser can't read it");
+        assert_eq!(agreed_spki(None, Some(&a)), None, "webpki can't read it");
+        assert_eq!(agreed_spki(None, None), None);
     }
 
     #[test]

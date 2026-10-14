@@ -15,7 +15,7 @@
 | Encrypting the private key | DPAPI through the `windows` crate |
 | mDNS advertising | `mdns-sd` |
 | Database | `rusqlite` (bundled SQLite) |
-| Clipboard read and write | `arboard`, with change events from `AddClipboardFormatListener` through the `windows` crate |
+| Clipboard read and write | The Win32 clipboard API through the `windows` crate: `AddClipboardFormatListener` on a hidden message-only window for the change events, `CF_UNICODETEXT` for the text, and `EnumClipboardFormats` for the opt-out formats. (`arboard` was in this plan. It would only have covered the text, and the listener and the format checks need Win32 anyway, so it was left out: one dependency fewer.) |
 | QR rendering | `qrcode` (rendered as SVG for the UI) |
 | Tray, hotkey, notifications, autostart, single instance | Tauri's built-in tray, plus the `global-shortcut`, `notification`, `autostart` and `single-instance` plugins |
 | JSON | `serde`, `serde_json` |
@@ -38,12 +38,31 @@ Handlers need to know which device made each request, but axum doesn't pass the 
 
 - **Drop window:** drag files in, or click to pick them.
 - **Explorer "Send to":** a shortcut in `%APPDATA%\Microsoft\Windows\SendTo` runs the app with `--send <paths>`. On Windows 11 it's under "Show more options". The modern menu entry comes in Phase 2.
-- **Hotkey** (configurable, default picked in 1.2 after checking for conflicts): sends the current clipboard text as a `text` message.
+- **Hotkey** (default `Ctrl+Alt+Shift+K`, configurable): sends the current clipboard text as a `text` message. The tray's "Send clipboard to phone" and `kin.exe --send-clipboard` do the same. See [Hotkey](#hotkey).
 - **Automatic clipboard sync** (on by default, can be turned off): each clipboard change sends a `clipboard` message.
   - Debounced by 300 ms.
   - Text only in the MVP.
   - **Skips password-manager content.** That means content carrying any of the formats apps use to opt out: `ExcludeClipboardContentFromMonitorProcessing`, or `CanIncludeInClipboardHistory` / `CanUploadToCloudClipboard` set to 0.
   - **Loop prevention:** remember a hash of the text last set from the phone, and ignore the change event it causes.
+
+### Hotkey
+
+**Default: `Ctrl+Alt+Shift+K`** ("K" for Kin). It is picked to stay out of the way of what people already use:
+
+- **Windows keeps every `Win+<key>` for itself** (`Win+V` is the clipboard history, `Win+Shift+S` the snipping tool, `Win+K` casting, and so on), so none of those is used.
+- **Two-modifier shortcuts are what apps use** (`Ctrl+Shift+K` opens the web console in Firefox, for one, and editors bind many `Ctrl+Alt+<letter>` commands). A global hotkey wins over the app in front, so it would break those. With three modifiers it sits where far fewer commands are bound.
+- **`Ctrl+Alt+<letter>` is `AltGr+<letter>` on many keyboard layouts**, which is how they type characters (`€`, `@`, Polish `ł` and `ś`, and so on). A global `Ctrl+Alt+<letter>` takes that character away from the people who type it. Adding `Shift` keeps it clear of the common ones.
+- **Checked on the development PC:** Windows accepted the registration, so no other program holds it there. The check is repeated on every start (a program that holds the key makes the registration fail, which shows in the log, in `status.json` and in a toast). Every program on every PC can't be checked, which is why it is configurable.
+
+**Changing it.** Put the key in `%APPDATA%\Kin\settings.json` (a settings window comes in 1.4):
+
+```json
+{ "autoClipboardSync": true, "hotkey": "Ctrl+Alt+Shift+F9" }
+```
+
+The syntax is the accelerator syntax of the Tauri global-shortcut plugin: modifiers `Ctrl`, `Alt`, `Shift` and `Super`, a letter, a digit or a name such as `F9`, joined with `+`. An empty string turns the hotkey off. The change takes effect the next time the app starts. If the text isn't a hotkey, or another program already has it, the app starts without a hotkey and says why once (a toast, the log, and `hotkey.error` in `status.json`).
+
+**What the hotkey does.** It reads the clipboard at the moment of the press and sends the text as a `text` message, which the phone treats as an explicit send (a notification, and later an entry in the history). Two rules differ from the automatic sync, because someone pressed a key on purpose: it also sends content that a password manager marked "don't record" (the person asked), and a failure (the phone isn't connected, no `ack` within 5 s) gets a toast. The toast on success is "Sent to <phone>". A clipboard with no text gets "The clipboard has no text to send."
 
 ## Receiving from the phone
 

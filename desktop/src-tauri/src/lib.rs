@@ -1,9 +1,11 @@
-//! Kin Relay for Windows, milestone 1.1: identity, the HTTPS server, pairing, mDNS, the WebSocket and its ping, and a tray.
+//! Kin Relay for Windows, milestone 1.2: identity, the HTTPS server, pairing, mDNS, the WebSocket and its ping, a tray, and text,
+//! links and the clipboard (`clipboard`, `links`, `sync`, `settings`).
 //!
 //! The protocol and the app's state have no UI in them (`messages`, `server`, `ws`, `core`, ...), so the integration tests
 //! can run them in the test process. The Tauri side is `app`, `tray` and `ui`.
 pub mod app;
 pub mod cli;
+pub mod clipboard;
 pub mod connections;
 pub mod core;
 mod dpapi;
@@ -11,12 +13,15 @@ pub mod encoding;
 pub mod filelog;
 pub mod identity;
 pub mod json;
+pub mod links;
 pub mod mdns;
 pub mod messages;
 pub mod netaddr;
 pub mod pairing;
 pub mod server;
+pub mod settings;
 pub mod storage;
+pub mod sync;
 pub mod tls;
 pub mod tray;
 pub mod ui;

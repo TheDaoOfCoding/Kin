@@ -75,6 +75,11 @@ impl Pairing {
         self.active.as_ref().filter(|t| !t.invalidated && now < t.expires_at).map(|t| t.expires_at)
     }
 
+    /// `true` if the pairing in progress was shut down by too many wrong guesses (see `MAX_FAILURES`).
+    pub fn is_invalidated(&self) -> bool {
+        self.active.as_ref().is_some_and(|t| t.invalidated)
+    }
+
     /// Checks a presented token. This doesn't use it up: call [`Pairing::consume`] once the device is saved, with
     /// the same lock still held, so two requests can't both succeed.
     pub fn check(&mut self, now: Instant, presented: &str) -> Result<(), PairError> {

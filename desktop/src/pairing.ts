@@ -5,7 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 
 type Device = { deviceId: string; name: string; platform: string };
 type View = {
-  status: "waiting" | "expired" | "paired" | "removed" | "no_network";
+  status: "waiting" | "expired" | "locked" | "paired" | "removed" | "no_network";
   svg: string | null;
   pcName: string;
   shortId: string;
@@ -72,9 +72,10 @@ export function startPairingWindow(root: HTMLElement): void {
       );
       return;
     }
-    if (view.status === "expired") {
+    if (view.status === "expired" || view.status === "locked") {
+      // "locked": five wrong guesses shut the code down. Either way the QR code is gone, and a new one has to be shown.
       root.append(
-        el("p", {}, "This code has expired."),
+        el("p", {}, view.status === "locked" ? "Too many wrong attempts. This code no longer works." : "This code has expired."),
         el("div", { className: "row" }, button("Show a new code", () => void renew())),
       );
       return;

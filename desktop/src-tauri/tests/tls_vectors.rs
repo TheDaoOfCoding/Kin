@@ -255,16 +255,14 @@ async fn control_the_same_client_connects_when_it_signs_honestly() {
     s.expect_accepted(client_config(&s.pc.device_id, vec![s.phone.cert.clone()], &s.phone.pkcs8, Signing::Honest)).await;
 }
 
-/// The first real Android certificate is the test that matters (protocol/README.md, "Android: the certificate"). When the
-/// integration agent adds `fixtures/android-client.der` (and `android-client.key.der`, a throwaway key), the PC has to
-/// accept it. Until then there is nothing to test.
+/// The first real Android certificate is the test that matters (protocol/README.md, "Android: the certificate"): the PC has to
+/// accept a certificate that the Android app generated itself. The fixture is part of the repository now, so this test **fails**
+/// if `protocol/fixtures/android-client.der` is missing. (It used to pass quietly without it, which let a deleted or renamed
+/// fixture go unnoticed.) `android-client.key.der`, a throwaway key for a full handshake, is still optional.
 #[tokio::test]
-async fn android_generated_certificate_is_accepted_when_the_fixture_exists() {
+async fn android_generated_certificate_is_accepted() {
     let cert_path = protocol_dir().join("fixtures/android-client.der");
-    if !cert_path.exists() {
-        eprintln!("skipped: no protocol/fixtures/android-client.der yet");
-        return;
-    }
+    assert!(cert_path.exists(), "the Android certificate fixture is missing: {}", cert_path.display());
     let cert = std::fs::read(&cert_path).unwrap();
     assert_eq!(certificate_profile_violations(&cert), Vec::<String>::new(), "the Android certificate leaves the profile");
     assert!(P256ClientVerifier.verify_client_cert(&CertificateDer::from(cert.clone()), &[], UnixTime::now()).is_ok());
