@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <!-- WinForms is only here for System.Windows.Forms.NotifyIcon (the tray). -->
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>Kin</AssemblyName>
+    <RootNamespace>Kin</RootNamespace>
+    <ApplicationIcon>Assets\kin.ico</ApplicationIcon>
+    <Product>Kin Relay</Product>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Also embedded as a resource so the tray can load it without a file on disk. -->
+    <Resource Include="Assets\kin.ico" />
+  </ItemGroup>
+
+</Project>
