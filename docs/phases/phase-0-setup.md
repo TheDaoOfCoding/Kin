@@ -45,12 +45,10 @@ Check with: `rustc --version`, `cargo --version`, `adb --version` and the .NET c
 
 This shows early whether your home network has the problems listed in [risks.md](../risks.md).
 
-1. On the PC, start a tiny server:
-   `bun -e "Bun.serve({ port: 47821, fetch: () => new Response('hi') })"`
-2. Find the PC's address: `ipconfig`, then the IPv4 address of the Wi-Fi or Ethernet adapter.
-3. In the phone's browser, open `http://<pc-address>:47821`. It should show "hi".
-4. If Windows shows a firewall prompt, note whether the network is "Private" or "Public". That feeds decision D12.
-5. If the page doesn't load, check the Windows firewall, whether you're on a guest network, and whether the router has "AP isolation" or "client isolation" turned on.
+1. On the PC, run `bun tools/net-check.ts`. It serves a short text page on port 47821, prints a URL for each LAN address (the likely one is marked), and logs every request. It stops on Ctrl+C or after 10 minutes. See [tools/README.md](../../tools/README.md).
+2. If Windows shows a firewall prompt, allow it, and note whether the network is "Private" or "Public". That feeds decision D12.
+3. In the phone's browser, on Wi-Fi, open a printed URL. It should show "Kin Relay network check OK", and the PC's log should show a request from the phone's address.
+4. If the page doesn't load, check the Windows firewall, whether you're on a guest network, and whether the router has "AP isolation" or "client isolation" turned on.
 
 ## 6. Warm-up (optional)
 
