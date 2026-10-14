@@ -1,0 +1,7 @@
+html, body { height: 100%; margin: 0; }
+body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font: 20px "Segoe UI", system-ui, sans-serif;
+}

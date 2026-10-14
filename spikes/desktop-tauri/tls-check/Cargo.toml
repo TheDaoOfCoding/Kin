@@ -1,0 +1,12 @@
+# Standalone check for the D2 table, not part of the Kin app. It never opens a socket: the TLS handshake runs in memory.
+[package]
+name = "tls-check"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rustls = "0.23"
+rcgen = "0.14"
+x509-parser = "0.18"
+sha2 = "0.10"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
