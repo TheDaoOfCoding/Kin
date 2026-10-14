@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The pairing window talks to the app through its own commands and listens for its events",
+  "windows": ["pairing"],
+  "permissions": ["core:default"]
+}

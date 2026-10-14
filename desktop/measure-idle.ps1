@@ -1,0 +1,42 @@
+﻿# Idle memory of the release Kin.exe, tray only, measured the same way as docs/results/phase-0-tauri.md: private working set from
+# the Win32_PerfFormattedData_PerfProc_Process counters (what Task Manager calls "active private working set"), working set and
+# private bytes from Get-Process, 60 s after launch. No window is ever opened.
+#
+# The app runs with the developer network settings (loopback only, no mDNS), so no Windows Firewall prompt appears. That leaves
+# out the mDNS daemon of a normal run. It runs with a throwaway profile, so nothing in %APPDATA%\Kin is touched.
+#
+#   powershell -ExecutionPolicy Bypass -File desktop\measure-idle.ps1 [-IdleSeconds 60] [-Runs 3]
+param(
+    [int]$IdleSeconds = 60,
+    [int]$Runs = 3
+)
+$ErrorActionPreference = 'Stop'
+$exe = Join-Path $PSScriptRoot 'src-tauri\target\release\Kin.exe'
+if (Get-Process Kin -ErrorAction SilentlyContinue) { throw 'Kin is already running; quit it first' }
+
+foreach ($run in 1..$Runs) {
+    $data = Join-Path ([IO.Path]::GetFullPath($env:TEMP)) "kin-idle-$run"
+    Remove-Item $data -Recurse -Force -ErrorAction SilentlyContinue
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    # The path is quoted, because Start-Process doesn't quote the arguments of an array for you, and the temp folder can have a space.
+    $p = Start-Process $exe -ArgumentList '--data-dir', ('"{0}"' -f $data), '--dev-bind', '127.0.0.1', '--dev-no-windows' -PassThru
+    Start-Sleep -Seconds ([math]::Max(0, $IdleSeconds - $sw.Elapsed.TotalSeconds))
+    $p.Refresh()
+    $perf = Get-CimInstance Win32_PerfFormattedData_PerfProc_Process | Where-Object { $_.IDProcess -eq $p.Id }
+    $children = @(Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $p.Id })
+    [pscustomobject]@{
+        Run = $run
+        AfterSeconds = [math]::Round($sw.Elapsed.TotalSeconds)
+        Processes = 1 + $children.Count
+        WorkingSetMB = [math]::Round($p.WorkingSet64 / 1MB, 1)
+        PrivateWorkingSetMB = [math]::Round($perf.WorkingSetPrivate / 1MB, 1)
+        PrivateBytesMB = [math]::Round($p.PrivateMemorySize64 / 1MB, 1)
+        Threads = $p.Threads.Count
+        Handles = $p.HandleCount
+    } | Format-Table -AutoSize | Out-String
+    Start-Process $exe -ArgumentList '--quit' -Wait | Out-Null
+    [void]$p.WaitForExit(8000)
+    if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+    Remove-Item $data -Recurse -Force -ErrorAction SilentlyContinue
+}
+
