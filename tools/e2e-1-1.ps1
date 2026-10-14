@@ -1,11 +1,13 @@
 ﻿# End-to-end check of milestone 1.1 on the emulator: the real Windows app (Kin.exe, developer mode, loopback only)
 # and the real debug APK. Pair by deep link, ping both ways, check the state on both sides, tear everything down.
 # Exits 0 if every check passed, 1 otherwise. Later milestones extend the section marked "EXTEND HERE".
+# -Milestone 1.2 adds the text, link and clipboard scenarios of tools\e2e-1-2-scenarios.ps1 (use tools\e2e-1-2.ps1, which sets it).
 #
 #   tools\e2e-1-1.ps1                      # kin_api37 (Android 17)
 #   tools\e2e-1-1.ps1 -Avd kin_api29       # Android 10
 #   tools\e2e-1-1.ps1 -Build               # build Kin.exe and the debug APK first (slow)
 #   tools\e2e-1-1.ps1 -KeepRunning         # leave emulator and Kin running, for debugging
+#   tools\e2e-1-1.ps1 -Milestone 1.2      # the same plus milestone 1.2; it saves and restores the real PC clipboard
 #
 # The desktop app only ever runs with --dev-bind 127.0.0.1 (never all interfaces, so no firewall prompt) and a throwaway
 # data directory under %TEMP%, never %APPDATA%\Kin. Needs ANDROID_HOME and JAVA_HOME (user environment; read from the
@@ -14,6 +16,9 @@ param(
     [string]$Avd = 'kin_api37',
     [switch]$Build,
     [switch]$KeepRunning,
+    [ValidateSet('1.1', '1.2')][string]$Milestone = '1.1',
+    [switch]$DiscardClipboard,   # 1.2: go on although the PC clipboard holds more than plain text (it can't be put back, and is lost)
+    [string]$ScreenshotDir = (Join-Path $PSScriptRoot '..\docs\results\phase-1-2-integration-screens'),
     [string]$Kin = (Join-Path $PSScriptRoot '..\desktop\src-tauri\target\release\Kin.exe'),
     [string]$Apk = (Join-Path $PSScriptRoot '..\android\app\build\outputs\apk\debug\app-debug.apk')
 )
@@ -67,10 +72,12 @@ function Phone-Cmd([string]$Command, [string]$Wait = '') {
     return $script:l
 }
 function Parse-Rtt($line) { if ($line -match 'Rtt\(millis=([0-9.]+)\)') { [double]$Matches[1] } else { $null } }
+if ($Milestone -eq '1.2') { . (Join-Path $PSScriptRoot 'e2e-1-2-scenarios.ps1') }
 function Phone-State { $l = Phone-Cmd 'STATE'; $h = @{}; if ($l) { foreach ($m in [regex]::Matches($l, '(\w+)=(\S+)')) { $h[$m.Groups[1].Value] = $m.Groups[2].Value } }; $h }
 
 $started = @{ Emulator = $false; Kin = $false }
 try {
+    if ($Milestone -eq '1.2') { Save-PcClipboard $DiscardClipboard.IsPresent }   # before anything can touch it
     if ($Build) {
         Say 'building Kin.exe'
         Push-Location (Join-Path $Repo 'desktop'); . .\_env.ps1
@@ -117,8 +124,10 @@ try {
     $url = (Get-Content $urlFile -Raw).Trim()
     $token = ([regex]::Match($url, 'tk=([^&]+)')).Groups[1].Value
     Check 'pairing URL has the emulator address' ($url -match "a=10\.0\.2\.2:$($pc.port)&")
+    if ($Milestone -eq '1.2') { Test-ConfirmationScreen $url $pc }   # a link without AUTO_CONFIRM must not pair by itself
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    A shell am start -a android.intent.action.VIEW -d "'$url'" 2>$null | Out-Null
+    # AUTO_CONFIRM is the debug build's way past the confirmation screen that every link from outside the app gets
+    A shell am start -a android.intent.action.VIEW -d "'$url'" --ez app.kinrelay.android.AUTO_CONFIRM true 2>$null | Out-Null
     $paired = Wait-Until { (Get-Status).state -eq 'phone_connected' } 40
     Check 'paired and connected' $paired ("{0:N1} s" -f $sw.Elapsed.TotalSeconds)
     $pc = Get-Status
@@ -144,10 +153,12 @@ try {
     Check 'no private key in the logs' ($phoneLog -notmatch 'PRIVATE KEY' -and $pcLog -notmatch 'PRIVATE KEY')
 
     # ---- EXTEND HERE: later milestones add their scenarios (text, clipboard, files, ...) before the unpair.
+    if ($Milestone -eq '1.2') { Run-Milestone12 }
 
     # ---- unpair from the phone: the PC cleans up
     Phone-Cmd 'UNPAIR' | Out-Null
     Check 'unpair from the phone removes the device on the PC' (Wait-Until { $s = Get-Status; $s.state -eq 'not_paired' -and @($s.devices).Count -eq 0 } 15)
+    if ($Milestone -eq '1.2') { Test-ConfirmByTap }
 }
 catch {
     Say "ERROR: $_"
@@ -164,12 +175,19 @@ finally {
         if ($started.Emulator) { Invoke-EmuScript 'stop.ps1' @('-All') 120 | Out-Null }
         & $Adb kill-server 2>$null | Out-Null
     }
+    # After Kin has quit, so that the restored text is not synced to the phone. Also with -KeepRunning: it is the user's clipboard.
+    if ($Milestone -eq '1.2') { Restore-PcClipboard }
     $shouldKeep = $script:Failures.Count -gt 0 -or $KeepRunning
     if ($shouldKeep -and (Test-Path $Data)) { Say "data and logs kept in $Data" }
     elseif (Test-Path $Data) { try { [IO.Directory]::Delete($Data, $true) } catch { Say "could not remove $Data" } }
 }
 
 Write-Host ''
+if ($script:Timings -and $script:Timings.Count -gt 0) {
+    Write-Host 'Arrival times:'
+    $script:Timings.GetEnumerator() | ForEach-Object { Write-Host ("  {0,-95} {1}" -f $_.Key, $_.Value) }
+    Write-Host ''
+}
 $script:Results.GetEnumerator() | ForEach-Object { Write-Host ("{0,-5} {1}" -f $_.Value, $_.Key) }
 if ($script:Failures.Count -gt 0) { Write-Host "`nFAILED: $($script:Failures -join '; ')"; exit 1 }
 Write-Host "`nOK: all $($script:Results.Count) checks passed on $Avd."
