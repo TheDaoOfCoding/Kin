@@ -30,6 +30,7 @@ fun DebugScreen(
         Text("Debug", style = MaterialTheme.typography.titleLarge)
         Text("Connects: ${stats.connects}   Disconnects: ${stats.disconnects}   Service kills: ${stats.kills}")
         Text("Last ping: ${stats.lastRttMillis?.let { UiText.formatMillis(it) } ?: "none yet"}")
+        Text("Last send (tap to ack): ${stats.lastArrivalMillis?.let { "$it ms" } ?: "none yet"}")
         Text("WebSocket ping every (applies at the next connection):", style = MaterialTheme.typography.bodySmall)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             PING_CHOICES.forEach { (seconds, label) ->

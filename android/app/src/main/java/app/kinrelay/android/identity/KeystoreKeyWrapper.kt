@@ -12,7 +12,7 @@ import javax.crypto.spec.GCMParameterSpec
 class KeystoreKeyWrapper(private val alias: String = "kin_identity_wrap") : KeyWrapper {
     override fun encrypt(plain: ByteArray): ByteArray {
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.ENCRYPT_MODE, secretKey())
+        cipher.init(Cipher.ENCRYPT_MODE, secretKey(create = true))
         cipher.updateAAD(AAD)
         val iv = cipher.iv
         check(iv.size == IV_BYTES)
@@ -20,16 +20,18 @@ class KeystoreKeyWrapper(private val alias: String = "kin_identity_wrap") : KeyW
     }
 
     override fun decrypt(wrapped: ByteArray): ByteArray {
-        require(wrapped.size > 1 + IV_BYTES && wrapped[0] == VERSION) { "unknown key file format" }
+        if (wrapped.size <= 1 + IV_BYTES || wrapped[0] != VERSION) throw CorruptKeyFileException("unknown key file format")
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.DECRYPT_MODE, secretKey(), GCMParameterSpec(TAG_BITS, wrapped, 1, IV_BYTES))
+        cipher.init(Cipher.DECRYPT_MODE, secretKey(create = false), GCMParameterSpec(TAG_BITS, wrapped, 1, IV_BYTES))
         cipher.updateAAD(AAD)
         return cipher.doFinal(wrapped, 1 + IV_BYTES, wrapped.size - 1 - IV_BYTES)
     }
 
-    private fun secretKey(): SecretKey {
+    /** Decrypting must never create the key: a new key could not read the old file and would hide the loss. */
+    private fun secretKey(create: Boolean): SecretKey {
         val store = KeyStore.getInstance(PROVIDER).apply { load(null) }
         (store.getKey(alias, null) as? SecretKey)?.let { return it }
+        if (!create) throw KeyMissingException("the Keystore key '$alias' does not exist")
         val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, PROVIDER)
         generator.init(
             KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)

@@ -32,6 +32,12 @@ interface LinkHost {
     suspend fun onDisconnected(end: SessionEnd, action: CloseAction)
     fun onPingReceived(fromName: String)
     suspend fun onPeerUnpaired()
+
+    /** A `text` from the PC (acked already). Called one at a time, in arrival order. */
+    suspend fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean)
+
+    /** A `clipboard` from the PC (acked already). Called one at a time, in arrival order. */
+    suspend fun onClipboardReceived(id: String, text: String)
 }
 
 /**
@@ -53,6 +59,7 @@ class LinkLoop(
     val state: StateFlow<LinkState> = mutableState
 
     private val wake = Channel<Unit>(Channel.CONFLATED)
+    private val deliveries = DeliveryQueue(log)
     private var job: Job? = null
     @Volatile private var session: LinkConnection? = null
     @Volatile private var stopping = false
@@ -60,6 +67,7 @@ class LinkLoop(
     val currentSession: LinkConnection? get() = session
 
     fun start() {
+        deliveries.start(scope)
         job = scope.launch { run() }
     }
 
@@ -81,6 +89,14 @@ class LinkLoop(
     }
 
     private suspend fun run() {
+        try {
+            runConnections()
+        } finally {
+            deliveries.close()
+        }
+    }
+
+    private suspend fun runConnections() {
         while (!stopping) {
             mutableState.value = LinkState.Connecting()
             val address = findAddress()
@@ -99,6 +115,12 @@ class LinkLoop(
                 override fun onPeerUnpaired() {
                     scope.launch { host.onPeerUnpaired() }
                 }
+
+                override fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean) =
+                    deliveries.submit { host.onTextReceived(fromName, id, text, isUrl) }
+
+                override fun onClipboardReceived(id: String, text: String) =
+                    deliveries.submit { host.onClipboardReceived(id, text) }
             }
             val opened = env.openSession(address, listener)
             session = opened

@@ -18,9 +18,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import app.kinrelay.android.AppGraph
 import app.kinrelay.android.data.Stats
+import app.kinrelay.android.pairing.PairingUiState
 import kotlinx.coroutines.launch
 
-/** The three screens in one: Onboarding or Home (depending on whether a PC is paired) and Debug. */
+/** The screens in one: Confirm pairing (when a link is waiting), Onboarding or Home (depending on whether a PC is paired), and Debug. */
 @Composable
 fun KinRoot(
     graph: AppGraph,
@@ -29,11 +30,14 @@ fun KinRoot(
     onAllowLocalNetwork: () -> Unit,
     onScan: () -> Unit,
     onPair: (String) -> Unit,
+    onConfirmPairing: () -> Unit,
+    onCancelPairing: () -> Unit,
 ) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
     val scope = rememberCoroutineScope()
     val devices by graph.database.devices().observeAll().collectAsState(initial = null)
     val identity by graph.identityFlow.collectAsState()
+    val identityProblem by graph.identityProblem.collectAsState()
     val linkState by graph.link.state.collectAsState()
     val lastPing by graph.link.lastPing.collectAsState()
     val pairingState by graph.pairing.state.collectAsState()
@@ -42,6 +46,12 @@ fun KinRoot(
 
     Scaffold(modifier = Modifier.fillMaxSize()) { padding ->
         Column(modifier = Modifier.padding(padding)) {
+            val confirm = pairingState as? PairingUiState.Confirm
+            if (confirm != null) {
+                // A pairing link from outside the app: nothing else is shown until the user decides.
+                ConfirmPairingScreen(confirm.confirmation, onConfirm = onConfirmPairing, onCancel = onCancelPairing)
+                return@Column
+            }
             PrimaryTabRow(selectedTabIndex = tab) {
                 Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Kin") })
                 Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Debug") })
@@ -54,6 +64,9 @@ fun KinRoot(
                     devices == null -> Unit
                     pc == null -> OnboardingScreen(
                         state = pairingState,
+                        localNetworkAllowed = localNetworkAllowed,
+                        onAllowLocalNetwork = onAllowLocalNetwork,
+                        identityProblem = identityProblem,
                         onScan = onScan,
                         onPair = onPair,
                     )
@@ -62,6 +75,9 @@ fun KinRoot(
                         phoneShortId = identity?.shortId,
                         localNetworkAllowed = localNetworkAllowed,
                         onAllowLocalNetwork = onAllowLocalNetwork,
+                        identityProblem = identityProblem,
+                        pairingState = pairingState,
+                        onDismissPairing = { graph.pairing.reset() },
                         state = linkState,
                         lastPing = lastPing,
                         onPing = { graph.link.ping() },

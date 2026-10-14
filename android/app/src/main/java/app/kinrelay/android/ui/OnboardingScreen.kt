@@ -27,6 +27,9 @@ import app.kinrelay.android.pairing.PairingUiState
 @Composable
 fun OnboardingScreen(
     state: PairingUiState,
+    localNetworkAllowed: Boolean,
+    onAllowLocalNetwork: () -> Unit,
+    identityProblem: String?,
     onScan: () -> Unit,
     onPair: (String) -> Unit,
     modifier: Modifier = Modifier,
@@ -42,6 +45,8 @@ fun OnboardingScreen(
             "On your PC open Kin and choose “Pair new phone”, then scan the code it shows.",
             style = MaterialTheme.typography.bodyLarge,
         )
+        if (identityProblem != null) IdentityProblemCard(identityProblem)
+        if (!localNetworkAllowed) LocalNetworkCard(onAllowLocalNetwork)
         Button(onClick = onScan, enabled = state !is PairingUiState.Working, modifier = Modifier.fillMaxWidth()) {
             Text("Scan code")
         }
@@ -58,7 +63,7 @@ fun OnboardingScreen(
             modifier = Modifier.fillMaxWidth(),
         ) { Text("Pair") }
         when (state) {
-            PairingUiState.Idle -> Unit
+            PairingUiState.Idle, is PairingUiState.Confirm -> Unit
             is PairingUiState.Working -> Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 CircularProgressIndicator(modifier = Modifier.size(24.dp))
                 Text(state.message)

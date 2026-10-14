@@ -20,8 +20,10 @@ import javax.net.ssl.X509ExtendedKeyManager
 import javax.net.ssl.X509ExtendedTrustManager
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import mockwebserver3.Dispatcher
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
@@ -57,6 +59,10 @@ class FakePc(
     @Volatile var sendHelloOnOpen = true
     @Volatile var helloProtocol = 1
     @Volatile var ackPings = true
+
+    /** What the PC does with a `text` from the phone: ack it, say nothing, or answer with this `error` code. */
+    @Volatile var ackTexts = true
+    @Volatile var errorForText: String? = null
     @Volatile var pairResponse: (() -> MockResponse)? = null
     @Volatile var onFrame: ((WebSocket, JsonObject) -> Unit)? = null
     @Volatile var wsUpgradeStatus: Int? = null
@@ -84,6 +90,13 @@ class FakePc(
     }
 
     fun send(text: String) = sockets.last().send(text)
+
+    /** A `clipboard` message from the PC, written the way the real PC writes it (compact JSON). */
+    fun sendClipboard(id: String, text: String) =
+        send(buildJsonObject { put("type", "clipboard"); put("id", id); put("text", text) }.toString())
+
+    fun sendText(id: String, text: String, isUrl: Boolean) =
+        send(buildJsonObject { put("type", "text"); put("id", id); put("text", text); put("isUrl", isUrl) }.toString())
 
     fun sendBinary(bytes: ByteArray) = sockets.last().send(ByteString.of(*bytes))
 
@@ -136,6 +149,14 @@ class FakePc(
             val id = frame["id"]?.jsonPrimitive?.content
             when (type) {
                 "ping" -> if (ackPings && id != null) webSocket.send("""{"type":"ack","ref":"$id"}""")
+                "text" -> if (id != null) {
+                    val error = errorForText
+                    if (error != null) {
+                        webSocket.send("""{"type":"error","ref":"$id","code":"$error","message":"test"}""")
+                    } else if (ackTexts) {
+                        webSocket.send("""{"type":"ack","ref":"$id"}""")
+                    }
+                }
                 "unpair" -> if (id != null) {
                     webSocket.send("""{"type":"ack","ref":"$id"}""")
                     webSocket.close(1000, "unpaired")

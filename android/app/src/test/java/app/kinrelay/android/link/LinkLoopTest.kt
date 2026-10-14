@@ -33,6 +33,7 @@ class LinkLoopTest {
             ended.complete(end(1000))
         }
         override suspend fun ping(timeoutMillis: Long) = PingResult.NoConnection
+        override suspend fun sendAcked(id: String, frame: String, timeoutMillis: Long) = AckResult.NoConnection
         override suspend fun sendUnpairAndClose() = Unit
     }
 
@@ -69,7 +70,14 @@ class LinkLoopTest {
         val connected = mutableListOf<PairingAddress>()
         val disconnected = mutableListOf<Pair<SessionEnd, CloseAction>>()
         var unpaired = 0
+        val delivered = mutableListOf<String>()
         override suspend fun lastAddresses() = addresses
+        override suspend fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean) {
+            // The first message is slow on purpose: the second must still wait for it.
+            if (text == "slow") kotlinx.coroutines.delay(1_000)
+            delivered += "text:$text"
+        }
+        override suspend fun onClipboardReceived(id: String, text: String) { delivered += "clipboard:$text" }
         override suspend fun onConnected(address: PairingAddress, peer: Hello) { connected += address }
         override suspend fun onDisconnected(end: SessionEnd, action: CloseAction) { disconnected += end to action }
         override fun onPingReceived(fromName: String) = Unit
@@ -179,6 +187,25 @@ class LinkLoopTest {
         val before = env.discoverTimes.size
         advance(5_000)
         assertEquals(before + 1, env.discoverTimes.size)
+        loop.stop("test")
+    }
+
+    @Test
+    fun textAndClipboardFromThePcAreDeliveredInArrivalOrderEvenWhenTheFirstIsSlow() = runTest {
+        val env = Env(this).apply { winners = setOf(known) }
+        val host = Host(listOf(known))
+        val loop = loop(env, host)
+        loop.start()
+        runCurrent()
+        val listener = env.sessions.single().listener
+        listener.onHelloAccepted(peer)
+        listener.onTextReceived("Desk PC", "a", "slow", false)
+        listener.onClipboardReceived("b", "second")
+        listener.onTextReceived("Desk PC", "c", "third", true)
+        runCurrent()
+        assertTrue("the slow one holds the others back", host.delivered.isEmpty())
+        advance(1_000)
+        assertEquals(listOf("text:slow", "clipboard:second", "text:third"), host.delivered)
         loop.stop("test")
     }
 

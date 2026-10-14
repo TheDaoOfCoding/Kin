@@ -16,7 +16,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 
 /**
  * The foreground service (type `connectedDevice`) that holds the connection to the paired PC.
@@ -31,7 +31,7 @@ class LinkService : Service() {
     override fun onCreate() {
         super.onCreate()
         val graph = applicationContext.graph
-        val notifications = Notifications(this)
+        val notifications = graph.notifications
         try {
             ServiceCompat.startForeground(
                 this, Notifications.LINK_ID, notifications.link("Starting…"),
@@ -44,7 +44,8 @@ class LinkService : Service() {
         }
         scope.launch {
             val bootCount = Settings.Global.getInt(contentResolver, Settings.Global.BOOT_COUNT, -1)
-            when (graph.settings.markServiceStarted(bootCount)) {
+            // Same single thread as the "stopped" marker of the previous run, so the two can't swap places.
+            when (withContext(graph.serviceBookkeeping) { graph.settings.markServiceStarted(bootCount) }) {
                 KinSettings.PreviousRun.CLEAN -> graph.log.i("service", "service started")
                 KinSettings.PreviousRun.REBOOT -> graph.log.i("service", "service started after a reboot")
                 KinSettings.PreviousRun.KILLED -> {
@@ -58,7 +59,7 @@ class LinkService : Service() {
                 stopSelf()
                 return@launch
             }
-            val linkRuntime = LinkRuntime(this@LinkService, graph, scope, notifications) { stopSelf() }
+            val linkRuntime = LinkRuntime(this@LinkService, graph, scope, notifications, onStopRequested = { stopSelf() })
             runtime = linkRuntime
             graph.link.runtime = linkRuntime
             linkRuntime.start()
@@ -77,8 +78,11 @@ class LinkService : Service() {
         graph.link.runtime = null
         graph.link.state.value = LinkState.Stopped
         scope.cancel()
-        runBlocking(Dispatchers.IO) { graph.settings.markServiceStopped() }
-        graph.log.i("service", "service stopped")
+        // Not on this (main) thread: the app's own scope finishes the bookkeeping after the service is gone.
+        graph.scope.launch(graph.serviceBookkeeping) {
+            graph.settings.markServiceStopped()
+            graph.log.i("service", "service stopped")
+        }
         super.onDestroy()
     }
 
@@ -89,6 +93,7 @@ class LinkService : Service() {
         LinkState.Replaced -> "$pcName connected from elsewhere. Open Kin to reconnect"
         LinkState.UpdateApp -> "Update the app: versions don't match"
         LinkState.PairAgain -> "$pcName no longer trusts this phone. Pair again"
+        LinkState.PermissionNeeded -> "Nearby devices permission needed"
     }
 
     companion object {

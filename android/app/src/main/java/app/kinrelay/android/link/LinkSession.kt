@@ -33,6 +33,20 @@ class SessionEnd(
     val peerUnpaired: Boolean,
 )
 
+/** How a message that needs an ack ended. */
+sealed interface AckResult {
+    data object Acked : AckResult
+
+    /** The peer answered with an `error` for it. No retry (protocol.md, Message IDs and acks). */
+    data class Refused(val code: String, val message: String) : AckResult
+
+    /** No ack within the timeout, or the connection ended first. The message may or may not have arrived. */
+    data object NoReply : AckResult
+
+    /** There was no connection to send on. */
+    data object NoConnection : AckResult
+}
+
 /** One connection to the PC, as the reconnect loop and the UI see it. */
 interface LinkConnection {
     val isReady: Boolean
@@ -40,6 +54,12 @@ interface LinkConnection {
     suspend fun awaitEnd(): SessionEnd
     fun closeNormally(reason: String)
     suspend fun ping(timeoutMillis: Long = 5_000L): PingResult
+
+    /**
+     * Sends [frame] (whose `id` is [id]) and waits up to [timeoutMillis] for its `ack`. With no ack the
+     * connection is treated as dead, as for any unacked message.
+     */
+    suspend fun sendAcked(id: String, frame: String, timeoutMillis: Long = 5_000L): AckResult
     suspend fun sendUnpairAndClose()
 }
 
@@ -47,6 +67,12 @@ interface SessionListener {
     fun onHelloAccepted(peer: Hello)
     fun onPingReceived(fromName: String)
     fun onPeerUnpaired()
+
+    /** A valid `text` from the PC, already acked. Called in arrival order from the socket's thread: don't block. */
+    fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean)
+
+    /** A valid `clipboard` from the PC, already acked. */
+    fun onClipboardReceived(id: String, text: String)
 }
 
 /** The phone's own name, sent in its `hello`. */
@@ -93,20 +119,32 @@ class LinkSession(
 
     /** Sends a `ping` and measures the round trip to its `ack` with a monotonic clock. */
     override suspend fun ping(timeoutMillis: Long): PingResult {
-        if (!isReady) return PingResult.NoConnection
         val id = MessageIds.newId()
-        val reply = CompletableDeferred<Action>().also { pending[id] = it }
         val started = System.nanoTime()
-        if (!send(Frames.ping(id, System.currentTimeMillis()))) return PingResult.NoConnection
+        return when (val result = sendAcked(id, Frames.ping(id, System.currentTimeMillis()), timeoutMillis)) {
+            AckResult.Acked -> PingResult.Rtt((System.nanoTime() - started) / 1_000_000.0)
+            is AckResult.Refused -> PingResult.Failed(result.code, result.message)
+            AckResult.NoReply -> PingResult.NoReply
+            AckResult.NoConnection -> PingResult.NoConnection
+        }
+    }
+
+    override suspend fun sendAcked(id: String, frame: String, timeoutMillis: Long): AckResult {
+        if (!isReady) return AckResult.NoConnection
+        val reply = CompletableDeferred<Action>().also { pending[id] = it }
+        if (!send(frame)) {
+            pending.remove(id)
+            return AckResult.NoConnection
+        }
         val action = withTimeoutOrNull(timeoutMillis) { reply.await() }
         pending.remove(id)
         return when (action) {
-            is Action.MarkDelivered -> PingResult.Rtt((System.nanoTime() - started) / 1_000_000.0)
-            is Action.MarkFailed -> PingResult.Failed(action.code, action.message)
+            is Action.MarkDelivered -> AckResult.Acked
+            is Action.MarkFailed -> AckResult.Refused(action.code, action.message)
             else -> {
-                log.w("link", "ping $id not acked in $timeoutMillis ms; treating the connection as dead")
+                log.w("link", "message $id not acked in $timeoutMillis ms; treating the connection as dead")
                 socket?.cancel()
-                PingResult.NoReply
+                AckResult.NoReply
             }
         }
     }
@@ -146,7 +184,8 @@ class LinkSession(
         )
         if (!ended.complete(end)) return
         helloTimeout?.cancel()
-        pending.values.forEach { it.cancel() }
+        // Anyone still waiting for an ack gets an answer that isn't one, instead of a cancellation.
+        pending.values.forEach { it.complete(Action.CloseOnly) }
     }
 
     private fun handle(outcome: app.kinrelay.android.protocol.Outcome) {
@@ -164,6 +203,8 @@ class LinkSession(
             }
             is Action.ShowErrorOnly -> log.w("link", "peer error ${action.code}: ${action.message}")
             is Action.ShowPing -> listener.onPingReceived(receiver.peer?.name ?: "PC")
+            is Action.DeliverText -> listener.onTextReceived(receiver.peer?.name ?: "PC", action.id, action.text, action.isUrl)
+            is Action.SetClipboard -> listener.onClipboardReceived(action.id, action.text)
             is Action.RemovePeerAndClose -> {
                 peerUnpaired = true
                 listener.onPeerUnpaired()

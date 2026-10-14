@@ -9,6 +9,8 @@ sealed class Action(val category: String) {
     class MarkFailed(val ref: String, val code: String, val message: String) : Action("mark_failed")
     class ShowErrorOnly(val code: String, val message: String) : Action("show_error_only")
     class ShowPing(val id: String) : Action("show_ping_toast")
+    class DeliverText(val id: String, val text: String, val isUrl: Boolean) : Action("deliver_text")
+    class SetClipboard(val id: String, val text: String) : Action("set_clipboard")
     data object IgnoreDuplicate : Action("ignore_duplicate")
     data object RemovePeerAndClose : Action("remove_peer_and_close")
     data object CloseOnly : Action("close_only")
@@ -25,17 +27,18 @@ class Outcome(val replies: List<String>, val close: Int?, val action: Action)
  * replies exactly as protocol.md, "Control channel". It does no I/O: the caller sends the replies,
  * closes the socket and acts on [Outcome.action].
  *
- * Milestone 1.1 handles `hello`, `ack`, `error`, `ping` and `unpair`. The later message types
- * (`text`, `clipboard`, `offer`, `complete`, `cancel`) are answered with `unsupported_type`
- * until their milestones, the same as an unknown type.
+ * Milestones 1.1 and 1.2 handle `hello`, `ack`, `error`, `ping`, `unpair`, `text` and `clipboard`. The file
+ * messages (`offer`, `complete`, `cancel`) are answered with `unsupported_type` until 1.3, the same as an
+ * unknown type. `clipboard` only goes from the PC to the phone, so a receiver that stands for the PC
+ * ([acceptsClipboard] false, used by the shared test vectors) answers it with `unsupported_type`.
  */
-class MessageReceiver(private val dedup: DedupMemory) {
+class MessageReceiver(private val dedup: DedupMemory, private val acceptsClipboard: Boolean = true) {
     var peer: Hello? = null
         private set
 
     val helloAccepted: Boolean get() = peer != null
 
-    private val handled = setOf("hello", "ack", "error", "ping", "unpair")
+    private val handled = setOf("hello", "ack", "error", "ping", "unpair", "text", "clipboard")
 
     fun onBinary(): Outcome = Outcome(emptyList(), 1003, Action.CloseOnly)
 
@@ -62,13 +65,15 @@ class MessageReceiver(private val dedup: DedupMemory) {
         }
 
         // 5. Unknown, wrong-direction or not yet supported type.
-        if (type !in handled) return rejected(ErrorCodes.UNSUPPORTED_TYPE, "Unsupported message type.", ref)
+        if (type !in handled || (type == "clipboard" && !acceptsClipboard)) return rejected(ErrorCodes.UNSUPPORTED_TYPE, "Unsupported message type.", ref)
 
         return when (type) {
             "hello" -> onHello(frame, ref)
             "ack" -> onAck(frame)
             "error" -> onError(frame)
             "ping" -> onPing(frame, ref)
+            "text" -> onText(frame, ref)
+            "clipboard" -> onClipboard(frame, ref)
             else -> onUnpair(frame, ref)
         }
     }
@@ -119,14 +124,34 @@ class MessageReceiver(private val dedup: DedupMemory) {
         return processOnce(ref, Action.ShowPing(ref))
     }
 
-    private fun onUnpair(frame: JsonObject, ref: String?): Outcome {
-        if (ref == null) return rejected(ErrorCodes.BAD_REQUEST, "The unpair needs an id.", ref)
-        return processOnce(ref, Action.RemovePeerAndClose, close = 1000)
+    private fun onText(frame: JsonObject, ref: String?): Outcome {
+        val text = Fields.nonEmptyString(frame["text"])
+        val isUrl = Fields.boolean(frame["isUrl"])
+        if (ref == null || text == null || isUrl == null) {
+            return rejected(ErrorCodes.BAD_REQUEST, "The text message needs an id, a non-empty text and isUrl.", ref)
+        }
+        return processOnce(ref, Action.DeliverText(ref, text, isUrl))
     }
 
-    /** Acks a message, or repeats the stored response if its ID was already processed. */
-    private fun processOnce(id: String, action: Action, close: Int? = null): Outcome {
-        dedup.lookup(id)?.let { return Outcome(listOf(it), null, Action.IgnoreDuplicate) }
+    private fun onClipboard(frame: JsonObject, ref: String?): Outcome {
+        val text = Fields.nonEmptyString(frame["text"])
+        if (ref == null || text == null) {
+            return rejected(ErrorCodes.BAD_REQUEST, "The clipboard message needs an id and a non-empty text.", ref)
+        }
+        return processOnce(ref, Action.SetClipboard(ref, text))
+    }
+
+    private fun onUnpair(frame: JsonObject, ref: String?): Outcome {
+        if (ref == null) return rejected(ErrorCodes.BAD_REQUEST, "The unpair needs an id.", ref)
+        return processOnce(ref, Action.RemovePeerAndClose, close = 1000, closeOnDuplicate = 1000)
+    }
+
+    /**
+     * Acks a message, or repeats the stored response if its ID was already processed.
+     * A repeated `unpair` is acked again and the connection is closed again ([closeOnDuplicate]), as the PC does.
+     */
+    private fun processOnce(id: String, action: Action, close: Int? = null, closeOnDuplicate: Int? = null): Outcome {
+        dedup.lookup(id)?.let { return Outcome(listOf(it), closeOnDuplicate, Action.IgnoreDuplicate) }
         val ack = Frames.ack(id)
         dedup.record(id, ack)
         return Outcome(listOf(ack), close, action)

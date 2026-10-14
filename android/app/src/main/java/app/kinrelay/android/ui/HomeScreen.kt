@@ -7,11 +7,13 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -24,6 +26,7 @@ import app.kinrelay.android.data.DeviceEntity
 import app.kinrelay.android.identity.DeviceIds
 import app.kinrelay.android.link.LinkState
 import app.kinrelay.android.link.PingResult
+import app.kinrelay.android.pairing.PairingUiState
 import kotlinx.coroutines.launch
 
 @Composable
@@ -32,6 +35,9 @@ fun HomeScreen(
     phoneShortId: String?,
     localNetworkAllowed: Boolean,
     onAllowLocalNetwork: () -> Unit,
+    identityProblem: String?,
+    pairingState: PairingUiState,
+    onDismissPairing: () -> Unit,
     state: LinkState,
     lastPing: PingResult?,
     onPing: suspend () -> Unit,
@@ -41,11 +47,24 @@ fun HomeScreen(
 ) {
     val scope = rememberCoroutineScope()
     var pinging by remember { mutableStateOf(false) }
+    var confirmUnpair by remember { mutableStateOf(false) }
     Column(
         modifier = modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         Text("Kin", style = MaterialTheme.typography.displayMedium)
+        // A pairing that fails while a PC is paired (a stale link, a used code) used to be visible only in the log.
+        when (pairingState) {
+            is PairingUiState.Failed -> Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Pairing didn't work", style = MaterialTheme.typography.titleMedium)
+                    Text(pairingState.message, color = MaterialTheme.colorScheme.error)
+                    TextButton(onClick = onDismissPairing) { Text("Dismiss") }
+                }
+            }
+            is PairingUiState.Working -> Text(pairingState.message, style = MaterialTheme.typography.bodyLarge)
+            PairingUiState.Idle, is PairingUiState.Confirm -> Unit
+        }
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(pc.name, style = MaterialTheme.typography.titleLarge)
@@ -55,14 +74,8 @@ fun HomeScreen(
                 Text("This phone: ${phoneShortId?.let(DeviceIds::display) ?: "…"}", style = MaterialTheme.typography.bodySmall)
             }
         }
-        if (!localNetworkAllowed) {
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Kin isn't allowed to reach devices on your network, so it can't connect to your PC.")
-                    Button(onClick = onAllowLocalNetwork) { Text("Allow in settings") }
-                }
-            }
-        }
+        if (identityProblem != null) IdentityProblemCard(identityProblem)
+        if (!localNetworkAllowed) LocalNetworkCard(onAllowLocalNetwork)
         Button(
             onClick = { scope.launch { pinging = true; onPing(); pinging = false } },
             enabled = !pinging,
@@ -72,8 +85,45 @@ fun HomeScreen(
         if (state is LinkState.Replaced || state is LinkState.Connecting) {
             OutlinedButton(onClick = onReconnect, modifier = Modifier.fillMaxWidth()) { Text("Reconnect now") }
         }
-        OutlinedButton(onClick = { scope.launch { onUnpair() } }, modifier = Modifier.fillMaxWidth()) {
+        OutlinedButton(onClick = { confirmUnpair = true }, modifier = Modifier.fillMaxWidth()) {
             Text(if (state is LinkState.PairAgain) "Remove this PC" else "Unpair")
+        }
+    }
+    if (confirmUnpair) {
+        AlertDialog(
+            onDismissRequest = { confirmUnpair = false },
+            title = { Text(if (state is LinkState.PairAgain) "Remove ${pc.name}?" else "Unpair from ${pc.name}?") },
+            text = { Text("Text and the clipboard stop syncing until you pair again. ${pc.name} is told, if it's connected.") },
+            confirmButton = {
+                TextButton(onClick = { confirmUnpair = false; scope.launch { onUnpair() } }) {
+                    Text(if (state is LinkState.PairAgain) "Remove" else "Unpair")
+                }
+            },
+            dismissButton = { TextButton(onClick = { confirmUnpair = false }) { Text("Cancel") } },
+        )
+    }
+}
+
+/** Android 17 won't let the app reach the PC without the "Nearby devices" permission. */
+@Composable
+fun LocalNetworkCard(onAllow: () -> Unit, modifier: Modifier = Modifier) {
+    Card(modifier = modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Nearby devices permission needed", style = MaterialTheme.typography.titleMedium)
+            Text("Kin isn't allowed to reach devices on your network, so it can't connect to your PC. Turn on Nearby devices for Kin in the app's permissions.")
+            Button(onClick = onAllow) { Text("Allow in settings") }
+        }
+    }
+}
+
+/** The Keystore couldn't be used right now. Nothing was deleted; Kin tries again by itself. */
+@Composable
+fun IdentityProblemCard(problem: String, modifier: Modifier = Modifier) {
+    Card(modifier = modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Kin can't use its secure storage right now", style = MaterialTheme.typography.titleMedium)
+            Text(problem, style = MaterialTheme.typography.bodyMedium)
+            Text("Your pairing is kept. Restarting the phone usually fixes this.", style = MaterialTheme.typography.bodySmall)
         }
     }
 }

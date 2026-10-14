@@ -68,6 +68,12 @@ Transfers and file names are not part of 1.1. They are in scope for 1.3.
 - How many times the OS killed the service
 - PC-to-phone ping latency after the screen has been off for over an hour
 
+**Permission cases** (Android 17 / API 37, where the "Nearby devices" permission `ACCESS_LOCAL_NETWORK` is a runtime permission; repeat them on every Android 17 test phone and on the emulator):
+
+- **Denied:** deny the permission at the first prompt, then pair. Expected: no connection attempt hangs silently. Home and the service notification say "Nearby devices permission needed" and a button leads to the app settings. A pairing says what is wrong, and a send says "PC not reachable".
+- **Revoked later:** pair and connect, then turn the permission off in the app settings (`adb shell pm revoke app.kinrelay.android android.permission.ACCESS_LOCAL_NETWORK`). Expected: the same state appears without a crash. Turning it back on and opening the app reconnects without pairing again.
+- **Older Android (API 29 to 36):** the permission doesn't exist, no prompt appears and nothing about it is shown.
+
 **Gate:**
 
 | Result | What happens |

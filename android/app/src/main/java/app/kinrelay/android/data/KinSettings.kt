@@ -5,6 +5,7 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.doublePreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
@@ -19,6 +20,8 @@ data class Stats(
     val disconnects: Int = 0,
     val kills: Int = 0,
     val lastRttMillis: Double? = null,
+    /** Tap to ack of the last text sent to the PC, in ms (targets.md priority 2). */
+    val lastArrivalMillis: Long? = null,
     val pingIntervalSeconds: Int = KinSettings.DEFAULT_PING_INTERVAL_SECONDS,
 )
 
@@ -31,6 +34,7 @@ class KinSettings(context: Context) {
             disconnects = prefs[DISCONNECTS] ?: 0,
             kills = prefs[KILLS] ?: 0,
             lastRttMillis = prefs[LAST_RTT],
+            lastArrivalMillis = prefs[LAST_ARRIVAL],
             pingIntervalSeconds = prefs[PING_INTERVAL] ?: DEFAULT_PING_INTERVAL_SECONDS,
         )
     }
@@ -44,6 +48,8 @@ class KinSettings(context: Context) {
     suspend fun countDisconnect() = increment(DISCONNECTS)
 
     suspend fun setLastRtt(millis: Double) = store.edit { it[LAST_RTT] = millis }
+
+    suspend fun setLastArrival(millis: Long) = store.edit { it[LAST_ARRIVAL] = millis }
 
     /** How the previous run of the service ended. */
     enum class PreviousRun {
@@ -84,6 +90,7 @@ class KinSettings(context: Context) {
         private val DISCONNECTS = intPreferencesKey("disconnects")
         private val KILLS = intPreferencesKey("kills")
         private val LAST_RTT = doublePreferencesKey("last_rtt_ms")
+        private val LAST_ARRIVAL = longPreferencesKey("last_arrival_ms")
         private val PING_INTERVAL = intPreferencesKey("ws_ping_interval_s")
         private val SERVICE_RUNNING = booleanPreferencesKey("service_running")
         private val BOOT_COUNT = intPreferencesKey("boot_count")

@@ -17,8 +17,30 @@
                 <action android:name="app.kinrelay.android.debug.UNPAIR" />
                 <action android:name="app.kinrelay.android.debug.PAIR" />
                 <action android:name="app.kinrelay.android.debug.SET_PING_INTERVAL" />
+                <action android:name="app.kinrelay.android.debug.SEND_TEXT" />
+                <action android:name="app.kinrelay.android.debug.SET_CLIPBOARD" />
             </intent-filter>
         </receiver>
+
+        <!--
+            Lets the adb shell start the (not exported) clipboard send activity, the same one the tile and the
+            notification button start: adb shell am start -n app.kinrelay.android/.debug.SendClipboardAlias
+            The shell can't start a non-exported activity, and an alias in the debug build only costs nothing in release.
+        -->
+        <activity-alias
+            android:name=".debug.SendClipboardAlias"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:targetActivity=".clipboard.ClipboardSendActivity" />
+
+        <!-- Reads the real clipboard for tests: adb shell am start -n app.kinrelay.android/.debug.DebugClipboardActivity -->
+        <activity
+            android:name=".debug.DebugClipboardActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:permission="android.permission.DUMP"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Kin.Transparent" />
     </application>
 
 </manifest>

@@ -10,6 +10,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.mutableStateOf
 import androidx.core.net.toUri
 import androidx.lifecycle.lifecycleScope
+import app.kinrelay.android.pairing.PairingIntake
+import app.kinrelay.android.pairing.PairingSource
+import app.kinrelay.android.pairing.PairingTarget
 import app.kinrelay.android.ui.KinRoot
 import app.kinrelay.android.ui.theme.KinTheme
 import com.google.mlkit.vision.barcode.common.Barcode
@@ -19,7 +22,7 @@ import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private val localNetworkAllowed = mutableStateOf(true)
-    private var pendingPairing: String? = null
+    private var pendingTarget: PairingTarget? = null
     private var askedOnce = false
     private var requestInFlight = false
 
@@ -28,10 +31,12 @@ class MainActivity : ComponentActivity() {
             requestInFlight = false
             graph.log.i("app", "permissions: $result")
             refreshPermissions()
-            pendingPairing?.let {
-                pendingPairing = null
+            pendingTarget?.let {
+                pendingTarget = null
                 graph.pairing.start(it, this)
             }
+            // The permission may just have been granted: try the connection now.
+            graph.link.userAction()
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -44,7 +49,9 @@ class MainActivity : ComponentActivity() {
                     localNetworkAllowed = localNetworkAllowed.value,
                     onAllowLocalNetwork = ::allowLocalNetwork,
                     onScan = ::scan,
-                    onPair = ::startPairing,
+                    onPair = { onPairingText(it, PairingSource.IN_APP) },
+                    onConfirmPairing = { graph.pairing.confirm()?.let(::beginPairing) },
+                    onCancelPairing = { graph.pairing.cancel() },
                 )
             }
         }
@@ -74,19 +81,33 @@ class MainActivity : ComponentActivity() {
         localNetworkAllowed.value = Permissions.localNetworkGranted(this)
     }
 
+    /**
+     * A link opened from outside the app (a browser, a message, `adb`). Any app or web page can fire one, so it never
+     * pairs on its own: it opens the confirmation screen. (The debug build can skip that, see [DebugHooks].)
+     */
     private fun handleLink(intent: Intent) {
         if (intent.action != Intent.ACTION_VIEW) return
+        // Re-opening the app from the recents list re-delivers its first intent. That isn't a new link.
+        if (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0) return
         val text = intent.dataString ?: return
-        graph.log.i("app", "pairing link opened (${intent.data?.scheme})")
-        startPairing(text)
+        graph.log.i("app", "pairing link opened from outside the app (${intent.data?.scheme})")
+        onPairingText(text, PairingSource.EXTERNAL_LINK, autoConfirm = DebugHooks.autoConfirmPairing(intent))
+    }
+
+    /** Text that was scanned or pasted in the app ([PairingSource.IN_APP]) or opened as a link. */
+    private fun onPairingText(text: String, source: PairingSource, autoConfirm: Boolean = false) {
+        lifecycleScope.launch {
+            val decision = graph.pairing.intake(text, source, autoConfirm)
+            if (decision is PairingIntake.PairNow) beginPairing(decision.target)
+        }
     }
 
     /** Pairing needs the local network permission on Android 17+, so it is asked for first. */
-    private fun startPairing(text: String) {
+    private fun beginPairing(target: PairingTarget) {
         if (Permissions.localNetworkGranted(this)) {
-            graph.pairing.start(text, this)
+            graph.pairing.start(target, this)
         } else {
-            pendingPairing = text
+            pendingTarget = target
             requestMissingPermissions()
         }
     }
@@ -111,7 +132,7 @@ class MainActivity : ComponentActivity() {
             .enableAutoZoom()
             .build()
         GmsBarcodeScanning.getClient(this, options).startScan()
-            .addOnSuccessListener { barcode -> barcode.rawValue?.let(::startPairing) }
+            .addOnSuccessListener { barcode -> barcode.rawValue?.let { onPairingText(it, PairingSource.IN_APP) } }
             .addOnCanceledListener { graph.log.i("app", "scan canceled") }
             .addOnFailureListener { e ->
                 graph.log.w("app", "code scanner unavailable: ${e.javaClass.simpleName}: ${e.message}")

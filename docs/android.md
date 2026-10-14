@@ -35,11 +35,20 @@ Since Android 10, only the focused app or the active keyboard can read the clipb
 
 Writing to the clipboard from the background is allowed, so PC → phone is automatic. Android 13+ shows a small system confirmation when that happens. That's expected.
 
+## Text and clipboard (built in 1.2)
+
+- **Receiving `clipboard`:** set silently from the service, never stored, never shown. The clip is marked sensitive on Android 13+, so the system's confirmation doesn't show a preview of it. The log holds only the length and a short hash.
+- **Receiving `text`:** copied to the clipboard and shown as a notification "Text from <PC>" with a preview (the lock screen shows only the title). A text with `isUrl` gets an **Open** action only if the text really is one `http` or `https` URL (the phone checks again and never trusts the flag). History comes in 1.4; until then the de-duplication memory is all that remembers a text. Messages are delivered in the order they arrived.
+- **Sending:** `ShareActivity`, `ProcessTextActivity` and `ClipboardSendActivity` start `LinkService` while they are on screen (a visible activity may), hand the text to a sender that runs on the app's scope, and finish at once. The sender waits up to 4 s for a connection, sends one `text` and waits 5 s for the ack. With no connection it shows a "PC not reachable" notification and sends nothing; with no ack it shows "No reply from <PC>" (the message may or may not have arrived). Nothing is queued until 1.4. Text over 1 MiB (the whole JSON frame) says "too long for now" and is logged: the `.txt` file the spec asks for comes with the files in 1.3.
+- **Loop prevention:** the hash of the last text the PC put on the clipboard is remembered for 60 s. A "send clipboard" of the same text in that time is skipped. Share and "Send to PC" are explicit and never skipped.
+- **Arrival time:** the time from the tap (the activity's creation) to the PC's ack is kept for the Debug screen and the debug state dump.
+- **Permission state:** while `ACCESS_LOCAL_NETWORK` is missing (API 37), `LinkService` makes no connection attempt and its state, the Home screen and the notification say "Nearby devices permission needed".
+
 ## LinkService
 
 - **Started when:** the app opens, after pairing, after a reboot, or when the user shares something. Starting from a visible activity is always allowed.
-- **Notification:** low importance and silent. It reads "Connected to Desk PC", "Looking for Desk PC" or "Not on Wi-Fi", with a "Send clipboard" action.
-- **Network:** a network callback watches for Wi-Fi. When Wi-Fi becomes available, the service connects. When it's lost, the service closes cleanly and stops trying.
+- **Notification:** low importance and silent. It reads "Connected to Desk PC", "Looking for Desk PC", "Not on Wi-Fi" or "Nearby devices permission needed", with a "Send clipboard" action.
+- **Network:** a network callback watches for Wi-Fi and keeps track of every Wi-Fi network that is up. When Wi-Fi becomes available, the service connects over the newest one. When that one is lost and another Wi-Fi network is still up, it moves to that one; only when the last one is gone does it close cleanly, say "Not on Wi-Fi" and stop trying.
 - Returns `START_STICKY`, so Android may restart it if it's killed. OEM battery managers often prevent that.
 - **Wake locks:** none while idle. During a transfer, a partial wake lock is held only while bytes are moving.
 

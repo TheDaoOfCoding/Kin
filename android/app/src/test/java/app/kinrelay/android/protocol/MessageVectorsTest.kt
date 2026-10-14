@@ -18,31 +18,37 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/** Runs the milestone 1.1 cases of `protocol/messages.json` through the real [MessageReceiver]. */
+/** Runs the milestone 1.1 and 1.2 cases of `protocol/messages.json` through the real [MessageReceiver]. */
 class MessageVectorsTest {
     private val vectors = Vectors.load("messages.json")
 
     private val validScope = listOf(
         "hello-*", "ack", "ack-from-pc", "error-*", "ping-*", "unpair-*", "nesting-depth-64-*",
         "brackets-inside-strings-do-not-count-as-nesting",
+        // 1.2
+        "text-*", "clipboard-*", "duplicate-keys-*",
     )
     private val invalidScope = listOf(
         "first-message-*", "hello-*", "ack-*", "error-*", "unpair-missing-id", "ping-*", "type-*",
         "unknown-type-is-checked-before-fields", "frame-*", "binary-frame*", "text-frame-1-MiB-plus-1-byte",
         "text-frame-multibyte-over-limit", "text-lone-*", "text-high-surrogate-followed-by-non-low-escape",
         "text-reversed-surrogate-pair-escape", "lone-surrogate-escape-*", "strict-*", "nesting-*",
+        // 1.2
+        "text-*", "clipboard-*",
     )
     private val sequenceScope = listOf(
         "second-hello-after-handshake-is-a-normal-message", "invalid-hello-does-not-count-as-accepted",
         "garbage-before-hello-keeps-the-connection-open", "future-hello-gets-unsupported-version-not-a-timeout",
         "duplicate-ping-shows-one-toast",
+        // 1.2
+        "handshake-then-text-then-duplicate", "invalid-message-keeps-connection-open", "rejected-message-id-is-not-remembered",
     )
 
     /** The invalid-UTF-8 case can only be checked on the PC side: OkHttp never shows the bad bytes. */
     private val skipped = setOf("text-frame-invalid-utf8")
-    private val laterTypes = setOf("text", "clipboard", "offer", "complete", "cancel")
 
-    private fun newReceiver() = MessageReceiver(DedupMemory({ 0L }))
+    /** The phone is the receiver for `to: phone`; for `to: pc` the receiver stands for the PC, which refuses `clipboard`. */
+    private fun newReceiver(role: String = "phone") = MessageReceiver(DedupMemory({ 0L }), acceptsClipboard = role == "phone")
 
     private fun open(receiver: MessageReceiver) {
         val hello = receiver.onText("""{"type":"hello","id":"prime","protocol":1,"name":"Peer","platform":"windows","appVersion":"0.1.0"}""")
@@ -79,7 +85,10 @@ class MessageVectorsTest {
             "ack" -> {
                 assertEquals("$name: one reply", 1, replies.size)
                 assertEquals("$name: type", "ack", replies[0].getValue("type").str())
-                val ref = expect.string("ref") ?: case.getValue("frame").jsonObject.getValue("id").str()
+                val source = case["frame"]?.jsonObject
+                    ?: case["synthesize"]?.jsonObject?.getValue("base")?.jsonObject
+                    ?: StrictJson.parse(case.getValue("raw").str()).jsonObject
+                val ref = expect.string("ref") ?: source.getValue("id").str()
                 assertEquals("$name: ack ref", ref, replies[0].getValue("ref").str())
             }
             "error" -> {
@@ -98,13 +107,13 @@ class MessageVectorsTest {
         for (case in vectors.cases(section)) {
             val name = case.getValue("name").str()
             if (!Vectors.inScope(name, scope) || name in skipped) continue
-            val receiver = newReceiver()
+            val receiver = newReceiver(case.getValue("to").str())
             if (case.getValue("state").str() == "open") open(receiver)
             check("$section/$name", case, feed(receiver, case))
             run++
         }
         println("messages.json $section: $run cases run")
-        assertTrue("$section: ran $run", run > if (section == "valid") 15 else 60)
+        assertTrue("$section: ran $run", run > if (section == "valid") 30 else 80)
     }
 
     @Test
@@ -119,11 +128,9 @@ class MessageVectorsTest {
         for (sequence in vectors.cases("sequences")) {
             val name = sequence.getValue("name").str()
             if (!Vectors.inScope(name, sequenceScope)) continue
-            val receivers = mapOf("phone" to newReceiver(), "pc" to newReceiver())
+            val receivers = mapOf("phone" to newReceiver("phone"), "pc" to newReceiver("pc"))
             for ((i, step) in sequence.getValue("steps").jsonArray.withIndex()) {
                 val case = step.jsonObject
-                // Later milestones: text and the transfer messages are not handled yet.
-                if (case["frame"]?.jsonObject?.get("type")?.str() in laterTypes) break
                 val receiver = receivers.getValue(if (case.getValue("from").str() == "phone") "pc" else "phone")
                 check("sequence/$name#$i", case, feed(receiver, case))
             }

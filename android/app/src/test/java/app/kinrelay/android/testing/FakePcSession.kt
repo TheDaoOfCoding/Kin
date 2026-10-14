@@ -10,7 +10,9 @@ import org.junit.Test
  * serves for KIN_FAKE_PC_SECONDS (default 300). Files in `app/build/fake-pc/`:
  *   pair-url.txt  the deep link to open on the phone
  *   events.txt    what the PC saw, one line per event
- *   command.txt   write `ping`, `close4001`, `close4003`, `unpair`, `hello2` (future-protocol hello) or `stop` here to drive the PC
+ *   command.txt   write `ping`, `close4001`, `close4003`, `unpair`, `hello2` (future-protocol hello) or `stop` here to drive the PC.
+ *                 Milestone 1.2: `clipboard <text>` (a `clipboard` message), `text <text>`, `url <link>` (a `text` with isUrl),
+ *                 `noack` / `ack` (stop / resume acking the phone's `text`) and `errtext` (answer the phone's `text` with an `error`)
  *
  *   KIN_FAKE_PC=1 gradlew.bat testDebugUnitTest --tests "*FakePcSession*" --rerun
  */
@@ -38,12 +40,20 @@ class FakePcSession {
                     pc.requests.drop(seen).forEach { event("http ${it.method} ${it.path} phone=${it.clientDeviceId} ct=${it.contentType} body=${it.body.replace(Regex("\"token\":\"[^\"]*\""), "\"token\":\"[redacted]\"")}") }
                     seen = pc.requests.size
                 }
-                val text = command.readText().trim()
-                if (text.isNotEmpty()) {
+                val line = command.readText().trim()
+                if (line.isNotEmpty()) {
                     command.writeText("")
-                    event("command $text")
+                    event("command ${line.substringBefore(' ')}")
+                    val text = line.substringBefore(' ')
+                    val argument = line.substringAfter(' ', "")
                     runCatching {
                         when (text) {
+                            "clipboard" -> pc.sendClipboard("fake-pc-clip-${System.nanoTime()}", argument)
+                            "text" -> pc.sendText("fake-pc-text-${System.nanoTime()}", argument, isUrl = false)
+                            "url" -> pc.sendText("fake-pc-text-${System.nanoTime()}", argument, isUrl = true)
+                            "noack" -> pc.ackTexts = false
+                            "ack" -> { pc.ackTexts = true; pc.errorForText = null }
+                            "errtext" -> pc.errorForText = "internal"
                             "ping" -> pc.send("""{"type":"ping","id":"fake-pc-ping-${System.nanoTime()}","sentAt":${System.currentTimeMillis()}}""")
                             "close4001" -> pc.closeSocket(4001, "replaced")
                             "close4003" -> pc.closeSocket(4003, "unauthorized")

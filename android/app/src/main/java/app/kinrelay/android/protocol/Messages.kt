@@ -46,6 +46,20 @@ object Frames {
         put("sentAt", sentAt)
     }
 
+    /**
+     * An explicit send. The text is made valid first (an unpaired surrogate becomes U+FFFD). Returns null when the
+     * serialized frame is over 1 MiB: the spec sends longer text as a `.txt` file, which comes with the files in 1.3.
+     */
+    fun text(id: String, text: String, isUrl: Boolean): String? {
+        val frame = buildJsonObject {
+            put("type", "text")
+            put("id", id)
+            put("text", sanitize(text))
+            put("isUrl", isUrl)
+        }.toString()
+        return frame.takeIf { Utf8.size(it) <= MAX_FRAME_BYTES }
+    }
+
     fun unpair(id: String): String = obj {
         put("type", "unpair")
         put("id", id)

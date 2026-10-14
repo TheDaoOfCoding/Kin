@@ -13,14 +13,21 @@ sealed interface PairingUiState {
     data object Idle : PairingUiState
     data class Working(val message: String) : PairingUiState
     data class Failed(val message: String) : PairingUiState
+
+    /** A link from outside the app is waiting for the user to confirm it. Nothing has been contacted. */
+    data class Confirm(val confirmation: PairingConfirmation) : PairingUiState
 }
 
-/** Runs a pairing from scanned or pasted text (or a deep link) and saves the PC on success. */
+/**
+ * Takes pairing text (a scan, a pasted link, a deep link), asks the user to confirm links that came from
+ * outside the app ([PairingIntake]), runs the pairing and saves the PC on success.
+ */
 class PairingController(private val graph: AppGraph) {
     private val mutableState = MutableStateFlow<PairingUiState>(PairingUiState.Idle)
     val state: StateFlow<PairingUiState> = mutableState
     private var job: Job? = null
 
+    /** Clears a finished state (an error, a cancelled confirmation). A running pairing is left alone. */
     fun reset() {
         if (job?.isActive != true) mutableState.value = PairingUiState.Idle
     }
@@ -29,19 +36,51 @@ class PairingController(private val graph: AppGraph) {
         mutableState.value = PairingUiState.Failed(message)
     }
 
-    fun start(text: String, context: android.content.Context) {
-        if (job?.isActive == true) return
-        val log = graph.log
-        when (val parsed = PairingUrl.parse(text)) {
-            is PairingParse.Error -> {
-                log.w("pairing", "link rejected: ${parsed.category} ${parsed.param.orEmpty()}")
-                mutableState.value = PairingUiState.Failed(PairingMessages.forParseError(parsed))
-            }
-            is PairingParse.Ok -> {
-                mutableState.value = PairingUiState.Working("Connecting to the PC…")
-                job = graph.scope.launch { pair(parsed.target, context.applicationContext) }
-            }
+    /**
+     * Decides what to do with [text]: show an error, ask the user (the state becomes [PairingUiState.Confirm]),
+     * or say "pair now", in which case the caller makes sure the permission is there and calls [start].
+     * Returns null when a pairing is already running.
+     */
+    suspend fun intake(text: String, source: PairingSource, autoConfirm: Boolean = false): PairingIntake? {
+        if (job?.isActive == true) {
+            graph.log.w("pairing", "a link was ignored: a pairing is already running")
+            return null
         }
+        val current = graph.pairedDevice()?.let { it.deviceId to it.name }
+        val decision = PairingIntake.decide(PairingUrl.parse(text), source, current, autoConfirm)
+        when (decision) {
+            is PairingIntake.Reject -> {
+                graph.log.w("pairing", decision.logLine)
+                mutableState.value = PairingUiState.Failed(decision.message)
+            }
+            is PairingIntake.AskUser -> {
+                val c = decision.confirmation
+                graph.log.i("pairing", "link from outside the app: waiting for confirmation (pc ${c.target.id.take(8)}… replacing=${c.replacing != null})")
+                mutableState.value = PairingUiState.Confirm(c)
+            }
+            is PairingIntake.PairNow -> Unit
+        }
+        return decision
+    }
+
+    /** The user tapped Confirm: the waiting target, to be passed to [start]. */
+    fun confirm(): PairingTarget? {
+        val waiting = mutableState.value as? PairingUiState.Confirm ?: return null
+        mutableState.value = PairingUiState.Idle
+        graph.log.i("pairing", "pairing confirmed by the user")
+        return waiting.confirmation.target
+    }
+
+    fun cancel() {
+        if (mutableState.value is PairingUiState.Confirm) graph.log.i("pairing", "pairing cancelled by the user")
+        mutableState.value = PairingUiState.Idle
+    }
+
+    /** Starts the pairing itself. Call it only after [intake] said so or after the user confirmed. */
+    fun start(target: PairingTarget, context: android.content.Context) {
+        if (job?.isActive == true) return
+        mutableState.value = PairingUiState.Working("Connecting to the PC…")
+        job = graph.scope.launch { pair(target, context.applicationContext) }
     }
 
     private suspend fun pair(target: PairingTarget, context: android.content.Context) {
@@ -66,6 +105,7 @@ class PairingController(private val graph: AppGraph) {
                 log.i("pairing", "paired with $name (${target.id.take(8)}…) via ${result.address}")
                 mutableState.value = PairingUiState.Idle
                 LinkService.start(context)
+                graph.link.devicePaired()
             }
         }
     }

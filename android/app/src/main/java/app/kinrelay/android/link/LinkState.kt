@@ -22,6 +22,9 @@ sealed interface LinkState {
 
     /** The PC no longer trusts this phone (4003 or 401). */
     data object PairAgain : LinkState
+
+    /** Android 17 needs the "Nearby devices" permission for any connection to the PC, and it is missing or was revoked. */
+    data object PermissionNeeded : LinkState
 }
 
 sealed interface PingResult {
