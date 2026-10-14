@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the hello window",
+  "description": "Capability for the hello window. The page makes no Tauri calls, so it has no permissions",
   "windows": ["hello"],
-  "permissions": ["core:default"]
+  "permissions": []
 }

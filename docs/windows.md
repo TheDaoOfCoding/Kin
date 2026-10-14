@@ -20,7 +20,7 @@
 | Tray, hotkey, notifications, autostart, single instance | Tauri's built-in tray, plus the `global-shortcut`, `notification`, `autostart` and `single-instance` plugins |
 | JSON | `serde`, `serde_json` |
 
-Handlers need to know which device made each request, but axum doesn't pass the client certificate to them by default. That needs a custom TLS accept loop that attaches the peer certificate to every request. It's a known pattern, and it gets built in 1.1.
+Handlers need to know which device made each request, but axum doesn't pass the client certificate to them by default. That needs a custom TLS accept loop that attaches the peer certificate to every request. It's a known pattern, and it gets built in 1.1. Two rules from [protocol.md](protocol.md#transport) apply to it. The client certificate is mandatory in the handshake, and the custom verifier accepts any chain but must still verify the TLS 1.3 signature (`verify_tls13_signature`), so a replayed public certificate can't pass. And axum's default `Json` extractor answers `415`/`422` in plain text, so the app uses its own extractor that returns `400 bad_request` JSON (see [protocol/README.md](../protocol/README.md#notes-for-the-implementers)).
 
 ## Process model
 
@@ -60,7 +60,7 @@ Handlers need to know which device made each request, but axum doesn't pass the 
   netsh advfirewall firewall add rule name="Kin Relay" dir=in action=allow program="<install path>\kin.exe" enable=yes profile=private,public
   ```
 
-  Which profiles to include is decision D12. The uninstaller removes the rule.
+  The rule allows both the Private and Public profiles (D12). Windows 11 marks new networks Public by default, and every request is authenticated (see R8 in [risks.md](risks.md)). The uninstaller removes the rule.
 - Also adds the "Send to" shortcut and start-with-Windows.
 - **Code signing:** unsigned in the MVP, so SmartScreen shows a warning. Sign before the public launch.
 

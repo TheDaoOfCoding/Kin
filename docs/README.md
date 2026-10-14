@@ -4,7 +4,7 @@ The product is called **Kin Relay**. Inside the app it's just **Kin**. Technical
 
 **In one line:** your phone and your PC, finally acting like they belong to the same person. Any brand.
 
-Status: planning. Name decided (D13). Phase 0 is in progress. The Android hello world and the .NET spike are built. The phone steps and the Tauri spike are still to do. Last updated 2026-10-14.
+Status: planning. Name decided (D13) and the Windows stack decided (D2: Tauri v2). Phase 0 is done except the phone steps, which wait for the user's phone. Phase 1 is starting, and agents build it before the user tests on real phones (D14). Last updated 2026-10-14.
 
 ## Phases at a glance
 
@@ -32,9 +32,7 @@ Work proceeds on the default until a decision is made. Details are in [decisions
 
 | # | Question | Default until decided |
 |---|---|---|
-| D2 | Stack | Kotlin on Android, Tauri v2 on Windows. A .NET (C#, WPF) alternative is being compared in Phase 0 |
 | D6 | When the bridge is built | Phase 2, before public launch |
-| D12 | Firewall rule on networks Windows marks "Public" | Allow, because every request is authenticated |
 | - | Test phones | Your own phone, plus a borrowed Xiaomi and Samsung if possible |
 
 ## Planned repo layout
@@ -43,7 +41,7 @@ Work proceeds on the default until a decision is made. Details are in [decisions
 C:\dev\ecosystem-app\
   docs/       this plan
   android/    Android app (Kotlin, Jetpack Compose)
-  desktop/    Windows app (Tauri v2: src-tauri/ is Rust, src/ is the TypeScript UI), unless the .NET spike wins D2
+  desktop/    Windows app (Tauri v2: src-tauri/ is Rust, src/ is the TypeScript UI)
   spikes/     Phase 0 throwaway experiments (desktop-dotnet/, desktop-tauri/)
   protocol/   example messages and test vectors shared by both apps
   tools/      scripts for soak tests and benchmarks

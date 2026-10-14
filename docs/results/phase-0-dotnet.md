@@ -1,6 +1,6 @@
 # Phase 0 result: .NET (WPF) tray spike for D2
 
-Measured 2026-10-14 on Windows 11 Pro 10.0.26300, Ryzen 9 7900X, 31 GB RAM. Code is in `spikes/desktop-dotnet/`. The Tauri side is not built yet (see the end).
+Measured 2026-10-14 on Windows 11 Pro 10.0.26300, Ryzen 9 7900X, 31 GB RAM. Code is in `spikes/desktop-dotnet/`. The Tauri side is in [phase-0-tauri.md](phase-0-tauri.md). D2 was decided for Tauri on 2026-10-14 (see [decisions.md](../decisions.md)), and this spike stays as a record of the comparison.
 
 ## What was built
 
@@ -73,10 +73,10 @@ WPF does not support trimming (`PublishTrimmed`) or NativeAOT, so the self-conta
 Notes for the comparison:
 
 - Everything above sits inside one language and one runtime. There is no Rust and no separate web UI, and no custom TLS accept loop.
-- The cost is size. Even a hello world is 148 MB self-contained, or tiny but tied to a runtime install. Tauri numbers are not available yet.
+- The cost is size. Even a hello world is 148 MB self-contained, or tiny but tied to a runtime install. The Tauri numbers are in [phase-0-tauri.md](phase-0-tauri.md): a 1.1 MB installer and 1.5 MB idle private working set.
 - Idle memory with no window is about 57 MB working set and 14 MB private bytes. The window-open number (128 MB working set) shows WPF windows are heavier than a tray-only process, which is relevant to the "destroy windows on close" rule.
 
-Against [targets.md](../targets.md) (the two priority 5 rows):
+Against [targets.md](../targets.md) (the PC footprint and App size rows):
 
 | Target | Goal | .NET spike | Result |
 |---|---|---|---|
@@ -85,5 +85,5 @@ Against [targets.md](../targets.md) (the two priority 5 rows):
 
 ## Left for the user at home
 
-- Install **Visual Studio Build Tools 2022 or later with the "Desktop development with C++" workload**. It needs admin. After that, install Rust and build the Tauri tray spike so D2 can be compared like for like (idle RAM, startup, bundle size).
+- The Tauri spike has since been built (see [phase-0-tauri.md](phase-0-tauri.md)), and D2 was decided for Tauri.
 - Optionally, run the phone-to-PC browser test from phase-0-setup.md section 5, which was out of scope for this spike.

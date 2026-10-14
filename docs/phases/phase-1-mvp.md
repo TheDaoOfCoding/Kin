@@ -25,9 +25,20 @@ Phone-to-PC clipboard is manual because Android 10+ blocks background apps from 
 
 Out of scope: everything in [Phase 2](phase-2-features.md) and [Later](later.md). That includes the bridge, Bluetooth, multiple phones, clipboard images, notification mirroring, screen mirroring and a pretty UI.
 
+## How Phase 1 is built
+
+Decision D14 sets the order. Agents build all of Phase 1 (milestones 1.1 to 1.4, plus the packaging in 1.5) before the user tests on real phones.
+
+- During development, agents test on the Android emulator (`tools/emulator/`) against the desktop app on the same PC. Two things make that possible without a camera or a LAN:
+  - **The PC needs a developer-only setting (or a debug flag)** that binds the HTTPS server to `127.0.0.1` and puts `10.0.2.2:<port>` in the QR code. From inside the emulator, `10.0.2.2` is the PC's loopback, so no firewall prompt appears. `10.0.2.2` is a valid address in the pairing URL (see [protocol.md](../protocol.md#parsing-rules)).
+  - **The phone app accepts a pairing link without the camera.** The deep link `kinrelay://pair?...` is needed anyway, and the same code path handles a scanned QR. For the emulator: `adb shell am start -a android.intent.action.VIEW -d "kinrelay://pair?v=1&a=10.0.2.2:47821&id=...&tk=...&n=Desk%20PC"` (quote it, because `&` is special in the shell).
+- mDNS discovery can't be tested on the emulator, because multicast doesn't reach the PC's network. It's tested on the real phone.
+- The 1.1 soak gate below still applies. It runs on the real phones once the build is ready. The user can also install the 1.1 build early and soak it while agents continue.
+- If the gate fails, the connection layer gets reworked (for example the FCM wake-up moves into Phase 1). The features above it mostly stay.
+
 ## Milestones
 
-Sizes are relative: S is a few days, M is about a week, L is more than a week. They're guesses for one person learning Kotlin and Rust along the way.
+Sizes are relative: S is small, M is medium, L is large. They show how milestones compare, not how long they take, because agents build it.
 
 ### 1.1 Connection spike: go/no-go gate (L)
 
@@ -36,8 +47,19 @@ Build only what's needed to test the riskiest assumption: that an always-on conn
 - Identity keys and certificates on both sides
 - PC: HTTPS server, mDNS advertising, a pairing window with the QR code
 - Phone: QR scan, pairing, the foreground service holding the WebSocket, and reconnect logic
-- A "Ping" button on both sides. The arrival shows as a notification or toast with the measured latency
+- A "Ping" button on both sides. The sender shows the round-trip time (for example "Ping: 42 ms"), and the receiver shows a notification or toast reading "Ping from <name>"
 - A local log on both sides of every connect, disconnect (with its reason), and service start or stop
+
+**Test vectors in scope for 1.1** (the full list with case names is in [protocol/README.md](../../protocol/README.md#what-each-milestone-needs); `bun protocol/check-vectors.ts` must stay green):
+
+- `device-id.json`: `keys[]`, `hashVectors[]`, `tokenVectors[]`, `shapeVectors[]`
+- `pairing-urls.json`: `valid[]`, `invalid[]`
+- `http.json`: the `pair-*`, `ws-upgrade-*` and `unknown-route*` exchanges (plus `unknown-version-path` and `wrong-method-on-known-route*`), the sequences `pair-rate-limit-per-token` and `pair-token-is-single-use`, `errors[]`, and `tls[]`
+- `messages.json`: the `hello`, `ack`, `error`, `ping` and `unpair` cases, the framing, strict-JSON and nesting cases listed in the README, plus `timers[]` and `closeCodes[]`
+
+Transfers and file names are not part of 1.1. They are in scope for 1.3.
+
+**The certificate is part of 1.1.** Both sides write a certificate that fits the profile in [protocol.md](../protocol.md#transport) (X.509 v3, ECDSA P-256, `ecdsa-with-SHA256`, no critical extensions), because the PC's rustls-webpki refuses anything else. On Android that means hand-rolling the DER from the `device-id.json` certificates or using BouncyCastle `bcpkix` (watch the ~10 MB APK target and R8). **Export one Android-generated certificate as a fixture, and make the Rust verifier tests accept it**, before the soak test starts.
 
 **Soak test:** leave it running for at least 3 days on each test phone, during normal use. Record:
 

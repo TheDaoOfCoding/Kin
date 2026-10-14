@@ -32,8 +32,8 @@ What this means:
 
 ## Identity
 
-- On first run, each install creates a P-256 key pair and a self-signed certificate.
-  - Android: stored in the Android Keystore (hardware-backed where available).
+- On first run, each install creates a P-256 key pair and a self-signed certificate. The certificate follows a fixed profile ([protocol.md](protocol.md#transport)): X.509 v3, ECDSA P-256 key, `ecdsa-with-SHA256`, a serial of at most 20 bytes, no critical extensions. The PC's TLS library rejects anything else, so a phone certificate outside the profile can't connect.
+  - Android: a software key, stored encrypted with an AES-GCM key held in the Android Keystore (D15). Keystore-resident private keys can't reliably be used for TLS client authentication through OkHttp/JSSE on every phone. A hardware-backed key can be an upgrade later.
   - Windows: stored in a file encrypted with DPAPI, so it's tied to the Windows user.
 - **Device ID** = SHA-256 of the public key (SPKI). The short ID shown in the UI is the first 8 characters in base32.
 - **Trust** is a list of pinned device IDs. There's no certificate authority and no account.
@@ -49,11 +49,11 @@ The full steps are in [protocol.md](protocol.md#pairing).
 
 ## Finding each other
 
-- The PC advertises the mDNS service `_kinrelay._tcp` with TXT records `id=<short device ID>` and `v=1`. It listens on port 47821, or a random port if that's taken.
+- The PC advertises the mDNS service `_kinrelay._tcp` with TXT records `id=<short ID>` (the 8-character short ID, no hyphen) and `v=1`. It listens on port 47821, or a random port if that's taken. The exact contract is in [protocol.md](protocol.md#discovery).
 - When the phone tries to connect, it goes in this order:
   1. Race all the addresses that worked last time, with a 1.5 s timeout each. This is the instant path.
-  2. Do an mDNS lookup for up to 5 s and match on the device ID.
-  3. If both fail, back off: 5 s, 30 s, 2 min, then every 10 min. The backoff resets when the network changes or the user does something.
+  2. Do an mDNS lookup for up to 5 s and match the `id` record against the short ID of the paired PC (the full device ID is checked in the TLS handshake).
+  3. If both fail, back off: 5 s, 30 s, 2 min, then every 10 min. The backoff resets when the network changes, when the user does something, or when a connection has stayed open with an accepted `hello` for at least 60 s. A connection that merely opens, or closes within a minute, doesn't reset it (see [protocol.md](protocol.md#close-codes)).
 - **When it tries:** when the service starts, when a Wi-Fi network becomes available, when the user does something, and when the backoff timer fires. It doesn't try on mobile data in the MVP, because there's no [bridge](#future-the-bridge) yet.
 
 ## Connection lifecycle
@@ -68,7 +68,7 @@ States: `offline` → `connecting` → `connected` → back to `connecting` when
 
 - **Small things** (text, clipboard, file offers, acks) go as JSON messages over the WebSocket.
 - **File bytes** go over separate HTTPS requests, so a large file never blocks the control channel.
-- **Every message has an ID.** The receiver acknowledges it. The sender retries until it gets an ack or the send is canceled. The receiver ignores duplicate IDs, so retries are safe.
+- **Every message except `ack` and `error` has an ID, and seven types are acknowledged:** `text`, `clipboard`, `offer`, `complete`, `cancel`, `unpair` and `ping`. The receiver acks each of them. The sender retries until it gets an ack or the send is canceled. The receiver ignores duplicate IDs, so retries are safe. `hello` has an `id` too, but isn't acked. `ack` and `error` have no `id` of their own: they point at another message with `ref`.
 
 ## Queue and resume
 

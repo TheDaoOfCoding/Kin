@@ -17,6 +17,10 @@ const DEFAULT_MINUTES = 10;
 const VIRTUAL_NAME =
   /vethernet|hyper-v|wsl|virtualbox|vbox|vmware|vmnet|docker|virbr|tailscale|zerotier|hamachi|npcap|bluetooth|loopback/i;
 
+// Anything from a request that gets logged: control characters (escape codes, newlines) must not reach the terminal.
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
+export const cleanForLog = (s: string): string => s.replace(CONTROL_CHARS, "?");
+
 export interface Candidate {
   name: string;
   address: string;
@@ -24,8 +28,11 @@ export interface Candidate {
 }
 
 // Pure, so it can be checked without listening on anything.
+// `routeAddress` is the address on the default route. It is never skipped for a virtual-looking adapter name,
+// because a Hyper-V external switch ("vEthernet (...)") can be the real LAN.
 export function listAddresses(
   interfaces: NodeJS.Dict<NetworkInterfaceInfo[]> = networkInterfaces(),
+  routeAddress: string | null = null,
 ): Candidate[] {
   const out: Candidate[] = [];
   for (const [name, infos] of Object.entries(interfaces)) {
@@ -34,7 +41,7 @@ export function listAddresses(
       const c: Candidate = { name, address: info.address };
       if (info.internal || info.address.startsWith("127.")) c.skipped = "loopback";
       else if (info.address.startsWith("169.254.")) c.skipped = "link-local";
-      else if (VIRTUAL_NAME.test(name)) c.skipped = "virtual adapter";
+      else if (VIRTUAL_NAME.test(name) && info.address !== routeAddress) c.skipped = "virtual adapter";
       out.push(c);
     }
   }
@@ -97,8 +104,9 @@ function main() {
       fetch(req, srv) {
         requests++;
         const remote = srv.requestIP(req)?.address.replace(/^::ffff:/, "") ?? "unknown";
-        const ua = (req.headers.get("user-agent") ?? "").slice(0, 70);
-        console.log(`[${clock()}] ${remote}  ${req.method} ${new URL(req.url).pathname}  ${ua}`);
+        const ua = cleanForLog((req.headers.get("user-agent") ?? "").slice(0, 70));
+        const path = cleanForLog(new URL(req.url).pathname.slice(0, 200));
+        console.log(`[${clock()}] ${remote}  ${cleanForLog(req.method)} ${path}  ${ua}`);
         return new Response(`Kin Relay network check OK\nHost: ${host}\n`, {
           headers: { "content-type": "text/plain; charset=utf-8" },
         });
@@ -113,10 +121,11 @@ function main() {
     process.exit(1);
   }
 
-  const all = listAddresses();
+  const route = defaultRouteAddress();
+  const all = listAddresses(networkInterfaces(), route);
   const usable = all.filter((c) => !c.skipped);
   const skipped = all.filter((c) => c.skipped);
-  const likely = usable.length > 1 ? defaultRouteAddress() : null; // with one address there is nothing to pick
+  const likely = usable.length > 1 ? route : null; // with one address there is nothing to pick
 
   console.log(`Kin Relay network check, on ${host}`);
   console.log(`Listening on port ${PORT}, all interfaces. Stops after ${minutes} minute(s), or press Ctrl+C.\n`);

@@ -9,7 +9,7 @@ const WINDOW_LABEL: &str = "hello";
 
 // Windows are created on open and destroyed on close, which frees the WebView2 processes
 // (see docs/windows.md). The app stays alive because of the ExitRequested handler in `run`.
-// Set KIN_HIDE_ON_CLOSE=1 to hide the window instead, to measure what that costs.
+// Set KIN_HIDE_ON_CLOSE=1 (or true) to hide the window instead, to measure what that costs. Any other value leaves it off.
 fn open_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(WINDOW_LABEL) {
         let _ = window.show();
@@ -25,7 +25,7 @@ fn open_window(app: &AppHandle) {
 }
 
 pub fn run() {
-    let hide_on_close = std::env::var_os("KIN_HIDE_ON_CLOSE").is_some();
+    let hide_on_close = matches!(std::env::var("KIN_HIDE_ON_CLOSE").as_deref(), Ok("1" | "true"));
 
     tauri::Builder::default()
         // Must be the first plugin. A second launch runs this callback in the first instance and exits.

@@ -12,7 +12,7 @@ bun tools/net-check.ts --minutes 30
 ```
 
 - It serves "Kin Relay network check OK" and the PC's name on port 47821, on all interfaces.
-- On start it prints a ready-to-type URL for each LAN address, and marks the one on the default route when there is more than one. It skips loopback, link-local and virtual adapters (Hyper-V/WSL, VirtualBox, VMware, Docker, VPNs), and lists what it skipped.
+- On start it prints a ready-to-type URL for each LAN address, and marks the one on the default route when there is more than one. It skips loopback, link-local and virtual adapters (Hyper-V/WSL, VirtualBox, VMware, Docker, VPNs), and lists what it skipped. It never skips the address on the default route, even if the adapter's name looks virtual, because a Hyper-V external switch (`vEthernet (...)`) can be the real LAN.
 - It logs every request with the time and the remote address. Browsers also ask for `/favicon.ico`, so expect two lines per page load.
 - It stops on Ctrl+C, or after 10 minutes. Change that with `--minutes N`.
 
@@ -29,3 +29,17 @@ If the page doesn't load:
 - The firewall prompt was dismissed or closed. Windows then blocks the program silently, and running it again won't ask again. Allow `bun.exe` for the network (Private and Public) in Windows Security → Firewall & network protection → Allow an app through firewall.
 - You used the wrong address. Try the other URLs that were printed.
 
+## Removing the firewall rule afterwards
+
+When you allow the Windows firewall prompt, Windows creates inbound rules for `bun.exe` (usually named "bun" or "bun.exe", one for TCP and one for UDP). They stay after the test. Removing them needs admin.
+
+- **Settings route:** Windows Defender Firewall → Advanced settings → Inbound Rules → select the "bun" entries → Delete.
+- **PowerShell route:** open PowerShell as administrator and run:
+
+  ```
+  Get-NetFirewallApplicationFilter | Where-Object { $_.Program -like '*\bun.exe' } | Get-NetFirewallRule | Remove-NetFirewallRule
+  ```
+
+  To see what it will remove first, run the same line with `| Select-Object DisplayName, Direction, Profile` instead of `| Remove-NetFirewallRule`.
+
+This removes every inbound rule for `bun.exe`, not only this test's. Windows asks again the next time a Bun program listens on the network.

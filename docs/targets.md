@@ -11,8 +11,8 @@ When two goals conflict, the higher one wins. These are targets we chose; none h
 | 3 | Phone battery | Under 1% per day while idle and connected | After 24 h: Settings → Battery → app usage, and `adb shell dumpsys batterystats --charged app.kinrelay.android`. Compare with a day without the app |
 | 4 | Transfer speed | Large files at least as fast as LocalSend on the same network | A 2 GB file, 5 runs each way, median MB/s. Then LocalSend with the same file, devices and positions |
 | 5 | PC footprint | When idle: under 30 MB of RAM and near 0% CPU | After 1 h idle with all windows closed: Task Manager's "Memory (active private working set)", including any leftover WebView2 processes (there should be none). CPU from `Get-Process` sampled over 10 minutes |
-| 5 | App size | APK and installer each about 10 MB or less | Build output sizes |
-| 6 | Setup time | Under 1 minute from opening the installer to "Paired" | Stopwatch, with someone who hasn't seen the app before |
+| 6 | App size | APK and installer each about 10 MB or less | Build output sizes |
+| 7 | Setup time | Under 1 minute from opening the installer to "Paired" | Stopwatch, with someone who hasn't seen the app before |
 
 Not a target in the MVP: how the UI looks, and support for more than one phone and one PC.
 
