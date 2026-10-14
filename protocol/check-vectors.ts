@@ -1048,6 +1048,47 @@ function checkResponse(group: string, name: string, expected: any, actual: Reply
   console.log(`milestone 1.1 scope: ${inScope} cases in messages.json and http.json, plus the whole of the arrays listed in the README`);
 }
 
+// ---- fixtures/: DER certificates for the negative tls[] cases (made by fixtures/make-fixtures.ts)
+{
+  const g = "fixtures";
+  const read = (f: string) => new Uint8Array(readFileSync(join(dir, "fixtures", f)));
+  const expectations: [string, RegExp][] = [
+    ["client-v1.der", /version is v1/],
+    ["client-unknown-critical-extension.der", /critical extension 1\.3\.6\.1\.4\.1\.99999\.1/],
+    ["client-not-p256.der", /curve is not prime256v1/],
+  ];
+  for (const [file, expected] of expectations) {
+    const der = read(file);
+    const violations = certProfileViolations(der);
+    check(g, `${file}: leaves the profile in the way its name says`, violations.some((v) => expected.test(v)), () => violations.join("; "));
+    // Everything else is fine, so a refused handshake is refused for that one reason. (P-384 also changes the SPKI size, which is the same reason.)
+    const others = violations.filter((v) => !expected.test(v) && !(file === "client-not-p256.der" && /SPKI|point/.test(v)));
+    check(g, `${file}: nothing else is wrong with it`, others.length === 0, () => others.join("; "));
+    // The signature is valid: the certificate is self-signed with its own key.
+    const x509 = new X509Certificate(Buffer.from(der));
+    check(g, `${file}: signature verifies with its own key`, x509.verify(x509.publicKey));
+  }
+  // The v1 and critical-extension certificates carry test key 2 of device-id.json, so a handshake that signs with key 2 has a valid CertificateVerify.
+  const key2 = load("device-id.json").keys[1];
+  for (const file of ["client-v1.der", "client-unknown-critical-extension.der"]) {
+    const spki = new Uint8Array(new X509Certificate(Buffer.from(read(file))).publicKey.export({ type: "spki", format: "der" }));
+    check(g, `${file}: carries the key of device-id.json test key 2`, hex(spki) === key2.spkiDerHex);
+  }
+  const p384 = createPrivateKey({ key: Buffer.from(read("client-not-p256.key.der")), format: "der", type: "pkcs8" });
+  check(g, "client-not-p256.key.der is a P-384 key", p384.asymmetricKeyType === "ec" && p384.asymmetricKeyDetails?.namedCurve === "secp384r1");
+
+  // The Android-generated certificate (exported by the app's own CertificateBuilder) is inside the profile, and its sidecar agrees.
+  const android = read("android-client.der");
+  const androidSide = JSON.parse(readFileSync(join(dir, "fixtures", "android-client.json"), "utf8"));
+  const androidViolations = certProfileViolations(android);
+  check(g, "android-client.der: inside the certificate profile", androidViolations.length === 0, () => androidViolations.join("; "));
+  const androidX509 = new X509Certificate(Buffer.from(android));
+  check(g, "android-client.der: signature verifies with its own key", androidX509.verify(androidX509.publicKey));
+  const androidSpki = new Uint8Array(androidX509.publicKey.export({ type: "spki", format: "der" }));
+  check(g, "android-client.json: spkiHex", hex(androidSpki) === androidSide.spkiHex);
+  check(g, "android-client.json: deviceId", deviceIdOfSpki(androidSpki) === androidSide.deviceId, () => deviceIdOfSpki(androidSpki));
+}
+
 // ---- base64url sanity: the hand-written encoder agrees with Node on random input
 {
   for (let n = 0; n < 200; n++) {

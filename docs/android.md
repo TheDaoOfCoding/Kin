@@ -69,6 +69,7 @@ This is the expected list. Confirm it on Android 14 and 15 during Phase 1.
 | `RECEIVE_BOOT_COMPLETED` | Restart after a reboot. Check that a `connectedDevice` service can still start from boot on Android 15+ |
 | `WAKE_LOCK` | Only during transfers |
 | `CHANGE_WIFI_MULTICAST_STATE` | Only if mDNS lookups need it on the test phones |
+| `ACCESS_LOCAL_NETWORK` | **Runtime permission on Android 17 (API 37), the "Nearby devices" group.** An app that targets API 37 needs it for any connection to a local network address (TCP, UDP, multicast, `NsdManager`), which is every connection to the PC. Without it a connect just times out, with no error that says why. Requested with `POST_NOTIFICATIONS` when the app opens and before a pairing starts. The user can revoke it later in settings, so Home shows an "Allow in settings" card while it is missing. It doesn't exist before Android 17. Found in the 1.1 emulator runs |
 
 No location, no camera (the code scanner doesn't need it), and no storage permission (on Android 10+, MediaStore lets an app write its own files without one).
 
