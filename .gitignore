@@ -1,0 +1,40 @@
+# Android / Gradle / Kotlin
+.gradle/
+build/
+local.properties
+.kotlin/
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Rust
+target/
+
+# Node
+node_modules/
+dist/
+
+# .NET
+bin/
+obj/
+*.user
+.vs/
+publish/
+
+# Secrets
+*.jks
+*.keystore
+.env
+.env.*
+!.env.example
+*.pfx
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Logs
+*.log
