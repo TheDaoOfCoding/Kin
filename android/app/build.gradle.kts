@@ -1,6 +1,7 @@
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.ksp)
 }
 
 android {
@@ -35,6 +36,11 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
+    }
+    sourceSets {
+        // The shared protocol vectors are loaded by the unit tests as classpath resources.
+        getByName("test").resources.directories.add("../../protocol")
     }
 }
 
@@ -47,7 +53,20 @@ dependencies {
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
+    implementation(libs.okhttp)
+    implementation(libs.kotlinx.serialization.json)
+    implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.room.runtime)
+    ksp(libs.room.compiler)
+    implementation(libs.androidx.datastore.preferences)
+    implementation(libs.play.services.code.scanner)
+    // The code scanner brings in androidx.fragment 1.0.0, too old for the Activity Result API.
+    implementation(libs.androidx.fragment)
+
     testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.okhttp.mockwebserver)
+    testImplementation(libs.okhttp.tls)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))
