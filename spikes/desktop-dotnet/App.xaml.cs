@@ -2,6 +2,7 @@ using System;
 using System.Drawing;
 using System.Threading;
 using System.Windows;
+using System.Windows.Threading;
 using Forms = System.Windows.Forms;
 
 namespace Kin;
@@ -22,8 +23,9 @@ public partial class App : Application
         base.OnStartup(e);
 
         // A crash would otherwise leave a ghost icon in the tray until the mouse hovers over it.
-        DispatcherUnhandledException += (_, _) => DisposeTray();
-        AppDomain.CurrentDomain.UnhandledException += (_, _) => DisposeTray();
+        // Neither handler sets e.Handled or swallows anything: the crash still goes through.
+        DispatcherUnhandledException += (_, _) => TryDisposeTray();
+        AppDomain.CurrentDomain.UnhandledException += (_, _) => TryDisposeOnUiThread();
 
         _singleInstance = new Mutex(true, AppId, out bool isFirst);
         if (!isFirst)
@@ -62,6 +64,32 @@ public partial class App : Application
         }
         _window.Show();
         _window.Activate();
+    }
+
+    // The crash can come from any thread, but WinForms objects belong to the UI thread. Hand the
+    // cleanup to it, and give up after a second if it is blocked or already gone.
+    private void TryDisposeOnUiThread()
+    {
+        try
+        {
+            Dispatcher.Invoke(DisposeTray, DispatcherPriority.Send, CancellationToken.None, TimeSpan.FromSeconds(1));
+        }
+        catch
+        {
+            // Cleanup is best effort. Never let it hide the original crash.
+        }
+    }
+
+    private void TryDisposeTray()
+    {
+        try
+        {
+            DisposeTray();
+        }
+        catch
+        {
+            // Same as above.
+        }
     }
 
     private void DisposeTray()

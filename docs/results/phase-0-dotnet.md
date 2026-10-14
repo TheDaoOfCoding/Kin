@@ -15,12 +15,12 @@ Checked by driving the real tray with UI Automation: the icon appeared in the ov
 
 ## SDK, PATH gotcha, build and run
 
-- **SDK:** .NET SDK 10.0.402 (LTS), installed per user with the official `dotnet-install.ps1` (Microsoft-signed, checked) into `%LOCALAPPDATA%\Microsoft\dotnet`. No admin was needed. `DOTNET_ROOT` is set per process by `_sdk.ps1` (and passed on to Kin by `run.ps1`). It is deliberately NOT set globally: apphosts read it before `C:\Program Files\dotnet`, so a user-level value would hide the Program Files runtimes from other apps (for example MSI Center's Smart Image Finder needs .NET Core 3.1, which only exists there). The machine PATH and `C:\Program Files\dotnet` were not touched. The SDK's first run did add `C:\Users\SOL 02\.dotnet\tools` to the user PATH. It is harmless and was left in place.
+- **SDK:** .NET SDK 10.0.402 (LTS), installed per user with the official `dotnet-install.ps1` (Microsoft-signed, checked) into `%LOCALAPPDATA%\Microsoft\dotnet`. No admin was needed. `DOTNET_ROOT` is set per process by `_sdk.ps1` (and passed on to Kin by `run.ps1`). `build.ps1` and `run.ps1` put the previous value back when they finish, even on error, so nothing leaks into an open PowerShell window. It is deliberately NOT set globally: apphosts read it before `C:\Program Files\dotnet`, so a user-level value would hide the Program Files runtimes from other apps (for example MSI Center's Smart Image Finder needs .NET Core 3.1, which only exists there). The machine PATH and `C:\Program Files\dotnet` were not touched. The SDK's first run did add `C:\Users\SOL 02\.dotnet\tools` to the user PATH. It is harmless and was left in place.
 - **Gotcha:** `C:\Program Files\dotnet` is on the machine PATH and holds runtimes only (3.1 and 9.0). Machine PATH wins over user PATH, so a bare `dotnet` is that muxer, and `dotnet --list-sdks` prints nothing. `DOTNET_ROOT` does not change which SDKs that muxer sees. The fix is to call `%LOCALAPPDATA%\Microsoft\dotnet\dotnet.exe` by full path. `_sdk.ps1` does that (and fails with a clear message if the SDK found is older than 10), and `build.ps1` and `run.ps1` use it. To check the SDK by hand: `& "$env:LOCALAPPDATA\Microsoft\dotnet\dotnet.exe" --version`.
 - **Build:** `powershell -ExecutionPolicy Bypass -File spikes\desktop-dotnet\build.ps1`. Output is `bin\Debug\net10.0-windows\Kin.exe`.
-- **Run:** `run.ps1` builds and launches. Look for the "K" in the tray overflow ("Show hidden icons"). Quit from its menu, or `Stop-Process -Name Kin`.
+- **Run:** `run.ps1` builds and launches. Look for the "K" in the tray overflow ("Show hidden icons"). Quit from the tray menu. Don't use `Stop-Process -Name Kin`: it skips `OnExit` and leaves a ghost tray icon until the mouse hovers over it.
 - **Publish:** `build.ps1 -Publish` writes `publish\fdd` and `publish\sc-single`.
-- **Runtime for the framework-dependent build:** it needs the .NET 10 Desktop Runtime. The machine only has 9.0, so the framework-dependent exe runs only when `DOTNET_ROOT` points at the per-user install, which `run.ps1` does for the process it starts. The final app would use Kestrel (see the D2 table), and the ASP.NET Core Runtime is not part of the Desktop Runtime. So a framework-dependent build would make end users install two runtimes, or we ship self-contained.
+- **Runtime for the framework-dependent build:** it needs the .NET 10 Desktop Runtime. `C:\Program Files\dotnet` only has the .NET Desktop Runtime 9.0 (plus .NET Core 3.1), so the framework-dependent exe runs only when `DOTNET_ROOT` points at the per-user install, which `run.ps1` does for the process it starts. The final app would use Kestrel (see the D2 table), and the ASP.NET Core Runtime is not part of the Desktop Runtime. So a framework-dependent build would make end users install two runtimes, or we ship self-contained.
 
 ## Metrics
 
@@ -80,7 +80,7 @@ Against [targets.md](../targets.md) (the two priority 5 rows):
 
 | Target | Goal | .NET spike | Result |
 |---|---|---|---|
-| PC footprint (idle) | Under 30 MB active private working set | 8.9 MB private working set, tray only, 63 s after launch. Measured twice, the second time on 2026-10-14 after the review fixes, with the same number | Passes. This is only a hello world with no networking, and the target is measured after 1 h idle, so it will grow |
+| PC footprint (idle) | Under 30 MB active private working set | 8.9 MB private working set, tray only. Measured twice: 62 s after launch in the first run (the Metrics table above), and 63 s after launch in the second, on 2026-10-14 after the review fixes, with the same number | Passes. This is only a hello world with no networking, and the target is measured after 1 h idle, so it will grow |
 | App size | About 10 MB or less | 147.6 MB self-contained single-file (0.2 MB framework-dependent, but it needs two runtimes) | Fails badly when self-contained |
 
 ## Left for the user at home

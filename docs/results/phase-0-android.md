@@ -73,7 +73,7 @@ Run from `android/`, with the JDK 21 environment above.
 | Incremental `assembleDebug` after a one-line change to `MainActivity.kt` | pass | 2.7 s |
 | `gradlew.bat assembleDebugAndroidTest` (compile only, nothing run) | pass | 12 s |
 
-- **APK:** `android/app/build/outputs/apk/debug/app-debug.apk`, 29,818,790 bytes (about 28.4 MiB). It is a debug build and includes Compose tooling. Release size will differ.
+- **APK:** `android/app/build/outputs/apk/debug/app-debug.apk`, 29,818,790 bytes (about 28.4 MiB). It is a debug build and includes Compose tooling. For the release size, see the next section.
 - **Signing:** the default debug keystore at `~\.android\debug.keystore`. No keystores are in the repo.
 - **Timings:** one run each, on this PC. Treat them as rough.
 
@@ -82,7 +82,21 @@ Run from `android/`, with the JDK 21 environment above.
 - `Unable to strip the following libraries, packaging them as they are: libandroidx.graphics.path.so`. This is normal when the NDK isn't installed. It only affects native debug symbols and is harmless.
 - `Configuration.setVisible(boolean) method has been deprecated. This is scheduled to be removed in Gradle 11.` This comes from a plugin (AGP or the Kotlin plugin), not our scripts. Nothing to do until a newer plugin version fixes it.
 - Gradle suggests enabling the configuration cache. Not enabled yet.
-- No Kotlin or Android lint warnings, and none were suppressed.
+- No lint warnings, verified with `gradlew.bat lintDebug` ("No issues found."), and none were suppressed. The template had three: `RedundantLabel` on the activity in `AndroidManifest.xml` and `MonochromeLauncherIcon` in both adaptive icons. They were fixed by removing the activity label (it inherits "Kin" from the application) and adding a `<monochrome>` layer to both icons, reusing the K foreground. That gives a themed icon on Android 13 and later. Not checked on a device.
+
+## Release APK size
+
+Target in [targets.md](../targets.md): APK about 10 MB or less. Built with `gradlew.bat clean assembleRelease` on 2026-10-14. The APK is unsigned, which is fine for measuring. No keystore was created, and none is in the repo.
+
+| Release build | Size |
+|---|---|
+| As the template ships it (R8 off, `isMinifyEnabled = false`) | 22,945,333 bytes (about 21.9 MiB) |
+| R8 on (`isMinifyEnabled = true`, `isShrinkResources = true`, default proguard files) | 1,374,366 bytes (about 1.31 MiB) |
+
+- **Against the target:** 21.9 MiB fails the 10 MB target. With R8 it is about 1.3 MiB, far under it. Almost all of the size is the Compose libraries, which R8 removes when the app uses little of them. It will grow as the real UI and networking are added, but there is a lot of room.
+- **R8 stays on.** The build is clean, `testDebugUnitTest` passes (1 test, 0 failures) and `lintDebug` still reports no issues. `aapt2 dump badging` on the R8 APK shows the right package, versions, SDK levels, the application label "Kin" and `MainActivity` as the launcher activity.
+- **Not tested:** the R8 build was not run on a device or emulator. Test a release build on the phone too, not only debug. With no networking or reflection code yet, the default rules are enough. Phase 1 libraries (for example a JSON library) may need keep rules.
+- Debug builds are unaffected by this setting.
 
 ## What you need to do at home
 
@@ -98,6 +112,8 @@ Run from `android/`, with the JDK 21 environment above.
 cd C:\Dev\ecosystem-app\android
 gradlew.bat assembleDebug
 gradlew.bat testDebugUnitTest
+gradlew.bat lintDebug
+gradlew.bat assembleRelease    (unsigned release APK, R8 on)
 gradlew.bat installDebug    (phone connected)
 ```
 

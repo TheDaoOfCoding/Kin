@@ -4,22 +4,33 @@
 param([switch]$Publish)
 
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot '_sdk.ps1')
-$proj = Join-Path $PSScriptRoot 'Kin.csproj'
+$exitCode = 0
+try {
+    . (Join-Path $PSScriptRoot '_sdk.ps1')
+    $proj = Join-Path $PSScriptRoot 'Kin.csproj'
 
-if (-not $Publish) {
-    & $Dotnet build $proj -c Debug
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    return
+    if (-not $Publish) {
+        & $Dotnet build $proj -c Debug
+        $exitCode = $LASTEXITCODE
+    }
+    else {
+        # WPF does not support trimming, so no -p:PublishTrimmed.
+        & $Dotnet publish $proj -c Release -r win-x64 --self-contained false -o (Join-Path $PSScriptRoot 'publish\fdd')
+        $exitCode = $LASTEXITCODE
+        if (-not $exitCode) {
+            & $Dotnet publish $proj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o (Join-Path $PSScriptRoot 'publish\sc-single')
+            $exitCode = $LASTEXITCODE
+        }
+        if (-not $exitCode) {
+            Get-ChildItem (Join-Path $PSScriptRoot 'publish') | ForEach-Object {
+                $bytes = (Get-ChildItem $_.FullName -Recurse -File | Measure-Object Length -Sum).Sum
+                '{0,-10} {1,8:N1} MB' -f $_.Name, ($bytes / 1MB)
+            }
+        }
+    }
 }
-
-# WPF does not support trimming, so no -p:PublishTrimmed.
-& $Dotnet publish $proj -c Release -r win-x64 --self-contained false -o (Join-Path $PSScriptRoot 'publish\fdd')
-if ($LASTEXITCODE) { exit $LASTEXITCODE }
-& $Dotnet publish $proj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o (Join-Path $PSScriptRoot 'publish\sc-single')
-if ($LASTEXITCODE) { exit $LASTEXITCODE }
-
-Get-ChildItem (Join-Path $PSScriptRoot 'publish') | ForEach-Object {
-    $bytes = (Get-ChildItem $_.FullName -Recurse -File | Measure-Object Length -Sum).Sum
-    '{0,-10} {1,8:N1} MB' -f $_.Name, ($bytes / 1MB)
+finally {
+    # Put DOTNET_ROOT and friends back, so they don't leak into the calling PowerShell window.
+    if (Get-Command Restore-SdkEnv -ErrorAction SilentlyContinue) { Restore-SdkEnv }
 }
+if ($exitCode) { exit $exitCode }
