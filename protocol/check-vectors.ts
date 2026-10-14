@@ -1048,6 +1048,31 @@ function checkResponse(group: string, name: string, expected: any, actual: Reply
   console.log(`milestone 1.1 scope: ${inScope} cases in messages.json and http.json, plus the whole of the arrays listed in the README`);
 }
 
+// ---- milestone 1.2 scope (text, links and the clipboard): the text and clipboard cases of messages.json. Same rule: every name in
+// protocol/README.md must match a case, and the 1.3 cases (offer, complete, cancel) stay out of it.
+{
+  const g = "scope-1.2";
+  const messages = load("messages.json");
+  const SCOPE: [string, any[], string[], number][] = [
+    ["messages.valid", messages.valid, ["text-*", "clipboard-*", "duplicate-keys-*"], 14],
+    ["messages.invalid", messages.invalid, ["text-*", "clipboard-*"], 24],
+    ["messages.sequences", messages.sequences, ["handshake-then-text-then-duplicate", "invalid-message-keeps-connection-open", "rejected-message-id-is-not-remembered"], 3],
+  ];
+  const matches = (name: string, p: string) => (p.endsWith("*") ? name.startsWith(p.slice(0, -1)) : name === p);
+  let inScope = 0;
+  for (const [label, cases, patterns, atLeast] of SCOPE) {
+    for (const p of patterns) check(g, `${label}: "${p}" matches a case`, cases.some((c) => matches(c.name, p)));
+    const hits = cases.filter((c) => patterns.some((p) => matches(c.name, p)));
+    inScope += hits.length;
+    check(g, `${label}: at least ${atLeast} cases in scope`, hits.length >= atLeast, () => String(hits.length));
+    // nothing of 1.3 sneaks in through a wide pattern
+    check(g, `${label}: no offer, complete or cancel case in the 1.2 scope`, hits.every((c) => !/^(offer|complete|cancel|duplicate-offer)/.test(c.name)));
+  }
+  // a text or clipboard case goes to the role that can receive it: `clipboard` only to the phone, `text` to either
+  for (const c of messages.valid.filter((c: any) => c.name.startsWith("clipboard-"))) check(g, `${c.name}: a valid clipboard goes to the phone`, c.to === "phone");
+  console.log(`milestone 1.2 scope: ${inScope} cases in messages.json (text and clipboard)`);
+}
+
 // ---- fixtures/: DER certificates for the negative tls[] cases (made by fixtures/make-fixtures.ts)
 {
   const g = "fixtures";
