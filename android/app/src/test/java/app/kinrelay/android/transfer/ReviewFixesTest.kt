@@ -34,10 +34,11 @@ class ReviewFixesTest {
     private fun offer(id: String, vararg sizes: Long) =
         Offer(id, sizes.mapIndexed { i, size -> OfferFile("f${i + 1}", "file$i.bin", size, "application/octet-stream") }, sizes.sum())
 
+    private fun TransferRig.accept(offer: Offer): String? = engine.acceptOffer(offer, pcId)
+
     private fun TransferRig.share(vararg files: Pair<String, ByteArray>): String =
         blocking { engine.enqueueUpload(files.map { (name, bytes) -> ShareSource(sources.add(name, bytes)) }) }!!
 
-    private val TransferRig.pcId get() = pc.identity.deviceId
 
     private fun transferRow(id: String, direction: String, peer: String, status: String, size: Long = 1_000, bytesDone: Long = 0, uri: String? = null) =
         TransferEntity(id, direction, peer, "Some PC", TransferKind.FILE, status, 1_000, null, size, null, null, completeAcked = false) to
@@ -83,7 +84,7 @@ class ReviewFixesTest {
         val filesBefore = r.store.files.getValue(id).toList()
         r.pc.files.offered(id, file("f1", "x.bin", 10))
 
-        r.blocking { r.engine.onOffer("Desk PC", offer(id, 10)) }
+        r.blocking { r.engine.onOffer(r.pcId, "Desk PC", offer(id, 10)) }
 
         Thread.sleep(200)
         assertEquals(TransferStatus.DONE, r.store.transfers.getValue(id).status)
@@ -97,8 +98,8 @@ class ReviewFixesTest {
     fun aDownloadOfAnotherPcIsNotTakenOverByAnOfferWithItsId() {
         val r = rig()
         r.put("theirs", TransferDirection.DOWN, peer = "another-pc", status = TransferStatus.QUEUED)
-        assertEquals("bad_request", r.engine.acceptOffer(offer("theirs", 1_000)))
-        r.blocking { r.engine.onOffer("Desk PC", offer("theirs", 1_000)) }
+        assertEquals("bad_request", r.accept(offer("theirs", 1_000)))
+        r.blocking { r.engine.onOffer(r.pcId, "Desk PC", offer("theirs", 1_000)) }
         assertEquals("another-pc", r.store.transfers.getValue("theirs").peerDeviceId)
         assertFalse(r.engine.isRunning("theirs"))
     }
@@ -112,8 +113,8 @@ class ReviewFixesTest {
         val offer = offer("once", 10_000)
 
         // After the 24 hours of the de-duplication memory the receiver no longer answers for it, so the gate and onOffer meet the ID.
-        assertEquals("bad_request", r.engine.acceptOffer(offer))
-        r.blocking { r.engine.onOffer("Desk PC", offer) }
+        assertEquals("bad_request", r.accept(offer))
+        r.blocking { r.engine.onOffer(r.pcId, "Desk PC", offer) }
         Thread.sleep(200)
         assertEquals(TransferStatus.DONE, r.store.transfers.getValue("once").status)
         assertEquals("no second GET", gets, r.pc.files.calls.count { it.method == "GET" })
@@ -129,8 +130,8 @@ class ReviewFixesTest {
         r.await("some bytes") { r.sink.entries.values.any { it.file.length() > 0 } }
         val offer = offer("again", 600_000)
 
-        assertNull("the gate lets it through", r.engine.acceptOffer(offer))
-        r.blocking { r.engine.onOffer("Desk PC", offer) }
+        assertEquals("a repeat by the same PC, not a reuse", app.kinrelay.android.protocol.OfferHistory.REPEAT, r.engine.offerHistory(offer, r.pcId))
+        r.blocking { r.engine.onOfferRepeated(r.pcId, offer) }
         assertEquals("still one entry, one job", 1, r.sink.entries.size)
         assertTrue(r.engine.isRunning("again"))
         r.engine.cancel("again")
@@ -264,7 +265,7 @@ class ReviewFixesTest {
         val r = rig()
         r.put("old", TransferDirection.DOWN, peer = "gone-pc", status = TransferStatus.QUEUED)
         r.put("up", TransferDirection.UP, peer = "gone-pc", status = TransferStatus.ACTIVE)
-        r.blocking { r.engine.onLinkReady() }
+        r.blocking { r.engine.onLinkReady(r.pcId) }
         assertEquals(TransferStatus.CANCELED, r.store.transfers.getValue("old").status)
         assertEquals(TransferStatus.CANCELED, r.store.transfers.getValue("up").status)
         assertEquals("unpaired", r.store.transfers.getValue("up").errorCode)
@@ -323,8 +324,8 @@ class ReviewFixesTest {
     @Test
     fun anOfferOfMoreThan800FilesIsRefusedWithTooLarge() {
         val r = rig()
-        assertNull(r.engine.acceptOffer(offer("o800", *LongArray(800) { 1 })))
-        assertEquals("too_large", r.engine.acceptOffer(offer("o801", *LongArray(801) { 1 })))
+        assertNull(r.accept(offer("o800", *LongArray(800) { 1 })))
+        assertEquals("too_large", r.accept(offer("o801", *LongArray(801) { 1 })))
 
         // and on the wire: the error replaces the ack
         r.pc.sendOffer("wire801", *(1..801).map { file("f$it", "n$it.txt", 1) }.toTypedArray())
@@ -339,17 +340,17 @@ class ReviewFixesTest {
     fun sizesThatOverflowTheSumAreRefusedNotWrappedAround() {
         val r = rig()
         r.sink.free = Long.MAX_VALUE
-        assertEquals("too_large", r.engine.acceptOffer(offer("ov1", Long.MAX_VALUE, 1)))
-        assertEquals("too_large", r.engine.acceptOffer(offer("ov2", Long.MAX_VALUE / 2 + 1, Long.MAX_VALUE / 2 + 1)))
-        assertEquals("too_large", r.engine.acceptOffer(offer("ov3", Long.MAX_VALUE, Long.MAX_VALUE, 5)))
-        assertNull("the largest sum that fits is fine", r.engine.acceptOffer(offer("ok", Long.MAX_VALUE - 1, 1)))
+        assertEquals("too_large", r.accept(offer("ov1", Long.MAX_VALUE, 1)))
+        assertEquals("too_large", r.accept(offer("ov2", Long.MAX_VALUE / 2 + 1, Long.MAX_VALUE / 2 + 1)))
+        assertEquals("too_large", r.accept(offer("ov3", Long.MAX_VALUE, Long.MAX_VALUE, 5)))
+        assertNull("the largest sum that fits is fine", r.accept(offer("ok", Long.MAX_VALUE - 1, 1)))
     }
 
     @Test
     fun aNegativeSizeIsBadRequest() {
         val r = rig()
-        assertEquals("bad_request", r.engine.acceptOffer(offer("neg", 10, -5)))
-        assertEquals("bad_request", r.engine.acceptOffer(offer("neg2", Long.MAX_VALUE, Long.MAX_VALUE, -Long.MAX_VALUE)))
+        assertEquals("bad_request", r.accept(offer("neg", 10, -5)))
+        assertEquals("bad_request", r.accept(offer("neg2", Long.MAX_VALUE, Long.MAX_VALUE, -Long.MAX_VALUE)))
     }
 
     @Test
@@ -358,18 +359,18 @@ class ReviewFixesTest {
         r.sink.free = 100_000
         // An unfinished download that has 80,000 bytes to go (100,000 - 20,000).
         r.put("busy", TransferDirection.DOWN, peer = r.pcId, status = TransferStatus.ACTIVE, size = 100_000, bytesDone = 20_000)
-        assertEquals("30,000 + 80,000 > 100,000", "disk_full", r.engine.acceptOffer(offer("a", 30_000)))
-        assertNull("15,000 + 80,000 fits", r.engine.acceptOffer(offer("b", 15_000)))
+        assertEquals("30,000 + 80,000 > 100,000", "disk_full", r.accept(offer("a", 30_000)))
+        assertNull("15,000 + 80,000 fits", r.accept(offer("b", 15_000)))
     }
 
     @Test
     fun twoOffersInARowCantBothTakeTheLastSpace() {
         val r = rig()
         r.sink.free = 100_000
-        assertNull(r.engine.acceptOffer(offer("first", 60_000)))
+        assertNull(r.accept(offer("first", 60_000)))
         // The first one is acked but its rows are not stored yet: its bytes are still claimed.
-        assertEquals("disk_full", r.engine.acceptOffer(offer("second", 60_000)))
-        assertNull(r.engine.acceptOffer(offer("small", 30_000)))
+        assertEquals("disk_full", r.accept(offer("second", 60_000)))
+        assertNull(r.accept(offer("small", 30_000)))
     }
 
     @Test
@@ -377,7 +378,7 @@ class ReviewFixesTest {
         val r = rig()
         r.sink.free = 100_000
         r.put("done", TransferDirection.DOWN, peer = r.pcId, status = TransferStatus.DONE, size = 90_000)
-        assertNull(r.engine.acceptOffer(offer("x", 95_000)))
+        assertNull(r.accept(offer("x", 95_000)))
     }
 
     // ---------------------------------------------------------------- 7. progress is throttled and never forced

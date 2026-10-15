@@ -6,6 +6,7 @@ import app.kinrelay.android.protocol.CloseAction
 import app.kinrelay.android.protocol.CloseRules
 import app.kinrelay.android.protocol.Hello
 import app.kinrelay.android.protocol.Offer
+import app.kinrelay.android.protocol.OfferHistory
 import app.kinrelay.android.tls.RaceResult
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -42,6 +43,12 @@ interface LinkHost {
 
     /** Before an `offer` is acked: null accepts it, an error code refuses it. Cheap and synchronous. */
     fun acceptOffer(offer: Offer): String? = null
+
+    /** What the phone knows about the ID of an `offer` (a repeat by this PC, a reuse, or new). Cheap and synchronous. */
+    fun offerHistory(offer: Offer): OfferHistory = OfferHistory.NEW
+
+    /** An `offer` this PC made before, acked again. Called one at a time, in arrival order. */
+    suspend fun onOfferRepeated(fromName: String, offer: Offer) = Unit
 
     /** An `offer` (acked already). Called one at a time, in arrival order. It must return soon: the download runs elsewhere. */
     suspend fun onOfferReceived(fromName: String, offer: Offer) = Unit
@@ -84,6 +91,18 @@ class LinkLoop(
     /** The user did something: try again now, from the first backoff step. */
     fun userAction() {
         if (mutableState.value is LinkState.Connected) return
+        backoff.reset()
+        wake.trySend(Unit)
+    }
+
+    /**
+     * The network came back or changed under a loop that is not connected (new addresses, the network became usable): the wait that
+     * repeated failures built up was earned on the old network and says nothing about this one, so the backoff starts again and the next
+     * attempt is made **now**. Repeated failures on an unchanged network still climb the steps. Does nothing while connected, and does not
+     * wake a loop that stopped on purpose (replaced, update needed, pair again).
+     */
+    fun networkChanged() {
+        if (mutableState.value !is LinkState.Connecting) return
         backoff.reset()
         wake.trySend(Unit)
     }
@@ -133,6 +152,11 @@ class LinkLoop(
                     deliveries.submit { host.onClipboardReceived(id, text) }
 
                 override fun acceptOffer(offer: Offer): String? = host.acceptOffer(offer)
+
+                override fun offerHistory(offer: Offer): OfferHistory = host.offerHistory(offer)
+
+                override fun onOfferRepeated(fromName: String, offer: Offer) =
+                    deliveries.submit { host.onOfferRepeated(fromName, offer) }
 
                 override fun onOfferReceived(fromName: String, offer: Offer) =
                     deliveries.submit { host.onOfferReceived(fromName, offer) }

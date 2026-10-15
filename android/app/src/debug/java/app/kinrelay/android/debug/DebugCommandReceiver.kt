@@ -43,7 +43,7 @@ class DebugCommandReceiver : BroadcastReceiver() {
                                 "lastAddresses=${device?.lastAddresses} lastPing=${graph.link.lastPing.value} " +
                                 "lastArrivalMs=${stats.lastArrivalMillis} clipboardGuard=${graph.clipboardGuard.describe()} " +
                                 "identityProblem=${graph.identityProblem.value} pairing=${graph.pairing.state.value.javaClass.simpleName} " +
-                                "connects=${stats.connects} disconnects=${stats.disconnects} kills=${stats.kills} " +
+                                "connects=${stats.connects} disconnects=${stats.disconnects} kills=${stats.kills} successRate=${graph.successRate().label()} " +
                                 "phoneId=${graph.identityFlow.value?.deviceId} wakeLockHeld=${graph.wakeLocks?.isHeld()}",
                         )
                     }
@@ -131,6 +131,34 @@ class DebugCommandReceiver : BroadcastReceiver() {
                     }
                     "EMPTY_ENTRY_CHECK" -> DebugChecks.emptyEntryCheck(context).forEach { graph.log.i("debug", "CMD EMPTY_ENTRY_CHECK $it") }
                     "APPEND_CHECK" -> DebugChecks.appendCheck(context).forEach { graph.log.i("debug", "CMD APPEND_CHECK $it") }
+                    "TEXTS" -> {
+                        // The text queue and history, without any text (id, direction, status, attempts, source, flags, size).
+                        val items = graph.database.texts().recent(50)
+                        graph.log.i("debug", "CMD TEXTS count=${items.size}")
+                        items.forEach { graph.log.i("debug", "CMD TEXT ${it.id} ${it.direction} ${it.status} attempts=${it.attempts} src=${it.source} sensitive=${it.sensitive} bytes=${it.byteSize} err=${it.errorCode} bodyKept=${it.body != null} retriedAs=${it.retriedAs}") }
+                    }
+                    "CANCEL_TEXT" -> {
+                        val id = intent.getStringExtra("id")
+                        if (id == null) graph.log.w("debug", "CMD CANCEL_TEXT needs --es id <message id>") else graph.log.i("debug", "CMD CANCEL_TEXT $id canceled=${graph.textOutbox.cancel(id)}")
+                    }
+                    "RETRY_TEXT" -> {
+                        val id = intent.getStringExtra("id")
+                        val item = id?.let { graph.history.items.first().firstOrNull { h -> h.id == it } }
+                        if (item == null) graph.log.w("debug", "CMD RETRY_TEXT needs --es id <message id>") else { graph.retryItem(item); graph.log.i("debug", "CMD RETRY_TEXT $id requested") }
+                    }
+                    "EXPORT_LOGS" -> {
+                        // The same zip as Settings > Debug > Export logs, without the share sheet: it is in cache/exports/ (run-as to read it).
+                        val uri = app.kinrelay.android.debuginfo.LogExport.create(graph)
+                        val zip = java.io.File(context.cacheDir, app.kinrelay.android.debuginfo.LogExport.DIR).listFiles()?.maxByOrNull { it.lastModified() }
+                        graph.log.i("debug", "CMD EXPORT_LOGS uri=$uri file=${zip?.name} bytes=${zip?.length()}")
+                    }
+                    "FLUSH" -> {
+                        val peer = graph.pairedDevice()
+                        val connection = peer?.let { graph.link.await(1_000, it.deviceId) }
+                        graph.log.i("debug", "CMD FLUSH ${connection?.let { graph.flusher.flush(it) } ?: "no connection"}")
+                    }
+                    // `--el ahead <ms>`: judge the queue as if the clock were that far ahead (a text made now is 7 days old at 604800000)
+                    "EXPIRE" -> graph.log.i("debug", "CMD EXPIRE expired=${graph.flusher.expire(intent.getLongExtra("ahead", 0L))}")
                     "SET_PING_INTERVAL" -> {
                         val seconds = intent.getIntExtra("seconds", -1)
                         if (seconds > 0) {

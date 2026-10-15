@@ -1,6 +1,7 @@
 package app.kinrelay.android.testing
 
 import java.io.File
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 
@@ -13,6 +14,7 @@ import org.junit.Test
  *   command.txt   write `ping`, `close4001`, `close4003`, `unpair`, `hello2` (future-protocol hello) or `stop` here to drive the PC.
  *                 Milestone 1.2: `clipboard <text>` (a `clipboard` message), `text <text>`, `url <link>` (a `text` with isUrl),
  *                 `noack` / `ack` (stop / resume acking the phone's `text`) and `errtext` (answer the phone's `text` with an `error`)
+ *                 Milestone 1.4: `holdtext <text>` (a text the PC kept while the phone was away: it goes out right after the phone's next `hello`), `used <transferId>` (that ID is used up: 404).
  *                 Milestone 1.3 (files): `offer <id> <spec>[,<spec>...]` where a spec is `name:size[:mime]` (deterministic bytes) or `name@WxH` (a
  *                 real JPEG or PNG), `cancel <transferId> [reason]` (a `cancel` from the PC), `gone <id>` (the offer expires: every GET is 404),
  *                 `changed <id> <fileId>` (a file changed: GET is 409), `postfail <status>` / `putfail <status>` (answer the phone's POST or PUT
@@ -40,7 +42,14 @@ class FakePcSession {
                 "kinrelay://pair?v=1&a=10.0.2.2:${pc.port}&id=${pc.identity.deviceId}&tk=$token&n=Fake%20PC"
             )
             event("listening on 127.0.0.1:${pc.port} pcId=${pc.identity.deviceId}")
-            pc.onFrame = { _, frame -> event("frame from phone: $frame") }
+            // `holdtext`: texts the PC "queued" while the phone was away; they go out right after the phone's next hello (the PC's own queue, milestone 1.4).
+            val held = java.util.concurrent.ConcurrentLinkedQueue<String>()
+            pc.onFrame = { _, frame ->
+                event("frame from phone: $frame")
+                if (frame["type"]?.jsonPrimitive?.content == "hello") {
+                    while (true) { val t = held.poll() ?: break; pc.sendText("fake-pc-held-${System.nanoTime()}", t, isUrl = false); event("sent held text after the phone's hello") }
+                }
+            }
             var seen = 0
             val reported = HashMap<String, String>()
             var messagesSeen = 0
@@ -65,9 +74,10 @@ class FakePcSession {
                 deletedSeen = pc.files.deleted.size
                 pc.files.calls.drop(callsSeen).forEach { event("files ${it.method} ${it.path} offset=${it.offset} range=${it.range} contentLength=${it.contentLength}") }
                 callsSeen = pc.files.calls.size
-                val line = command.readText().trim()
+                // The driver (a script) may be writing the file right now: read it again at the next round.
+                val line = runCatching { command.readText().trim() }.getOrDefault("")
                 if (line.isNotEmpty()) {
-                    command.writeText("")
+                    runCatching { command.writeText("") }
                     event("command ${line.substringBefore(' ')}")
                     val text = line.substringBefore(' ')
                     val argument = line.substringAfter(' ', "")
@@ -76,6 +86,8 @@ class FakePcSession {
                             "clipboard" -> pc.sendClipboard("fake-pc-clip-${System.nanoTime()}", argument)
                             "text" -> pc.sendText("fake-pc-text-${System.nanoTime()}", argument, isUrl = false)
                             "url" -> pc.sendText("fake-pc-text-${System.nanoTime()}", argument, isUrl = true)
+                            "holdtext" -> held += argument
+                            "used" -> pc.files.usedIds += argument.trim() // the PC has used this transfer ID up (canceled, failed or forgotten): POST, PUT and DELETE with it are 404
                             "noack" -> pc.ackTexts = false
                             "ack" -> { pc.ackTexts = true; pc.errorForText = null }
                             "errtext" -> pc.errorForText = "internal"

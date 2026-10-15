@@ -9,6 +9,13 @@ data class OfferFile(val fileId: String, val name: String, val size: Long, val m
 /** A valid `offer`. [id] is the transfer ID. */
 data class Offer(val id: String, val files: List<OfferFile>, val totalSize: Long)
 
+/**
+ * What the phone knows about the ID of an `offer` (protocol.md, Files: PC -> phone). [NEW]: it has no transfer with that ID. [REPEAT]: the
+ * same paired PC offered it before, with the same files (a repeat, whatever state the download is in). [REUSED]: anything else that
+ * uses an ID it remembers as a transfer.
+ */
+enum class OfferHistory { NEW, REPEAT, REUSED }
+
 /** What the receiver did with a frame. [category] is the name the test vectors use. */
 sealed class Action(val category: String) {
     class HandshakeOk(val hello: Hello) : Action("handshake_ok")
@@ -21,6 +28,9 @@ sealed class Action(val category: String) {
 
     /** A valid `offer`, acked: download the files. */
     class StartDownload(val offer: Offer) : Action("start_download")
+
+    /** An `offer` the same PC made before, answered with the first response (the ack) again: nothing is started a second time. */
+    class RepeatOffer(val offer: Offer) : Action("ignore_duplicate")
 
     /** The PC (role) got a `complete` from the phone: the transfer is done. */
     class MarkTransferDone(val transferId: String) : Action("mark_transfer_done")
@@ -62,11 +72,17 @@ enum class ReceiverRole {
  *
  * [offerGate] runs on a valid, new `offer` before it is acked: it returns null to accept, or an error code (the phone
  * says `disk_full`) to send an `error` *instead of* the ack, which ends the offer's life (protocol.md, Files: PC → phone).
+ *
+ * [offerHistory] says what the phone knows about the ID of an `offer`, **before** anything else: a [OfferHistory.REPEAT] (the same paired PC
+ * offering the same files again, whatever state the download is in) is answered with the first response, the ack, and nothing is started;
+ * [OfferHistory.REUSED] is `bad_request` with `ref` = the offer's ID. For a [OfferHistory.NEW] one, an ID that the receiver remembers from
+ * another message (a `text`, say) is a reuse too.
  */
 class MessageReceiver(
     private val dedup: DedupMemory,
     private val role: ReceiverRole = ReceiverRole.PHONE,
     private val offerGate: (Offer) -> String? = { null },
+    private val offerHistory: (Offer) -> OfferHistory = { OfferHistory.NEW },
 ) {
     var peer: Hello? = null
         private set
@@ -188,8 +204,15 @@ class MessageReceiver(
     private fun onOffer(frame: JsonObject, ref: String?): Outcome {
         val offer = parseOffer(frame, ref)
             ?: return rejected(ErrorCodes.BAD_REQUEST, "The offer needs a transfer id, at least one file (fileId, name, size, mime) and totalSize.", ref)
-        // A repeated offer gets its first response again and is not looked at again (protocol.md, de-duplication).
-        dedup.lookup(offer.id)?.let { return Outcome(listOf(it), null, Action.IgnoreDuplicate) }
+        // The same paired PC repeating an offer it made (it re-sent its queue, or never saw the ack): the first response again, nothing started.
+        // Any other reuse of an ID the phone remembers (an upload, another PC, other files, the ID of a `text`) is `bad_request`.
+        when (offerHistory(offer)) {
+            OfferHistory.REPEAT -> return Outcome(listOf(dedup.lookup(offer.id) ?: Frames.ack(offer.id)), null, Action.RepeatOffer(offer))
+            OfferHistory.REUSED -> return rejected(ErrorCodes.BAD_REQUEST, "That id was used before, and an id is never used twice.", offer.id)
+            OfferHistory.NEW -> if (dedup.lookup(offer.id) != null) {
+                return rejected(ErrorCodes.BAD_REQUEST, "That id was used before, and an id is never used twice.", offer.id)
+            }
+        }
         // More than 800 files: an `error` instead of the ack, and the ID is not remembered, so a smaller offer may use it (protocol.md, Files: PC -> phone).
         if (offer.files.size > MAX_OFFER_FILES) {
             val error = Frames.error(ErrorCodes.TOO_LARGE, "An offer has at most $MAX_OFFER_FILES files.", offer.id)

@@ -24,6 +24,24 @@ object Permissions {
         if (!notificationsGranted(context)) add(Manifest.permission.POST_NOTIFICATIONS)
     }
 
+    /** What the setup screen shows. */
+    fun snapshot(context: Context) = PermissionSnapshot(
+        notifications = notificationsGranted(context),
+        notificationsExist = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU,
+        localNetwork = localNetworkGranted(context),
+        localNetworkExists = Build.VERSION.SDK_INT >= ANDROID_17,
+        batteryUnrestricted = app.kinrelay.android.setup.SetupActions.batteryOptimisationIgnored(context),
+    )
+
     private fun granted(context: Context, permission: String) =
         ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
 }
+
+/** The state of everything the setup (onboarding) is about. A permission that doesn't exist on this Android version counts as granted and isn't shown. */
+data class PermissionSnapshot(
+    val notifications: Boolean = true,
+    val notificationsExist: Boolean = false,
+    val localNetwork: Boolean = true,
+    val localNetworkExists: Boolean = false,
+    val batteryUnrestricted: Boolean = false,
+)

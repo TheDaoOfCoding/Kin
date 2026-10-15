@@ -6,6 +6,7 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.doublePreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
@@ -23,6 +24,13 @@ data class Stats(
     /** Tap to ack of the last text sent to the PC, in ms (targets.md priority 2). */
     val lastArrivalMillis: Long? = null,
     val pingIntervalSeconds: Int = KinSettings.DEFAULT_PING_INTERVAL_SECONDS,
+    /** The last ping round trips (ms) and tap-to-ack times (ms), oldest first, at most [KinSettings.LATENCY_KEPT] of each. */
+    val recentRtts: List<Double> = emptyList(),
+    val recentArrivals: List<Long> = emptyList(),
+    /** The name this phone sends in `hello`, or null for the system's. */
+    val deviceName: String? = null,
+    /** The reliability setup (notifications, battery, OEM steps) was shown and finished or skipped. */
+    val setupDone: Boolean = false,
 )
 
 class KinSettings(context: Context) {
@@ -36,6 +44,10 @@ class KinSettings(context: Context) {
             lastRttMillis = prefs[LAST_RTT],
             lastArrivalMillis = prefs[LAST_ARRIVAL],
             pingIntervalSeconds = prefs[PING_INTERVAL] ?: DEFAULT_PING_INTERVAL_SECONDS,
+            recentRtts = prefs[RTTS]?.split(',')?.mapNotNull { it.toDoubleOrNull() }.orEmpty(),
+            recentArrivals = prefs[ARRIVALS]?.split(',')?.mapNotNull { it.toLongOrNull() }.orEmpty(),
+            deviceName = prefs[DEVICE_NAME]?.takeIf { it.isNotBlank() },
+            setupDone = prefs[SETUP_DONE] == true,
         )
     }
 
@@ -47,9 +59,22 @@ class KinSettings(context: Context) {
 
     suspend fun countDisconnect() = increment(DISCONNECTS)
 
-    suspend fun setLastRtt(millis: Double) = store.edit { it[LAST_RTT] = millis }
+    suspend fun setLastRtt(millis: Double) = store.edit {
+        it[LAST_RTT] = millis
+        it[RTTS] = ((it[RTTS]?.split(',').orEmpty() + millis.toString()).takeLast(LATENCY_KEPT)).joinToString(",")
+    }
 
-    suspend fun setLastArrival(millis: Long) = store.edit { it[LAST_ARRIVAL] = millis }
+    suspend fun setLastArrival(millis: Long) = store.edit {
+        it[LAST_ARRIVAL] = millis
+        it[ARRIVALS] = ((it[ARRIVALS]?.split(',').orEmpty() + millis.toString()).takeLast(LATENCY_KEPT)).joinToString(",")
+    }
+
+    /** The device name the user chose (blank clears it: the system name is used again). */
+    suspend fun setDeviceName(name: String) = store.edit { if (name.isBlank()) it.remove(DEVICE_NAME) else it[DEVICE_NAME] = name.trim() }
+
+    suspend fun deviceName(): String? = store.data.first()[DEVICE_NAME]?.takeIf { it.isNotBlank() }
+
+    suspend fun setSetupDone(done: Boolean) = store.edit { it[SETUP_DONE] = done }
 
     /** How the previous run of the service ended. */
     enum class PreviousRun {
@@ -86,6 +111,7 @@ class KinSettings(context: Context) {
 
     companion object {
         const val DEFAULT_PING_INTERVAL_SECONDS = 240
+        const val LATENCY_KEPT = 20
         private val CONNECTS = intPreferencesKey("connects")
         private val DISCONNECTS = intPreferencesKey("disconnects")
         private val KILLS = intPreferencesKey("kills")
@@ -94,5 +120,9 @@ class KinSettings(context: Context) {
         private val PING_INTERVAL = intPreferencesKey("ws_ping_interval_s")
         private val SERVICE_RUNNING = booleanPreferencesKey("service_running")
         private val BOOT_COUNT = intPreferencesKey("boot_count")
+        private val RTTS = stringPreferencesKey("recent_rtts")
+        private val ARRIVALS = stringPreferencesKey("recent_arrivals")
+        private val DEVICE_NAME = stringPreferencesKey("device_name")
+        private val SETUP_DONE = booleanPreferencesKey("setup_done")
     }
 }

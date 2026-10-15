@@ -24,6 +24,10 @@ class FileLog(
 
     val logFile: File get() = file
 
+    /** Every line still on disk (both files), oldest first: the connect history of the Debug screen reads it. */
+    @Synchronized
+    fun allLines(): List<String> = (listOf(previous, file).filter { it.exists() }.flatMap { runCatching { it.readLines() }.getOrDefault(emptyList()) })
+
     init {
         directory.mkdirs()
         recentLines.value = readTail(RECENT_LINES)

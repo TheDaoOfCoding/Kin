@@ -1,6 +1,6 @@
 # Kin Android app
 
-Milestone 1.1 (connection spike): identity, pairing, a foreground service that holds one WebSocket to the PC, ping, local log. Milestone 1.2: text, links and the clipboard in both directions. Milestone 1.3: files in both directions (share sheet and direct-share shortcut, upload with progress, receive into MediaStore, resume, cancel). The contract is [docs/protocol.md](../docs/protocol.md); the design is [docs/android.md](../docs/android.md). Details of what was built and measured: [phase-1-1-android.md](../docs/results/phase-1-1-android.md), [phase-1-2-android.md](../docs/results/phase-1-2-android.md), [phase-1-3-android.md](../docs/results/phase-1-3-android.md).
+Milestone 1.1 (connection spike): identity, pairing, a foreground service that holds one WebSocket to the PC, ping, local log. Milestone 1.2: text, links and the clipboard in both directions. Milestone 1.3: files in both directions (share sheet and direct-share shortcut, upload with progress, receive into MediaStore, resume, cancel). Milestone 1.4: the persistent queue, history, notifications rework, setup (onboarding), settings and debug screens. The contract is [docs/protocol.md](../docs/protocol.md); the design is [docs/android.md](../docs/android.md). Details of what was built and measured: [phase-1-1-android.md](../docs/results/phase-1-1-android.md), [phase-1-2-android.md](../docs/results/phase-1-2-android.md), [phase-1-3-android.md](../docs/results/phase-1-3-android.md).
 
 ## Build and test
 
@@ -22,13 +22,14 @@ gradlew.bat --stop
 | `tls` | Pinning trust manager, client key manager, the TLS 1.3 OkHttp client, the address race |
 | `protocol` | Strict JSON, message receiver (validation order, replies, de-dup, and since 1.3 `offer`, `complete`, `cancel`), close-code rules, `UrlRules` (`isUrl`, which links may be opened), `FileNames` (cleaning and create-new), `TextRules` (128 KiB threshold) |
 | `pairing` | Pairing URL parser, `POST /v1/pair`, the pairing flow, `PairingIntake` (a link from outside the app must be confirmed) |
-| `link` | `LinkService`, `LinkRuntime` (network callback, `WifiTracker`), `LinkLoop` (connection order, backoff), `LinkSession` (one WebSocket), mDNS, notifications, `BootReceiver`. 1.2: `IncomingHandler` (receive `clipboard` and `text`), `OutgoingSender` (send `text`, wait for the ack), `DeliveryQueue` (deliver in arrival order) |
+| `link` | 1.4: `TextOutbox` (the text queue), `OutboxFlusher` (sends texts and uploads in creation order after the hello). `LinkService`, `LinkRuntime` (network callback, `WifiTracker`), `LinkLoop` (connection order, backoff), `LinkSession` (one WebSocket), mDNS, notifications, `BootReceiver`. 1.2: `IncomingHandler` (receive `clipboard` and `text`), `OutgoingSender` (send `text`, wait for the ack), `DeliveryQueue` (deliver in arrival order) |
 | `clipboard` | `ClipboardSendActivity`, `SendClipboardTile`, `ClipboardGuard` (loop prevention), `ClipboardPort` |
 | `share` | `ShareActivity` (share sheet: text and files), `ProcessTextActivity` (text menu, "Send to PC"), `ShareIntents` (reads the URIs), `ShareShortcuts` (the direct-share shortcut) |
 | `transfer` | 1.3: `TransferEngine` (jobs, cancel, retry, recovery, the `offer` gate, unpair clean-up, the start-up sweep, crash clean-up), `ProgressThrottle` (one progress update per 500 ms), `UploadRunner`, `DownloadRunner`, `TransferHttp` (the four file endpoints), `MediaStoreSink`, `AndroidSourceFiles`, `TransferNotifications`, `AndroidWakeLocks`. The runners only know the ports in `TransferPorts.kt`, so the unit tests run them with fakes |
-| `data` | Room (`devices`, `seen_messages`, and since 1.3 `transfers`, `transfer_files`; database version 2 with a real migration) and DataStore settings and counters |
-| `log` | Rotating file log with secret redaction. Text is never logged, only its length and a short hash |
-| `ui` | Compose screens: confirm pairing, onboarding, home, debug |
+| `data` | Room (`devices`, `seen_messages`, 1.3 `transfers` and `transfer_files`, 1.4 `texts`): **database version 4**, `exportSchema` on. The schema of every version is in `app/schemas/` (checked in, not ignored), and `MigrationTest` runs the 2 → 3 and 3 → 4 migrations on a real SQLite; `RetentionSqlTest` runs the storage queries (`QuerySql`) on one too. DataStore holds the settings and counters (device name, latency history, setup done). `QueuePolicy`: 7-day expiry, 500 history items 
+| `log` | Rotating file log with secret redaction. Text is never logged, only its length and a short keyed hash (HMAC-SHA256, per-install key wrapped by the Keystore: `LogFingerprint`) |
+| `ui` | Compose screens: confirm pairing, pairing, Home, History, Settings, the setup (onboarding), Debug |
+| `history`, `setup`, `notify`, `debuginfo` | 1.4: `HistoryBuilder`, `SuccessRate`; `OemTable` (the one table of OEM settings screens) and `SetupActions`; `NotificationLedger`, `TextArrivals`, `TrailingThrottle`, channels; `ConnectionHistory`, `StateDump`, `LogExport` |
 
 ## Automation hooks (for the emulator and the integration agent)
 
@@ -68,12 +69,13 @@ adb shell am broadcast -a app.kinrelay.android.debug.<COMMAND> -n app.kinrelay.a
 | Command | What it does | Result line (logcat tag `KinRelay`, also in the log file) |
 |---|---|---|
 | `PING` | Starts the service if needed and sends a `ping` to the PC | `CMD PING result=Rtt(millis=6.6)` / `NoReply` / `NoConnection` / `Failed(...)` |
-| `STATE` | Dumps the state | `CMD STATE link=Connected(...) paired=<name> pcId=<id> lastAddresses=... lastPing=... lastArrivalMs=<tap to ack of the last send, ms> clipboardGuard=<sha, age> identityProblem=<null or text> pairing=<state> connects=N disconnects=N kills=N phoneId=<id>` |
+| `STATE` | Dumps the state | `CMD STATE link=Connected(...) paired=<name> pcId=<id> lastAddresses=... lastPing=... lastArrivalMs=<tap to ack of the last send, ms> clipboardGuard=<set + age, or none> identityProblem=<null or text> pairing=<state> connects=N disconnects=N kills=N phoneId=<id>` |
 | `CONNECT` | A user action: starts the service, resets the backoff, reconnects now | `CMD CONNECT done`, then the usual `link:` lines |
 | `UNPAIR` | The Unpair button (without the confirmation dialog) | `CMD UNPAIR done` |
 | `PAIR --es url "<link>"` | Pairs from a link as if it had been pasted in the app (no confirmation screen). Prefer the deep link with the auto-confirm extra: starting the service from a background broadcast may be refused on Android 12+ | the `pairing:` lines, `CMD PAIR PairNow` |
-| `SEND_TEXT --es text "<text>"` | Sends the text to the PC with the same sender as the share sheet, and waits for the ack | `CMD SEND_TEXT result=Delivered(arrivalMillis=8)` / `NotReachable(reason=...)` / `NoReply` / `Refused(code=...)` |
+| `SEND_TEXT --es text "<text>"` | Sends the text to the PC with the same sender as the share sheet: **saved in the queue first**, then flushed, and waits for the ack | `CMD SEND_TEXT result=Delivered(arrivalMillis=8)` / `Queued(reason=..., afterNoReply=false)` (no connection, or no ack: it goes out by itself later) / `Refused(code=...)` / `NotPaired` / `NotSent(reason=...)` (a `--ez sensitive true` text with no open connection or no ack: **never queued, never stored**, a "Not sent: <PC> offline" notification) |
 | `SET_CLIPBOARD --es text "<text>"` | Puts text on the phone's clipboard (to prepare a "send clipboard" test) | `CMD SET_CLIPBOARD len=N sha=xxxxxxxx` |
+| `EXPORT_LOGS` | The same zip as Settings → Debug → Export logs, without the share sheet (read it with `run-as ... cat cache/exports/<file>`) | `CMD EXPORT_LOGS uri=... file=kin-logs-<time>.zip bytes=N` |
 | `SET_PING_INTERVAL --ei seconds N` | WebSocket ping interval, for the soak (default 240; applies at the next connection) | `CMD SET_PING_INTERVAL Ns ...` |
 
 Wait for a result with logcat, for example:
@@ -108,7 +110,7 @@ adb shell cmd statusbar expand-settings
 ```
 
 - `SendClipboardAlias` and `DebugClipboardActivity` are debug-only (`src/debug`) and protected by the `DUMP` permission. The adb shell can't start the real `ClipboardSendActivity` (it isn't exported), so the alias stands in for the tile and the notification button, which start that same activity.
-- `DebugClipboardActivity` prints to logcat only, never to the log file, because the log file holds no text, only lengths and short hashes. `STATE` has `clipboardGuard=sha=… ageMs=…`: the hash of the text the PC last set.
+- `DebugClipboardActivity` prints to logcat only, never to the log file, because the log file holds no text, only lengths and short hashes. `STATE` has `clipboardGuard=set ageMs=…` (no hash).
 - A plain `am start -a android.intent.action.SEND -t text/plain ...` (without `-n`) opens the system chooser, because other apps take text too. Tap Kin and "Just once", or name the component as above.
 - The arrival time (targets.md priority 2) is **tap to ack**: from the moment the send activity was created (or the debug command ran) to the PC's `ack`. It is in `CMD SEND_TEXT ... arrivalMillis`, in `STATE` (`lastArrivalMs`), in the log (`text sent (...) ...; tap to ack N ms`) and on the Debug tab.
 - Loop prevention: text the PC just put on the clipboard (`clipboard`, or the copy that comes with `text`) is remembered by its SHA-256 for 60 s. A "send clipboard" of the same text in that time is not sent ("The PC already has this text."; the log says `send skipped (CLIPBOARD)`). Share and "Send to PC" are explicit and never skipped.
@@ -166,6 +168,26 @@ adb shell am start -n app.kinrelay.sharesource/.ShareActivity --ei n 2 --ei size
 adb shell am start -n app.kinrelay.sharesource/.ShareActivity --ei n 2 --ei size 5000 --ez jpeg true --ez chooser true   # open the system share sheet: the PC is in the top row
 ```
 
+### Queue, history and settings (milestone 1.4)
+
+All debug-only, protected by the `DUMP` permission. Nothing here prints a text: only IDs, states and counts.
+
+```
+adb shell am broadcast -a app.kinrelay.android.debug.TEXTS  -n app.kinrelay.android/.debug.DebugCommandReceiver
+#   CMD TEXT <id> <up|down> <queued|active|done|failed|canceled> attempts=N src=<share|process_text|clipboard|debug|pc> sensitive=<bool> bytes=N err=<code> bodyKept=<bool>
+adb shell am broadcast -a app.kinrelay.android.debug.CANCEL_TEXT -n app.kinrelay.android/.debug.DebugCommandReceiver --es id <message id>   # only a queued text is canceled
+adb shell am broadcast -a app.kinrelay.android.debug.RETRY_TEXT  -n app.kinrelay.android/.debug.DebugCommandReceiver --es id <message id>   # a failed text goes out again as a new message
+adb shell am broadcast -a app.kinrelay.android.debug.FLUSH       -n app.kinrelay.android/.debug.DebugCommandReceiver                         # flush the queue now (what the hello does)
+adb shell am broadcast -a app.kinrelay.android.debug.EXPIRE      -n app.kinrelay.android/.debug.DebugCommandReceiver                         # fail what waited 7 days
+#   --el ahead <ms>: judge the queue as if the clock were that far ahead (604800000 = a text made now is 7 days old; 603000000 expires nothing). CMD EXPIRE expired=N
+```
+
+- `STATE` now also has `successRate=<n% (x of y)>`.
+- The setup screen picks its OEM guide from `Build.MANUFACTURER`. To see another maker's steps on the emulator: `adb shell "run-as app.kinrelay.android sh -c 'echo xiaomi > files/debug-oem'"` (debug build only; `rm` the file to undo).
+- **Queue test on the emulator:** `adb shell svc wifi disable`, `SEND_TEXT` (result `Queued`), `am force-stop` the app to prove the queue survives a kill, `svc wifi enable`, open the app: the text arrives right after the hello. The fake PC's `holdtext <text>` is the PC's own queue: the text goes out right after the phone's next `hello`.
+- **Notification cap:** `adb shell dumpsys notification --noredact` lists the notifications of the app; after 60 texts there is one "N texts from <PC>" (id 3), and after 60 offers at most 10 results (id 11) and one summary (id 21).
+- **Export logs** (Debug screen): the zip is in `cache/exports/`; `adb shell "run-as app.kinrelay.android sh -c 'unzip -l cache/exports/*.zip; unzip -p cache/exports/*.zip state.txt'"`.
+
 ### Reading the state
 
 - **Logcat:** `adb logcat -d -s KinRelay`. Every line has the tag `KinRelay` and looks like `<ISO time> <I|W|E> <component>: <message>`. Components: `app`, `identity`, `pairing`, `tls`, `link`, `service`, `boot`, `mdns`, `clipboard`, `share`, `debug`. The lines that matter:
@@ -173,7 +195,7 @@ adb shell am start -n app.kinrelay.sharesource/.ShareActivity --ei n 2 --ei size
   - `link: connection ended: ... (code N, upgrade N, hello accepted for N ms) -> <ACTION>`
   - `link: disconnected: ...`
   - `link: ping received from '<PC>'` (and the "Ping from <PC>" notification)
-  - `link: clipboard from the PC len=N sha=...`, `link: text from '<PC>' len=N sha=...`, `link: text sent (SHARE|PROCESS_TEXT|CLIPBOARD|DEBUG) len=N sha=...; tap to ack N ms`, `link: send failed (...)`, `link: send skipped (CLIPBOARD)`. Text is never logged, only its length and the first 8 hex digits of its SHA-256
+  - `link: clipboard from the PC len=N sha=...`, `link: text from '<PC>' len=N sha=...`, `link: text sent (SHARE|PROCESS_TEXT|CLIPBOARD|DEBUG) len=N sha=...; tap to ack N ms`, `link: send failed (...)`, `link: send skipped (CLIPBOARD)`. Text is never logged, only its length and 8 hex digits of a keyed hash (HMAC-SHA256 with a per-install key); a sensitive text is not logged at all, except that the echo skip (`send skipped (CLIPBOARD)`) is still logged, with no length and no hash
   - `service: service started` / `service stopped` / `kill detected: ...`
   - `boot: BOOT_COMPLETED received` / `service start requested`
   - `identity: ...`: `identity unavailable (attempt N)` means a temporary Keystore problem (nothing was deleted); `the stored identity was replaced: ...` means the old one was lost for good
@@ -201,7 +223,7 @@ set KIN_FAKE_PC=1
 gradlew.bat testDebugUnitTest --tests "*FakePcSession*" --rerun
 ```
 
-It serves for `KIN_FAKE_PC_SECONDS` (default 300). Milestone 1.3 adds the file endpoints (`FakePcFiles`: `POST`, `PUT`, `DELETE`, `GET` with `Range`). Drive it by writing a word into `app/build/fake-pc/command.txt`: `ping`, `close4001`, `close4003`, `unpair`, `hello2` (a future-protocol hello) or `stop`. Milestone 1.2 adds `clipboard <text>`, `text <text>`, `url <link>` (a `text` with `isUrl`), `noack` / `ack` (stop / resume acking the phone's `text`) and `errtext` (answer it with an `error`). Milestone 1.3 adds `offer <id> <spec,...>` (`name:size[:mime]` or `name@WxH`), `cancel <id>`, `gone <id>`, `changed <id> <fileId>`, `postfail <status>`, `putfail <status>`, `dropput <bytes>`, `dropget <bytes>`, `throttle <bytes per 100 ms>`, `stale <offset>`, `ackmsg` / `noackmsg` (the list is in the header of `FakePcSession.kt`). It logs what it saw to `events.txt`, including what the PC stored (`stored <transfer> <file> ... sha=<hex>`) and the phone's `complete` / `cancel` messages. While it runs it holds `app/build` open, so stop it (`stop`) before the next Gradle build.
+It serves for `KIN_FAKE_PC_SECONDS` (default 300). Milestone 1.3 adds the file endpoints (`FakePcFiles`: `POST`, `PUT`, `DELETE`, `GET` with `Range`). Drive it by writing a word into `app/build/fake-pc/command.txt`: `ping`, `close4001`, `close4003`, `unpair`, `hello2` (a future-protocol hello) or `stop`. Milestone 1.2 adds `clipboard <text>`, `text <text>`, `url <link>` (a `text` with `isUrl`), `noack` / `ack` (stop / resume acking the phone's `text`) and `errtext` (answer it with an `error`). Milestone 1.3 adds `offer <id> <spec,...>` (`name:size[:mime]` or `name@WxH`), `cancel <id>`, `gone <id>`, `changed <id> <fileId>`, `postfail <status>`, `putfail <status>`, `dropput <bytes>`, `dropget <bytes>`, `throttle <bytes per 100 ms>`, `stale <offset>`, `used <transferId>` (that ID is used up: 404 to POST, PUT and DELETE), `holdtext <text>` (the PC keeps a text and sends it right after the phone's next hello), `ackmsg` / `noackmsg` (the list is in the header of `FakePcSession.kt`). It logs what it saw to `events.txt`, including what the PC stored (`stored <transfer> <file> ... sha=<hex>`) and the phone's `complete` / `cancel` messages. While it runs it holds `app/build` open, so stop it (`stop`) before the next Gradle build.
 
 ## The certificate fixture
 

@@ -10,6 +10,7 @@ import app.kinrelay.android.protocol.Hello
 import app.kinrelay.android.protocol.MessageIds
 import app.kinrelay.android.protocol.MessageReceiver
 import app.kinrelay.android.protocol.Offer
+import app.kinrelay.android.protocol.OfferHistory
 import app.kinrelay.android.protocol.ReceiverRole
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -57,6 +58,9 @@ class HttpEndpoint(val client: OkHttpClient, val address: PairingAddress)
 interface LinkConnection {
     val isReady: Boolean
 
+    /** The device ID of the PC this connection is pinned to (the TLS handshake accepted only that key). A transfer or a queued message is for one PC. */
+    val peerDeviceId: String
+
     /** The HTTPS side of this connection (file bytes go over separate requests, never over the WebSocket). Null in tests that have none. */
     val httpEndpoint: HttpEndpoint? get() = null
 
@@ -90,6 +94,15 @@ interface SessionListener {
      */
     fun acceptOffer(offer: Offer): String? = null
 
+    /**
+     * What the phone knows about the ID of an `offer`, asked first: a repeat by this PC is acked again (and [onOfferRepeated] follows), any
+     * other reuse is `bad_request`. Runs on the socket's thread: keep it cheap.
+     */
+    fun offerHistory(offer: Offer): OfferHistory = OfferHistory.NEW
+
+    /** An `offer` this PC made before, acked again (nothing is downloaded a second time). Don't block. */
+    fun onOfferRepeated(fromName: String, offer: Offer) = Unit
+
     /** A valid `offer` that was acked. Don't block: start the download on another coroutine. */
     fun onOfferReceived(fromName: String, offer: Offer) = Unit
 
@@ -114,9 +127,10 @@ class LinkSession(
     private val clock: Clock,
     private val log: KinLog,
     private val listener: SessionListener,
+    override val peerDeviceId: String,
     private val helloTimeoutMillis: Long = CloseRules.HELLO_TIMEOUT_MILLIS,
 ) : LinkConnection {
-    private val receiver = MessageReceiver(dedup, ReceiverRole.PHONE, listener::acceptOffer)
+    private val receiver = MessageReceiver(dedup, ReceiverRole.PHONE, listener::acceptOffer, listener::offerHistory)
     private val ended = CompletableDeferred<SessionEnd>()
     private val pending = ConcurrentHashMap<String, CompletableDeferred<Action>>()
     private var socket: WebSocket? = null
@@ -234,6 +248,7 @@ class LinkSession(
             is Action.DeliverText -> listener.onTextReceived(receiver.peer?.name ?: "PC", action.id, action.text, action.isUrl, action.sensitive)
             is Action.SetClipboard -> listener.onClipboardReceived(action.id, action.text)
             is Action.StartDownload -> listener.onOfferReceived(receiver.peer?.name ?: "PC", action.offer)
+            is Action.RepeatOffer -> listener.onOfferRepeated(receiver.peer?.name ?: "PC", action.offer)
             is Action.CancelTransfer -> listener.onCancelReceived(action.transferId, action.reason)
             is Action.OfferRefused -> log.w("link", "an offer was refused: ${action.code}")
             is Action.MarkTransferDone -> Unit

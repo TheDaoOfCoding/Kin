@@ -15,8 +15,10 @@ interface TransferLink {
     /**
      * A connection that has accepted the PC's `hello`: now, or one that appears within [waitMillis]. [kick] says the user
      * did something (the loop tries to connect now); a transfer that is only waiting for the PC to come back doesn't kick.
+     * Only a connection to the PC [peerDeviceId] counts: right after a re-pair the old PC's connection is briefly still the current one,
+     * and a transfer must never be sent to (or asked of) a PC it was not made for.
      */
-    suspend fun connection(waitMillis: Long, kick: Boolean): LinkConnection?
+    suspend fun connection(waitMillis: Long, kick: Boolean, peerDeviceId: String): LinkConnection?
 
     /** Why [connection] found nothing, in words for the user. */
     fun unreachableReason(): String
@@ -35,17 +37,20 @@ interface SourceFiles {
     /** A stream positioned at [offset]. Throws `IOException` or `SecurityException` when access is lost. */
     fun open(uri: String, offset: Long): InputStream
 
-    /** Copies the file into the app's cache so access survives (android.md). Returns the new URI, or null if it failed. */
-    fun cacheCopy(uri: String, transferId: String, fileId: String): String?
+    /**
+     * Copies the file into the app's cache so access survives (android.md). Returns the new URI, or null if it failed. [cacheKey] is the
+     * transfer's stable local ID ([app.kinrelay.android.data.TransferEntity.localId]), not its transfer ID: that one can change.
+     */
+    fun cacheCopy(uri: String, cacheKey: String, fileId: String): String?
 
     /** Writes [text] (UTF-8) as a cached file and returns its URI. */
-    fun cacheText(text: String, transferId: String, fileId: String): String
+    fun cacheText(text: String, cacheKey: String, fileId: String): String
 
-    /** Deletes everything cached for the transfer. */
-    fun deleteCache(transferId: String)
+    /** Deletes everything cached under [cacheKey]. */
+    fun deleteCache(cacheKey: String)
 
     /**
-     * Deletes the cached copies of every transfer that isn't in [owned] (a crash left them behind), except those newer than
+     * Deletes the cached copies whose cache key isn't in [owned] (a crash left them behind), except those newer than
      * [minAgeMillis] (a share that is being set up right now has no database row yet). Returns how many were deleted.
      */
     fun deleteCacheExcept(owned: Set<String>, minAgeMillis: Long): Int
@@ -127,11 +132,19 @@ class TransferDeps(
     val notifier: TransferNotifier,
     val wake: WakeLockPort,
     val log: KinLog,
+    val progress: LiveProgress = LiveProgress(),
     val nowMillis: () -> Long = System::currentTimeMillis,
     val newId: () -> String,
 ) {
     /** Whether the PC that is paired now is the one [transfer] belongs to. A transfer never goes to (or comes from) another PC. */
     suspend fun isPairedWith(transfer: TransferEntity): Boolean = link.peer()?.deviceId == transfer.peerDeviceId
+
+    /**
+     * A ready connection to the PC [transfer] belongs to. The check is made twice, by [TransferLink] and here on the connection itself: a
+     * connection to another PC is never used, whatever the link says.
+     */
+    suspend fun connectionFor(transfer: TransferEntity, waitMillis: Long, kick: Boolean): LinkConnection? =
+        link.connection(waitMillis, kick, transfer.peerDeviceId)?.takeIf { it.peerDeviceId == transfer.peerDeviceId }
 }
 
 /** Time limits the runners use. The defaults are for the app; tests make them short. */

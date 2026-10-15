@@ -1,5 +1,6 @@
 package app.kinrelay.android.clipboard
 
+import app.kinrelay.android.log.LogFingerprint
 import app.kinrelay.android.protocol.Frames
 import java.security.MessageDigest
 
@@ -24,9 +25,9 @@ class ClipboardGuard(private val nowMillis: () -> Long, private val windowMillis
     @Synchronized
     fun isEcho(text: String): Boolean = lastHash != null && hash(text) == lastHash && nowMillis() - lastAt in 0..windowMillis
 
-    /** For the debug state dump: what the guard remembers, without the text. */
+    /** For the debug state dump: whether the guard remembers a text and how old it is. No hash: a hash of a short text can be guessed. */
     @Synchronized
-    fun describe(): String = lastHash?.let { "sha=${it.take(8)} ageMs=${nowMillis() - lastAt}" } ?: "none"
+    fun describe(): String = if (lastHash != null) "set ageMs=${nowMillis() - lastAt}" else "none"
 
     companion object {
         const val WINDOW_MILLIS = 60_000L
@@ -38,7 +39,7 @@ class ClipboardGuard(private val nowMillis: () -> Long, private val windowMillis
         fun hashOfWire(wire: String): String =
             MessageDigest.getInstance("SHA-256").digest(wire.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
 
-        /** What the log may say about a text: its length and a short hash, never the text. */
-        fun fingerprint(text: String): String = "len=${text.codePointCount(0, text.length)} sha=${hash(text).take(8)}"
+        /** What the log may say about a text: its length and a short **keyed** hash ([LogFingerprint]), never the text. */
+        fun fingerprint(text: String): String = LogFingerprint.of(text, Frames.wireText(text))
     }
 }

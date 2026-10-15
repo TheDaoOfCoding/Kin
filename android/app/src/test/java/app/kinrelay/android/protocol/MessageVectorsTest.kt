@@ -48,6 +48,14 @@ class MessageVectorsTest {
         "handshake-then-text-then-duplicate", "invalid-message-keeps-connection-open", "rejected-message-id-is-not-remembered",
         // 1.3
         "duplicate-offer-is-acked-not-restarted",
+        // 1.4 (they use the steps `reconnect` and `transfer_over`, see protocol/README.md)
+        "offer-reusing-a-text-id-is-bad-request",
+        "offer-repeated-while-unfinished-is-acked-after-a-reconnect", "queue-resend-after-reconnect-is-idempotent",
+        "queue-is-not-sent-before-hello",
+        // 1.4 review (item 52): the same PC repeating an offer is acked in any state, any other reuse is `bad_request`; complete and cancel are re-sent
+        "same-pc-repeat-after-done-is-acked", "same-pc-repeat-after-canceled-is-acked", "offer-from-another-device-is-bad-request",
+        "same-pc-repeat-with-different-files-is-bad-request", "complete-re-sent-after-reconnect-is-acked-again",
+        "cancel-re-sent-after-reconnect-is-acked-again",
     )
 
     /** The invalid-UTF-8 case can only be checked on the PC side: OkHttp never shows the bad bytes. */
@@ -138,11 +146,35 @@ class MessageVectorsTest {
         for (sequence in vectors.cases("sequences")) {
             val name = sequence.getValue("name").str()
             if (!Vectors.inScope(name, sequenceScope)) continue
-            val receivers = mapOf("phone" to newReceiver("phone"), "pc" to newReceiver("pc"))
+            // The memory of IDs outlives a connection (`reconnect` makes new receivers over the same memory). `known` stands for the transfer
+            // engine's store: the offers the phone started, with the PC that made them and their files (file ID to size). The engine's rule
+            // (item 52) is in [TransferEngine.offerHistory]; this is the same rule over a map, since the real one needs a store and a link.
+            val dedups = mapOf("phone" to DedupMemory({ 0L }), "pc" to DedupMemory({ 0L }))
+            class Known(val device: String, val files: Map<String, Long>)
+            val known = HashMap<String, Known>()
+            var device = "first"
+            fun history(offer: Offer): OfferHistory {
+                val earlier = known[offer.id] ?: return OfferHistory.NEW
+                return if (earlier.device == device && earlier.files == offer.files.associate { it.fileId to it.size }) OfferHistory.REPEAT else OfferHistory.REUSED
+            }
+            fun fresh() = mapOf(
+                "phone" to MessageReceiver(dedups.getValue("phone"), ReceiverRole.PHONE, offerHistory = ::history),
+                "pc" to MessageReceiver(dedups.getValue("pc"), ReceiverRole.PC),
+            )
+            var receivers = fresh()
             for ((i, step) in sequence.getValue("steps").jsonArray.withIndex()) {
                 val case = step.jsonObject
+                when (case["event"]?.str()) {
+                    "reconnect" -> { case["device"]?.str()?.let { device = it }; receivers = fresh(); continue }
+                    // A finished download keeps its ID for ever: nothing to change in the model.
+                    "transfer_over" -> continue
+                    null -> Unit
+                    else -> error("unknown step event in $name#$i")
+                }
                 val receiver = receivers.getValue(if (case.getValue("from").str() == "phone") "pc" else "phone")
-                check("sequence/$name#$i", case, feed(receiver, case))
+                val outcome = feed(receiver, case)
+                check("sequence/$name#$i", case, outcome)
+                (outcome.action as? Action.StartDownload)?.let { known[it.offer.id] = Known(device, it.offer.files.associate { f -> f.fileId to f.size }) }
             }
             run++
         }

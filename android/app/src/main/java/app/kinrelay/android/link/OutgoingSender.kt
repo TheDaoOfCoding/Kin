@@ -1,28 +1,45 @@
 package app.kinrelay.android.link
 
 import app.kinrelay.android.clipboard.ClipboardGuard
+import app.kinrelay.android.data.TextSource
+import app.kinrelay.android.data.TransferStatus
 import app.kinrelay.android.log.KinLog
 import app.kinrelay.android.protocol.Frames
 import app.kinrelay.android.protocol.MessageIds
 import app.kinrelay.android.protocol.TextRules
 import app.kinrelay.android.protocol.UrlRules
 import app.kinrelay.android.protocol.Utf8
+import app.kinrelay.android.transfer.PeerInfo
 
 /** Where an explicit send came from. Only a clipboard send is checked against the loop guard. */
-enum class SendSource { SHARE, PROCESS_TEXT, CLIPBOARD, DEBUG }
+enum class SendSource(val stored: String) {
+    SHARE(TextSource.SHARE),
+    PROCESS_TEXT(TextSource.PROCESS_TEXT),
+    CLIPBOARD(TextSource.CLIPBOARD),
+    DEBUG(TextSource.DEBUG),
+}
 
 sealed interface SendOutcome {
     /** The PC acked. [arrivalMillis] is the time from the tap to the ack. */
     data class Delivered(val arrivalMillis: Long) : SendOutcome
 
-    /** No connection (and none appeared in a few seconds). Nothing was sent. */
-    data class NotReachable(val reason: String) : SendOutcome
-
-    /** Sent, but no ack in time. It may or may not have arrived. */
-    data object NoReply : SendOutcome
+    /**
+     * Saved in the queue and not delivered yet: there was no connection (and none appeared in a few seconds), or the PC didn't ack in time
+     * ([afterNoReply]: it may or may not have arrived). It goes out by itself when the PC is back, and is shown in the history meanwhile.
+     */
+    data class Queued(val reason: String, val afterNoReply: Boolean = false) : SendOutcome
 
     /** The PC answered with an `error`. */
     data class Refused(val code: String) : SendOutcome
+
+    /** A sensitive text with no open connection (or no ack): never queued, never stored. The user was told. */
+    data class NotSent(val reason: String) : SendOutcome
+
+    /** Canceled in the history before it went out. */
+    data object Canceled : SendOutcome
+
+    /** No PC is paired: nothing was queued. */
+    data object NotPaired : SendOutcome
 
     /** Over 128 KiB, so it goes as a `.txt` file ([TextFileSender]): the upload runs on its own, with its own progress notification. */
     data object SentAsFile : SendOutcome
@@ -39,13 +56,14 @@ sealed interface SendOutcome {
 
 /** How the sender gets a connection and the facts it needs for messages. */
 interface OutgoingLink {
-    /** A connection that has accepted the PC's `hello`: now, or one that appears within [waitMillis]. */
-    suspend fun await(waitMillis: Long): LinkConnection?
+    /** A connection to the PC [peerDeviceId] that has accepted its `hello`: now, or one that appears within [waitMillis]. */
+    suspend fun await(waitMillis: Long, peerDeviceId: String): LinkConnection?
 
     /** Why [await] found nothing, in words for the user. */
     fun unreachableReason(): String
 
-    suspend fun peerName(): String?
+    /** The PC this phone is paired with, or null. */
+    suspend fun peer(): PeerInfo?
 }
 
 /** Records the tap-to-ack time (targets.md priority 2). */
@@ -64,12 +82,14 @@ fun interface TextFileSender {
 }
 
 /**
- * Sends text to the PC as a `text` message and waits for the ack (5 s, protocol.md). With no connection it
- * says "PC not reachable" and sends nothing: the persistent queue is 1.4. It reports to the user itself
- * ([Alerts]), so the activities that call it can finish at once.
+ * Sends text to the PC: **saved in the queue first** ([TextOutbox]), then the queue is flushed if there is a connection ([OutboxFlusher]),
+ * and the outcome tells the user what happened. With no connection (none appears within [connectWaitMillis]) the text stays queued
+ * ("saved, goes out when the PC is back") instead of being lost; with no ack in 5 s it is re-queued, not failed. It reports to the user
+ * itself ([Alerts]), so the activities that call it can finish at once.
  *
  * The text goes out in its wire form ([Frames.wireText]: LF only). A text over 128 KiB (UTF-8) is not sent as a message but as a
- * `.txt` file ([TextFileSender]), which is an upload like any other. The 1 MiB frame limit stays as the receivers' hard limit.
+ * `.txt` file ([TextFileSender]), which is an upload (and is queued like any upload). The 1 MiB frame limit stays as the receivers' hard
+ * limit. The automatic clipboard sync (PC to phone) is not sent from here and is never queued.
  */
 class OutgoingSender(
     private val link: OutgoingLink,
@@ -78,22 +98,26 @@ class OutgoingSender(
     private val arrivals: ArrivalSink,
     private val clock: Clock,
     private val log: KinLog,
-    private val ackTimeoutMillis: Long = ACK_TIMEOUT_MILLIS,
+    private val outbox: TextOutbox,
+    private val flusher: OutboxFlusher,
     private val connectWaitMillis: Long = CONNECT_WAIT_MILLIS,
     private val textFiles: TextFileSender = TextFileSender.None,
+    private val ackTimeoutMillis: Long = ACK_TIMEOUT_MILLIS,
 ) {
     /**
      * [tapAtMillis] is on the [Clock]'s timeline: when the user's tap reached the app. [sensitive] is set when the clipboard's
      * `ClipDescription` says the content is sensitive (a password manager): the PC then keeps it out of its history.
      */
     suspend fun send(text: String, tapAtMillis: Long, source: SendSource, sensitive: Boolean = false): SendOutcome {
-        val fingerprint = ClipboardGuard.fingerprint(text)
+        // A sensitive text is never fingerprinted: no length, no hash, nothing about it reaches the log (a hash of a short secret can be guessed).
+        val fingerprint = if (sensitive) "" else ClipboardGuard.fingerprint(text)
         if (text.isBlank()) {
             alerts.message("Nothing to send.")
             return SendOutcome.Empty
         }
         if (source == SendSource.CLIPBOARD && guard.isEcho(text)) {
-            log.i("link", "send skipped ($source): the text is what the PC just set $fingerprint")
+            // The skip itself is logged for a sensitive text too (it is how the e2e checks the guard); only the fingerprint is left out.
+            log.i("link", "send skipped ($source): the text is what the PC just set${if (sensitive) "" else " $fingerprint"}")
             alerts.message("The PC already has this text.")
             return SendOutcome.Echo
         }
@@ -108,40 +132,74 @@ class OutgoingSender(
                 return SendOutcome.TooLong
             }
         }
-        val id = MessageIds.newId()
         val isUrl = UrlRules.isUrl(text)
-        // Over 128 KiB went to a file above, so the frame is far below 1 MiB: null can't happen, but never send a broken frame.
-        val frame = Frames.text(id, text, isUrl, sensitive) ?: return SendOutcome.TooLong
-        val pcName = link.peerName()
-        val connection = link.await(connectWaitMillis)
-        if (connection == null) {
-            val reason = link.unreachableReason()
-            log.w("link", "send failed ($source): PC not reachable: $reason ${logged(fingerprint, sensitive)}")
-            alerts.sendFailed("PC not reachable", "Couldn't send to ${pcName ?: "your PC"}. $reason")
-            return SendOutcome.NotReachable(reason)
+        // Over 128 KiB went to a file above, so the frame is far below 1 MiB: null can't happen, but never queue a broken frame.
+        if (Frames.text("probe", text, isUrl, sensitive) == null) return SendOutcome.TooLong
+        val peer = link.peer()
+        if (peer == null) {
+            alerts.message("Pair a PC first.")
+            return SendOutcome.NotPaired
         }
-        return when (val result = connection.sendAcked(id, frame, ackTimeoutMillis)) {
-            AckResult.Acked -> {
+
+        // A sensitive text is never stored (protocol.md, Queue), so it can't wait: it goes out only over an open connection.
+        if (sensitive) return sendSensitive(text, isUrl, tapAtMillis, source, peer)
+
+        // Saved first. From here on the text can't be lost by a dead connection or a killed process.
+        val item = outbox.enqueue(text, isUrl, sensitive, source.stored, peer)
+        val connection = link.await(connectWaitMillis, peer.deviceId)
+        if (connection != null) flusher.flush(connection)
+
+        val result = outbox.get(item.id)
+        return when (result?.status) {
+            TransferStatus.DONE -> {
                 val arrival = clock.elapsedMillis() - tapAtMillis
                 arrivals.record(arrival)
                 log.i("link", "text sent ($source) ${logged(fingerprint, sensitive)} isUrl=$isUrl sensitive=$sensitive; tap to ack $arrival ms")
-                alerts.sent(pcName, arrival)
+                alerts.sent(peer.name, arrival)
                 SendOutcome.Delivered(arrival)
             }
-            AckResult.NoConnection -> {
-                log.w("link", "send ($source): the connection dropped before the send ${logged(fingerprint, sensitive)}")
-                alerts.sendFailed("PC not reachable", "Couldn't send to ${pcName ?: "your PC"}. The connection dropped.")
-                SendOutcome.NotReachable("The connection dropped.")
+            TransferStatus.FAILED -> {
+                val code = result.errorCode ?: "failed"
+                log.w("link", "send ($source): not delivered, $code ${logged(fingerprint, sensitive)}")
+                alerts.sendFailed("${peer.name} refused it", result.message ?: "The PC answered with an error ($code).")
+                SendOutcome.Refused(code)
             }
-            AckResult.NoReply -> {
-                log.w("link", "send ($source): no ack in $ackTimeoutMillis ms ${logged(fingerprint, sensitive)}")
-                alerts.sendFailed("No reply from ${pcName ?: "your PC"}", "It may or may not have arrived. Try again if it didn't.")
-                SendOutcome.NoReply
+            TransferStatus.CANCELED -> SendOutcome.Canceled
+            else -> {
+                outbox.markReportedQueued(item.id)
+                val noReply = connection != null
+                val reason = if (noReply) "No reply from ${peer.name} yet." else link.unreachableReason()
+                log.w("link", "send ($source): queued, ${if (noReply) "no ack" else "PC not reachable: $reason"} ${logged(fingerprint, sensitive)}")
+                alerts.queued(peer.name, reason, afterNoReply = noReply)
+                SendOutcome.Queued(reason, afterNoReply = noReply)
+            }
+        }
+    }
+
+    /** Sends a sensitive text now or not at all: nothing goes to the database, the history or the queue, and the log has no hash. */
+    private suspend fun sendSensitive(text: String, isUrl: Boolean, tapAtMillis: Long, source: SendSource, peer: PeerInfo): SendOutcome {
+        val connection = link.await(connectWaitMillis, peer.deviceId)
+        val id = MessageIds.newId()
+        val frame = Frames.text(id, Frames.sanitize(text), isUrl, sensitive = true) ?: return SendOutcome.TooLong
+        val result = connection?.sendAcked(id, frame, ackTimeoutMillis) ?: AckResult.NoConnection
+        return when (result) {
+            AckResult.Acked -> {
+                val arrival = clock.elapsedMillis() - tapAtMillis
+                arrivals.record(arrival)
+                log.i("link", "sensitive text sent ($source) (its content is not logged); tap to ack $arrival ms")
+                alerts.sent(peer.name, arrival)
+                SendOutcome.Delivered(arrival)
             }
             is AckResult.Refused -> {
-                log.w("link", "send ($source): the PC answered ${result.code}: ${result.message}")
-                alerts.sendFailed("${pcName ?: "Your PC"} refused it", "The PC answered with an error (${result.code}).")
+                log.w("link", "sensitive send ($source): not delivered, ${result.code}")
+                alerts.sendFailed("${peer.name} refused it", "The PC answered with an error (${result.code}).")
                 SendOutcome.Refused(result.code)
+            }
+            AckResult.NoReply, AckResult.NoConnection -> {
+                val reason = if (result == AckResult.NoReply) "${peer.name} didn't confirm it." else link.unreachableReason()
+                log.w("link", "sensitive send ($source): not sent, ${if (result == AckResult.NoReply) "no ack" else "PC not reachable"}; sensitive texts are not queued")
+                alerts.sendFailed("Not sent: ${peer.name} offline", "A sensitive text is never saved to be sent later. $reason Copy it again when ${peer.name} is back.")
+                SendOutcome.NotSent(reason)
             }
         }
     }
@@ -156,7 +214,7 @@ class OutgoingSender(
         return SendOutcome.SentAsFile
     }
 
-    /** A sensitive text is never logged, not even by its hash. */
+    /** A sensitive text is never logged, not even by its length or its hash. */
     private fun logged(fingerprint: String, sensitive: Boolean) = if (sensitive) "(sensitive)" else fingerprint
 
     companion object {

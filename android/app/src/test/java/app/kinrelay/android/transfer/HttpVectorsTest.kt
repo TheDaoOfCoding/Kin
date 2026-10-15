@@ -227,7 +227,13 @@ class HttpVectorsTest {
     @Test
     fun everyTransferIdSequenceIsUnderstoodByTheClient() {
         val sequences = vectors.cases("sequences").filter { it.getValue("name").str().startsWith("transfer-id-") }
-        assertEquals(listOf("transfer-id-canceled-is-never-reused", "transfer-id-finished-answers-for-a-day-then-404"), sequences.map { it.getValue("name").str() })
+        assertEquals(
+            listOf(
+                "transfer-id-canceled-is-never-reused", "transfer-id-finished-answers-for-a-day-then-404", "transfer-id-window-ends-at-exactly-24-hours",
+                "transfer-id-window-is-not-extended-by-an-empty-put-or-a-post", "transfer-id-retry-after-404-sends-only-the-missing-files",
+            ),
+            sequences.map { it.getValue("name").str() },
+        )
         var clockSteps = 0
         var requests = 0
         for (sequence in sequences) {
@@ -248,7 +254,8 @@ class HttpVectorsTest {
                     continue
                 }
                 val request = step.getValue("request").jsonObject
-                val response = step.getValue("response").jsonObject
+                // A request without a response is one whose connection broke (`interruptedAfterBytes`): the phone sees no answer, and nothing is replayed.
+                val response = (step["response"] as? JsonObject) ?: continue
                 val method = request.getValue("method").str()
                 val path = request.getValue("path").str()
                 val status = response.getValue("status").jsonPrimitive.int
@@ -270,9 +277,9 @@ class HttpVectorsTest {
                 if (method == "PUT" && status == 200 && (request["bodyBytes"]?.jsonPrimitive?.long ?: 0L) > 0) finishedAt[id] = clock.nowMillis
             }
             val notFound = sequence.getValue("steps").jsonArray.count { (it.jsonObject["response"] as? JsonObject)?.get("status")?.jsonPrimitive?.int == 404 }
-            assertTrue("$sequenceName: it has 404 answers", notFound >= 3)
+            assertTrue("$sequenceName: it has 404 answers", notFound >= 1)
         }
-        assertEquals("one sequence moves the clock, twice", 2, clockSteps)
+        assertEquals("the sequences that move the clock do it six times in all", 6, clockSteps)
         assertTrue("requests replayed: $requests", requests >= 14)
     }
 
@@ -391,5 +398,38 @@ class HttpVectorsTest {
         assertEquals(emptyList<String>(), problems.toList())
         rig.awaitStatus(id, TransferStatus.DONE)
         assertArrayEquals(bytes, rig.sink.visible().single().file.readBytes())
+    }
+
+    /**
+     * `transfer-id-retry-after-404-sends-only-the-missing-files`, through the real runner and the real engine. The vector's DELETE step only
+     * models the PC ending the transfer, so the phone never sends it. The vector's `POST` with the old ID that answers `404` is what the
+     * phone's *automatic* resume asks after the cut (it marks the transfer failed there and sends nothing more); the user's Retry then asks
+     * the old ID again (a second `404`, the same answer, inserted here), and only then does the new ID with the one file that never got a
+     * `200` go out.
+     */
+    @Test
+    fun uploadRetryAfter404SendsOnlyTheMissingFiles() {
+        val old = "0193a5c2-8000-7a11-8b22-0123456789ab"
+        val new = "0193a5c2-8000-7a11-8b22-0123456789ac"
+        val ids = LinkedBlockingQueue(listOf(old, new))
+        val rig = TransferRig(newId = { ids.take() }).also { rigs += it; it.connect() }
+        val f1 = rig.sources.add("f1.bin", TransferRig.bytes(5, 1))
+        val f2 = rig.sources.add("f2.bin", TransferRig.bytes(5, 2))
+        val vector = steps("transfer-id-retry-after-404-sends-only-the-missing-files")
+        val notFoundPost = vector[4]
+        val steps = vector.filterIndexed { index, _ -> index != 3 }.toMutableList().also { it.add(4, notFoundPost) }
+        assertEquals(listOf("POST", "PUT", "PUT", "POST", "POST", "POST", "PUT"), steps.map { it.request.getValue("method").str() })
+        val problems = replay(rig, steps, { rig.blocking { rig.engine.enqueueUpload(listOf(ShareSource(f1), ShareSource(f2))) } }) { index, step, _ ->
+            // After the automatic resume got its 404 the transfer is failed; then the user taps Retry.
+            if (index == 3) Thread { rig.awaitStatus(old, TransferStatus.FAILED); rig.engine.retry(old) }.start()
+            brokenOrServed(step)
+        }
+        assertEquals(emptyList<String>(), problems.toList())
+        rig.awaitStatus(new, TransferStatus.DONE)
+        val oldRow = rig.store.transfers.getValue(old)
+        assertEquals(TransferStatus.FAILED, oldRow.status)
+        assertEquals(new, oldRow.retriedAs)
+        assertEquals("not_found", oldRow.errorCode)
+        assertEquals(listOf("f2"), rig.store.files.getValue(new).map { it.fileId })
     }
 }

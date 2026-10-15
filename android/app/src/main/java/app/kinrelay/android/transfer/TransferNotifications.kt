@@ -1,7 +1,6 @@
 package app.kinrelay.android.transfer
 
 import android.Manifest
-import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.ClipData
@@ -11,6 +10,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -20,14 +20,21 @@ import app.kinrelay.android.R
 import app.kinrelay.android.data.TransferDirection
 import app.kinrelay.android.data.TransferEntity
 import app.kinrelay.android.data.TransferFileEntity
+import app.kinrelay.android.notify.NotificationChannels
+import app.kinrelay.android.notify.NotificationLedger
+import app.kinrelay.android.notify.TrailingThrottle
 
 /**
  * What the user sees of a transfer: a progress notification with Cancel, and the result ("Photo from Desk PC" with Open and Share
  * for a download). Progress is updated at most twice a second by the runners ([ProgressThrottle]).
  *
- * The result has its **own notification ID**, so it is a new notification and never an update of the progress one: Android drops
- * updates of an app that posts too fast, and a dropped result would leave "Receiving..." on screen for ever. The progress notification
- * is cancelled when the result is posted.
+ * - The result has its **own notification ID**, so it is a new notification and never an update of the progress one: Android drops
+ *   updates of an app that posts too fast, and a dropped result would leave "Receiving..." on screen for ever. The progress notification
+ *   is cancelled when the result is posted.
+ * - **Bounded and grouped (1.4).** Android drops *new* notifications once an app has 50 up, so a long batch of transfers could lose its
+ *   results. Each of the two groups (what the phone sends and the progress of everything: channel *transfers*; what arrived: channel
+ *   *arrivals*) keeps at most [MAX_SLOTS] transfers on screen ([NotificationLedger]: a new one beyond the cap pushes out the oldest), and
+ *   shows a summary notification ("N file transfers") when there are two or more, so they are one stack.
  */
 class TransferNotifications(context: Context) : TransferNotifier {
     private val context = context.applicationContext
@@ -37,18 +44,26 @@ class TransferNotifications(context: Context) : TransferNotifier {
     /** Transfers that have a progress notification up (so that the first update of a retried transfer takes the old result away). */
     private val showingProgress: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
+    private val sendLedger = NotificationLedger(MAX_SLOTS, now = SystemClock::elapsedRealtime)
+    private val arrivalLedger = NotificationLedger(MAX_SLOTS, now = SystemClock::elapsedRealtime)
+    private val lock = Any()
+
+    // A summary is the one notification that is *updated* (everything else is a new notification under its own tag). Android sheds updates
+    // of an app that posts more than about five a second, and the update that is shed in a burst of 15 files is the last, so the count
+    // would stay low for good (seen on the emulator: "4 files from your PC" with 10 on screen). The summaries are posted at most once a
+    // second each, and the last request is always posted ([TrailingThrottle]).
+    private fun summaryPoster(ledger: NotificationLedger, group: String, channel: String, summaryId: Int, what: String) = TrailingThrottle(
+        intervalMillis = SUMMARY_UPDATE_MILLIS,
+        now = SystemClock::elapsedRealtime,
+        schedule = { delay, task -> main.postDelayed(task, delay) },
+        action = { synchronized(lock) { renderSummary(ledger, group, channel, summaryId, what) } },
+    )
+
+    private val sendSummary = summaryPoster(sendLedger, GROUP_SENDS, NotificationChannels.TRANSFERS, SENDS_SUMMARY_ID, "file transfers")
+    private val arrivalSummary = summaryPoster(arrivalLedger, GROUP_ARRIVALS, NotificationChannels.ARRIVALS, ARRIVALS_SUMMARY_ID, "files from your PC")
+
     init {
-        manager.createNotificationChannel(
-            NotificationChannel(PROGRESS_CHANNEL, "File transfers", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "Progress of files going to or coming from your PC"
-                setShowBadge(false)
-            }
-        )
-        manager.createNotificationChannel(
-            NotificationChannel(RESULT_CHANNEL, "Files from your PC", NotificationManager.IMPORTANCE_DEFAULT).apply {
-                description = "Photos and files your PC sent, and transfers that didn't work"
-            }
-        )
+        NotificationChannels.ensure(this.context)
     }
 
     override fun progress(transfer: TransferEntity, files: List<TransferFileEntity>, bytesDone: Long, waiting: Boolean) {
@@ -65,14 +80,18 @@ class TransferNotifications(context: Context) : TransferNotifier {
             files.size == 1 -> "$percent%"
             else -> "${minOf(finished + 1, files.size)} of ${files.size} files · $percent%"
         }
-        val builder = base(PROGRESS_CHANNEL, title, text)
+        val builder = base(NotificationChannels.TRANSFERS, GROUP_SENDS, title, text)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setSilent(true)
             .setCategory(NotificationCompat.CATEGORY_PROGRESS)
             .setProgress(100, percent, waiting)
             .addAction(R.drawable.ic_stat_kin, "Cancel", broadcast(ACTION_CANCEL, transfer.id))
-        manager.notify(transfer.id, PROGRESS_ID, builder.build())
+        synchronized(lock) {
+            claim(sendLedger, transfer.id, title)
+            manager.notify(transfer.id, PROGRESS_ID, builder.build())
+            updateSummary(sends = true)
+        }
     }
 
     override fun uploaded(transfer: TransferEntity, files: List<TransferFileEntity>) {
@@ -81,11 +100,11 @@ class TransferNotifications(context: Context) : TransferNotifier {
             message("Sent $what to ${transfer.peerName}")
             return
         }
-        val builder = base(RESULT_CHANNEL, "Sent to ${transfer.peerName}", what)
+        val builder = base(NotificationChannels.TRANSFERS, GROUP_SENDS, "Sent to ${transfer.peerName}", what)
             .setAutoCancel(true)
             .setTimeoutAfter(RESULT_TIMEOUT_MILLIS)
             .setSilent(true)
-        postResult(transfer.id, builder)
+        postSendResult(transfer.id, "Sent to ${transfer.peerName}", builder)
     }
 
     override fun received(transfer: TransferEntity, files: List<TransferFileEntity>) {
@@ -95,28 +114,36 @@ class TransferNotifications(context: Context) : TransferNotifier {
             return
         }
         val title = receivedTitle(transfer.peerName, saved)
-        val builder = base(RESULT_CHANNEL, title, saved.joinToString(", ") { it.finalName ?: it.name })
+        val builder = base(NotificationChannels.ARRIVALS, GROUP_ARRIVALS, title, saved.joinToString(", ") { it.finalName ?: it.name })
             .setAutoCancel(true)
             .setContentIntent(open(saved.first(), transfer.id))
             .addAction(R.drawable.ic_stat_kin, "Open", open(saved.first(), transfer.id))
             .addAction(R.drawable.ic_stat_kin, "Share", share(saved, transfer.id))
-        postResult(transfer.id, builder)
+        synchronized(lock) {
+            // A new slot in the arrivals group, under its own ID; the progress notification of the send group goes after it.
+            claim(arrivalLedger, transfer.id, title)
+            manager.notify(transfer.id, RESULT_ID, builder.build())
+            sendLedger.release(transfer.id)
+            endProgress(transfer.id)
+            updateSummary(sends = false)
+            updateSummary(sends = true)
+        }
     }
 
     override fun queued(transfer: TransferEntity, reason: String) {
         val up = transfer.direction == TransferDirection.UP
         val title = if (up) "PC not reachable" else "Waiting for ${transfer.peerName}"
-        val text = if (up) "Couldn't send to ${transfer.peerName}. $reason Your files are ready to send again." else "Your PC's files will download when it is back. $reason"
+        val text = if (up) "Couldn't send to ${transfer.peerName}. $reason Your files are saved and go out when it is back." else "Your PC's files will download when it is back. $reason"
         if (!canPost()) {
             message("$title. $reason")
             return
         }
-        val builder = base(RESULT_CHANNEL, title, text)
+        val builder = base(NotificationChannels.TRANSFERS, GROUP_SENDS, title, text)
             .setStyle(NotificationCompat.BigTextStyle().bigText(text))
             .setAutoCancel(!up)
             .addAction(R.drawable.ic_stat_kin, "Retry", broadcast(ACTION_RETRY, transfer.id))
             .addAction(R.drawable.ic_stat_kin, "Discard", broadcast(ACTION_CANCEL, transfer.id))
-        postResult(transfer.id, builder)
+        postSendResult(transfer.id, title, builder)
     }
 
     override fun failed(transfer: TransferEntity, message: String) {
@@ -126,21 +153,31 @@ class TransferNotifications(context: Context) : TransferNotifier {
             message("$title. $message")
             return
         }
-        val builder = base(RESULT_CHANNEL, title, message)
+        val builder = base(NotificationChannels.TRANSFERS, GROUP_SENDS, title, message)
             .setStyle(NotificationCompat.BigTextStyle().bigText(message))
             .setAutoCancel(true)
-        postResult(transfer.id, builder)
+        postSendResult(transfer.id, title, builder)
     }
 
     override fun clear(transferId: String) {
-        endProgress(transferId)
-        manager.cancel(transferId, RESULT_ID)
+        synchronized(lock) {
+            endProgress(transferId)
+            manager.cancel(transferId, RESULT_ID)
+            sendLedger.release(transferId)
+            arrivalLedger.release(transferId)
+            updateSummary(sends = true)
+            updateSummary(sends = false)
+        }
     }
 
     /** The result goes out first, under its own ID; then the progress notification goes. */
-    private fun postResult(transferId: String, builder: NotificationCompat.Builder) {
-        manager.notify(transferId, RESULT_ID, builder.build())
-        endProgress(transferId)
+    private fun postSendResult(transferId: String, title: String, builder: NotificationCompat.Builder) {
+        synchronized(lock) {
+            claim(sendLedger, transferId, title)
+            manager.notify(transferId, RESULT_ID, builder.build())
+            endProgress(transferId)
+            updateSummary(sends = true)
+        }
     }
 
     private fun endProgress(transferId: String) {
@@ -148,17 +185,71 @@ class TransferNotifications(context: Context) : TransferNotifier {
         manager.cancel(transferId, PROGRESS_ID)
     }
 
+    /**
+     * Forgets the slots whose notification is gone (swiped away, timed out), so they no longer count against the cap or in a summary. The
+     * system's list lags a `notify` that was just made, so a slot is only forgotten when it has been missing for more than
+     * [NotificationLedger.MISSING_GRACE_MILLIS] ([NotificationLedger.retainOnly]).
+     */
+    private fun pruneGone(ledger: NotificationLedger) {
+        runCatching {
+            val live = manager.activeNotifications.filter { it.id == PROGRESS_ID || it.id == RESULT_ID }.mapNotNull { it.tag }.toSet()
+            ledger.retainOnly(live)
+        }
+    }
+
+    /** Takes a slot for [key]; a transfer pushed out by the cap loses its notifications. */
+    private fun claim(ledger: NotificationLedger, key: String, title: String) {
+        if (key !in ledger) pruneGone(ledger)
+        ledger.claim(key, title).forEach { evicted ->
+            showingProgress.remove(evicted)
+            manager.cancel(evicted, PROGRESS_ID)
+            manager.cancel(evicted, RESULT_ID)
+        }
+    }
+
+    /** Asks for the summary of a group to be posted (at most once a second, the last request always: see [summaryPoster]). */
+    private fun updateSummary(sends: Boolean) {
+        (if (sends) sendSummary else arrivalSummary).request()
+    }
+
+    /** With two or more notifications in a group, a summary stacks them; with fewer there is none. */
+    private fun renderSummary(ledger: NotificationLedger, group: String, channel: String, summaryId: Int, what: String) {
+        pruneGone(ledger)
+        if (ledger.size < 2) {
+            manager.cancel(SUMMARY_TAG, summaryId)
+            return
+        }
+        val style = NotificationCompat.InboxStyle().setBigContentTitle("${ledger.size} $what")
+        ledger.titles.takeLast(SUMMARY_LINES).forEach { style.addLine(it) }
+        val summary = NotificationCompat.Builder(context, channel)
+            .setSmallIcon(R.drawable.ic_stat_kin)
+            .setContentTitle("${ledger.size} $what")
+            .setStyle(style)
+            .setGroup(group)
+            .setGroupSummary(true)
+            .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_CHILDREN)
+            .setSilent(true)
+            .setAutoCancel(true)
+            .setContentIntent(openApp())
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPublicVersion(NotificationCompat.Builder(context, channel).setSmallIcon(R.drawable.ic_stat_kin).setContentTitle("${ledger.size} $what").build())
+            .build()
+        manager.notify(SUMMARY_TAG, summaryId, summary)
+    }
+
     override fun message(text: String) {
         main.post { Toast.makeText(context, text, Toast.LENGTH_SHORT).show() }
     }
 
     /** The title builder shared by every notification: private on the lock screen (names are private), with a bare public version. */
-    private fun base(channel: String, title: String, text: String): NotificationCompat.Builder =
+    private fun base(channel: String, group: String, title: String, text: String): NotificationCompat.Builder =
         NotificationCompat.Builder(context, channel)
             .setSmallIcon(R.drawable.ic_stat_kin)
             .setContentTitle(title)
             .setContentText(text)
             .setContentIntent(openApp())
+            .setGroup(group)
+            .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_CHILDREN)
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
             .setPublicVersion(NotificationCompat.Builder(context, channel).setSmallIcon(R.drawable.ic_stat_kin).setContentTitle(title).build())
 
@@ -201,12 +292,21 @@ class TransferNotifications(context: Context) : TransferNotifier {
         const val ACTION_CANCEL = "app.kinrelay.android.transfer.CANCEL"
         const val ACTION_RETRY = "app.kinrelay.android.transfer.RETRY"
         const val EXTRA_TRANSFER_ID = "transferId"
+
         /** The progress notification of a transfer, and (own ID, so it is never an update of the progress one) its result. */
         private const val PROGRESS_ID = 10
         private const val RESULT_ID = 11
-        private const val PROGRESS_CHANNEL = "transfers"
-        private const val RESULT_CHANNEL = "transfer_results"
+        private const val SENDS_SUMMARY_ID = 20
+        private const val ARRIVALS_SUMMARY_ID = 21
+        private const val SUMMARY_TAG = "summary"
+        private const val GROUP_SENDS = "app.kinrelay.android.group.TRANSFERS"
+        private const val GROUP_ARRIVALS = "app.kinrelay.android.group.ARRIVALS"
+        private const val SUMMARY_LINES = 5
         private const val RESULT_TIMEOUT_MILLIS = 8_000L
+        private const val SUMMARY_UPDATE_MILLIS = 1_000L
+
+        /** At most this many transfers of each group are on screen (the oldest goes first). Android drops new notifications beyond 50 per app. */
+        const val MAX_SLOTS = 10
 
         /** "Photo from Desk PC", "Video from Desk PC", "File from Desk PC", or "3 files from Desk PC". */
         fun receivedTitle(pcName: String, saved: List<TransferFileEntity>): String {

@@ -103,8 +103,8 @@ class AndroidSourceFiles(context: Context) : SourceFiles {
         }
     }
 
-    override fun cacheCopy(uri: String, transferId: String, fileId: String): String? = try {
-        val target = File(File(root, transferId).also { it.mkdirs() }, fileId)
+    override fun cacheCopy(uri: String, cacheKey: String, fileId: String): String? = try {
+        val target = File(File(root, cacheKey).also { it.mkdirs() }, fileId)
         open(uri, 0).use { input -> target.outputStream().use { output -> input.copyTo(output, COPY_BUFFER_BYTES) } }
         Uri.fromFile(target).toString()
     } catch (e: IOException) {
@@ -113,14 +113,14 @@ class AndroidSourceFiles(context: Context) : SourceFiles {
         null
     }
 
-    override fun cacheText(text: String, transferId: String, fileId: String): String {
-        val target = File(File(root, transferId).also { it.mkdirs() }, fileId)
+    override fun cacheText(text: String, cacheKey: String, fileId: String): String {
+        val target = File(File(root, cacheKey).also { it.mkdirs() }, fileId)
         target.writeBytes(text.toByteArray(Charsets.UTF_8))
         return Uri.fromFile(target).toString()
     }
 
-    override fun deleteCache(transferId: String) {
-        File(root, transferId).deleteRecursively()
+    override fun deleteCache(cacheKey: String) {
+        File(root, cacheKey).deleteRecursively()
     }
 
     override fun deleteCacheExcept(owned: Set<String>, minAgeMillis: Long): Int {
@@ -128,11 +128,6 @@ class AndroidSourceFiles(context: Context) : SourceFiles {
         val orphans = root.listFiles()?.filter { it.name !in owned && now - it.lastModified() >= minAgeMillis }.orEmpty()
         orphans.forEach { it.deleteRecursively() }
         return orphans.size
-    }
-
-    /** Removes cached copies of transfers older than [maxAgeMillis] (a failed or forgotten transfer must not fill the cache). */
-    fun deleteCacheOlderThan(maxAgeMillis: Long, nowMillis: Long = System.currentTimeMillis()) {
-        root.listFiles()?.filter { nowMillis - it.lastModified() > maxAgeMillis }?.forEach { it.deleteRecursively() }
     }
 
     private companion object {

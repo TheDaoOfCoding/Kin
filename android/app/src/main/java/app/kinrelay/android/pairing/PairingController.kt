@@ -111,7 +111,7 @@ class PairingController(private val graph: AppGraph) {
                 devices.all().filter { it.deviceId != target.id }.forEach {
                     devices.delete(it.deviceId)
                     // The old PC's transfers end with its pairing: an upload must not go to the PC that replaces it.
-                    graph.transfers.onUnpaired(it.deviceId)
+                    graph.peerGone(it.deviceId)
                 }
                 devices.upsert(DeviceEntity(target.id, name, "windows", now, now, ordered.joinToString(",")))
                 log.i("pairing", "paired with $name (${target.id.take(8)}…) via ${result.address}")

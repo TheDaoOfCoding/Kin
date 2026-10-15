@@ -21,7 +21,7 @@ import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
-    private val localNetworkAllowed = mutableStateOf(true)
+    private val permissions = mutableStateOf(PermissionSnapshot())
     private var pendingTarget: PairingTarget? = null
     private var askedOnce = false
     private var requestInFlight = false
@@ -46,7 +46,8 @@ class MainActivity : ComponentActivity() {
             KinTheme {
                 KinRoot(
                     graph, this,
-                    localNetworkAllowed = localNetworkAllowed.value,
+                    permissions = permissions.value,
+                    onAskPermissions = ::askPermissions,
                     onAllowLocalNetwork = ::allowLocalNetwork,
                     onScan = ::scan,
                     onPair = { onPairingText(it, PairingSource.IN_APP) },
@@ -64,6 +65,21 @@ class MainActivity : ComponentActivity() {
         handleLink(intent)
     }
 
+    override fun onResume() {
+        super.onResume()
+        // Back from a settings screen (battery, notifications, Nearby devices): the setup shows what changed.
+        refreshPermissions()
+    }
+
+    /** The setup's "Allow": the system prompt for what is missing, or the app's settings page when the system won't ask again. */
+    private fun askPermissions() {
+        if (Permissions.missing(this).isEmpty()) {
+            allowLocalNetwork()
+        } else {
+            requestMissingPermissions()
+        }
+    }
+
     override fun onStart() {
         super.onStart()
         refreshPermissions()
@@ -71,14 +87,17 @@ class MainActivity : ComponentActivity() {
             askedOnce = true
             requestMissingPermissions()
         }
+        graph.notifications.textsSeen()
         lifecycleScope.launch {
             graph.link.ensureRunning(this@MainActivity)
             graph.link.userAction()
+            // What waited in the queue for more than 7 days has expired (it never goes out).
+            runCatching { graph.flusher.expire() }
         }
     }
 
     private fun refreshPermissions() {
-        localNetworkAllowed.value = Permissions.localNetworkGranted(this)
+        permissions.value = Permissions.snapshot(this)
     }
 
     /**

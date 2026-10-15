@@ -3,13 +3,12 @@ package app.kinrelay.android.transfer
 import app.kinrelay.android.data.TransferEntity
 import app.kinrelay.android.data.TransferFileEntity
 import app.kinrelay.android.data.TransferStatus
-import app.kinrelay.android.link.AckResult
 import app.kinrelay.android.link.HttpEndpoint
 import app.kinrelay.android.link.LinkConnection
 import app.kinrelay.android.protocol.FileNames
-import app.kinrelay.android.protocol.Frames
-import app.kinrelay.android.protocol.MessageIds
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -28,12 +27,13 @@ class SizeMismatchException(message: String) : IOException(message)
  * Receives one PC → phone transfer (protocol.md, "Files: PC → phone"). The `offer` has been acked already. For each file, in order:
  * create a pending entry (photos to `Pictures/Kin`, videos to `Movies/Kin`, the rest to `Download/Kin`, through [SaveSink]), `GET` it
  * (with `Range: bytes=N-` when resuming, never for a 0-byte file), append to the entry, and when it is complete clear the pending flag.
- * After the last file it sends `complete`.
+ * After the last file it sends `complete`: the message is written down with the status ([OwedMessages]) and sent once; if the PC doesn't
+ * ack it, it is sent again after every `hello` until it does.
  *
  * - A dropped connection resumes: the entry keeps its bytes, and the next `GET` asks for the rest.
  * - `200` to a `Range` request restarts the file; `416` starts it over once.
  * - `404` or `409` (the offer expired, was cancelled, or the file changed) fails the whole offer: the partial files are deleted, a `cancel`
- *   with reason `error` goes to the PC, and files already saved completely stay.
+ *   with reason `error` goes to the PC (written down and sent again after every `hello` until acked), and files already saved completely stay.
  */
 class DownloadRunner(
     private val d: TransferDeps,
@@ -60,6 +60,8 @@ class DownloadRunner(
         data class BadRange(val header: String?) : Got
     }
 
+    private val owedMessages = OwedMessages(d, timings.ackTimeoutMillis)
+
     suspend fun run(transferId: String): RunResult {
         val transfer = d.store.transfer(transferId) ?: return RunResult.Failed("not_found", "That transfer is gone.")
         return Run(transfer, d.store.files(transferId)).execute()
@@ -70,14 +72,24 @@ class DownloadRunner(
         val movedThisAttempt = AtomicLong(0)
         val throttle = ProgressThrottle()
 
-        suspend fun execute(): RunResult {
-            setStatus(TransferStatus.ACTIVE)
+        suspend fun execute(): RunResult = try {
+            run()
+        } finally {
+            // What was really written is saved (the free-space check of a new offer reads it), then the live numbers go.
+            withContext(NonCancellable) {
+                persistProgress()
+                d.progress.clear(transfer.id)
+            }
+        }
+
+        private suspend fun run(): RunResult {
+            if (!setStatus(TransferStatus.ACTIVE)) return RunResult.Canceled
             var stalled = 0
             while (true) {
                 currentCoroutineContext().ensureActive()
                 // Before every attempt: this transfer belongs to one PC, and only that PC is ever asked for it.
                 if (!d.isPairedWith(transfer)) return peerChanged()
-                val connection = d.link.connection(timings.reconnectWaitMillis, kick = false) ?: return park()
+                val connection = d.connectionFor(transfer, timings.reconnectWaitMillis, kick = false) ?: return park()
                 if (!d.isPairedWith(transfer)) return peerChanged()
                 val endpoint = connection.httpEndpoint ?: return failAndCancel(connection, "internal", "The connection has no file channel.")
                 movedThisAttempt.set(0)
@@ -91,6 +103,7 @@ class DownloadRunner(
                     Attempt.Done -> return finish(connection)
                     is Attempt.Fatal -> return failAndCancel(connection, attempt.code, attempt.message)
                     is Attempt.Retry -> {
+                        persistProgress()
                         stalled = if (attempt.moved) 0 else stalled + 1
                         if (stalled >= timings.maxStalledAttempts) {
                             return failAndCancel(connection, "connection_lost", "The connection to ${transfer.peerName} keeps dropping.")
@@ -150,12 +163,13 @@ class DownloadRunner(
                     // The user deleted the half-written entry (or the gallery did): make a new one and start over. But not forever: an
                     // entry that is "gone" right after it was made means the system can't hold it, and that must fail the file, not fill
                     // the gallery with empty entries (seen on the emulator before this limit existed).
-                    if (++recreated > MAX_RECREATED_ENTRIES) throw SinkException("the entry for ${file.name} keeps disappearing")
+                    if (++recreated > MAX_RECREATED_ENTRIES) throw SinkException("the entry for file ${file.fileId} keeps disappearing")
                     d.sink.delete(uri)
                     file = ensureEntry(file.copy(localUri = null, finalName = null, bytesDone = 0))
                     continue
                 }
                 val have = if (length > file.size) 0L else length
+                d.progress.set(transfer.id, file.fileId, have)
                 if (have == file.size && file.size > 0) return finishFile(file)
                 // No Range for a 0-byte file (any Range on it is unsatisfiable), none when starting from 0.
                 val from = if (file.size > 0 && have > 0) have else null
@@ -247,6 +261,7 @@ class DownloadRunner(
                     }
                     written += n
                     movedThisAttempt.addAndGet(n.toLong())
+                    d.progress.set(transfer.id, file.fileId, writeFrom + written)
                     done.addAndGet(n.toLong())
                     report()
                 }
@@ -282,9 +297,10 @@ class DownloadRunner(
             }
             val entry = created
             if (result is FileNames.CreateResult.Failed || entry == null) {
-                throw SinkException("can't create ${file.name}: ${(result as? FileNames.CreateResult.Failed)?.reason}")
+                throw SinkException("can't create file ${file.fileId}: ${(result as? FileNames.CreateResult.Failed)?.reason}")
             }
-            if (entry.finalName != requested) d.log.i("transfer", "the system saved a file as '${entry.finalName}', not '$requested'")
+            // File names are never logged (they are the user's): only the fact.
+            if (entry.finalName != requested) d.log.i("transfer", "the system saved file ${file.fileId} under another name than the one asked for")
             val updated = file.copy(localUri = entry.uri, finalName = entry.finalName, bytesDone = 0, finished = false)
             try {
                 d.store.updateFile(updated)
@@ -299,7 +315,7 @@ class DownloadRunner(
 
         private suspend fun finishFile(file: TransferFileEntity): Attempt? {
             val uri = file.localUri!!
-            if (d.sink.length(uri) != file.size) throw SizeMismatchException("${file.name} doesn't have ${file.size} bytes")
+            if (d.sink.length(uri) != file.size) throw SizeMismatchException("file ${file.fileId} doesn't have ${file.size} bytes")
             d.sink.finish(uri)
             val finished = file.copy(bytesDone = file.size, finished = true)
             d.store.updateFile(finished)
@@ -312,49 +328,44 @@ class DownloadRunner(
             if (throttle.tryReport(d.nowMillis())) d.notifier.progress(transfer, files, done.get(), waiting = false)
         }
 
-        private suspend fun setStatus(status: String, code: String? = null, message: String? = null) {
+        /** The status of a transfer that isn't over; false when it was already over (canceled, done): then nothing here changes it. */
+        private suspend fun setStatus(status: String, code: String? = null, message: String? = null, owed: String? = null, owedId: String? = null): Boolean {
             val finishedAt = if (TransferStatus.isFinished(status)) d.nowMillis() else null
-            d.store.setStatus(transfer.id, status, code, message, finishedAt)
-            transfer = transfer.copy(status = status, errorCode = code, message = message, finishedAtMillis = finishedAt)
+            val changed = d.store.setStatus(transfer.id, status, code, message, finishedAt, owed, owedId)
+            if (changed) transfer = transfer.copy(status = status, errorCode = code, message = message, finishedAtMillis = finishedAt, owed = owed, owedId = owedId)
+            return changed
         }
 
-        /** Every file is saved: the transfer is done, then `complete` goes to the PC (resent with the same ID until acked). */
+        /** Saves how many bytes each unfinished file really has (the live numbers), so a stopped download is counted right. */
+        private suspend fun persistProgress() {
+            for (file in files) {
+                if (file.finished) continue
+                val live = d.progress.get(transfer.id, file.fileId) ?: continue
+                runCatching { d.store.setBytesDone(transfer.id, file.fileId, live) }
+            }
+        }
+
+        /**
+         * Every file is saved: the transfer is done and owes the PC a `complete` (written in the same step as the status). It is sent now; if
+         * nobody acks it, it is sent again after every `hello`, under the same ID, until the PC does.
+         */
         private suspend fun finish(connection: LinkConnection): RunResult {
-            setStatus(TransferStatus.DONE)
+            if (!setStatus(TransferStatus.DONE, owed = OwedMessages.COMPLETE, owedId = OwedMessages.newMessageId())) return RunResult.Canceled
             d.log.i("transfer", "download ${transfer.id} done: ${files.size} files, ${files.sumOf { it.size }} bytes")
             d.notifier.received(transfer, files)
-            val messageId = MessageIds.newId()
-            var current: LinkConnection? = connection
-            repeat(COMPLETE_ATTEMPTS) { attemptNumber ->
-                val link = current ?: d.link.connection(COMPLETE_WAIT_MILLIS, kick = false)
-                current = null
-                if (link != null) {
-                    when (val ack = link.sendAcked(messageId, Frames.complete(messageId, transfer.id), timings.ackTimeoutMillis)) {
-                        AckResult.Acked -> {
-                            d.store.setCompleteAcked(transfer.id, true)
-                            return RunResult.Done
-                        }
-                        is AckResult.Refused -> {
-                            d.log.w("transfer", "download ${transfer.id}: the PC refused our complete: ${ack.code}")
-                            return RunResult.Done
-                        }
-                        AckResult.NoReply, AckResult.NoConnection -> d.log.w("transfer", "download ${transfer.id}: complete not acked (attempt ${attemptNumber + 1})")
-                    }
-                }
-            }
+            owedMessages.send(connection, transfer.id)
             return RunResult.Done
         }
 
-        /** A file failed for good: delete the partial files, tell the PC (`cancel`, reason `error`), and fail the transfer. */
+        /** A file failed for good: delete the partial files, fail the transfer, and tell the PC (`cancel`, reason `error`: owed until acked). */
         private suspend fun failAndCancel(connection: LinkConnection?, code: String, message: String): RunResult {
             discardPartials(d, transfer.id)
             files = d.store.files(transfer.id)
-            setStatus(TransferStatus.FAILED, code, message)
-            d.log.w("transfer", "download ${transfer.id} failed: $code: $message")
+            if (!setStatus(TransferStatus.FAILED, code, message, owed = OwedMessages.cancel("error"), owedId = OwedMessages.newMessageId())) return RunResult.Canceled
+            // The message names files and the PC; the log gets the code only.
+            d.log.w("transfer", "download ${transfer.id} failed: $code")
             d.notifier.failed(transfer, message)
-            val messageId = MessageIds.newId()
-            val link = connection?.takeIf { it.isReady } ?: d.link.connection(COMPLETE_WAIT_MILLIS, kick = false)
-            link?.sendAcked(messageId, Frames.cancel(messageId, transfer.id, "error"), timings.ackTimeoutMillis)
+            owedMessages.send(connection, transfer.id)
             return RunResult.Failed(code, message)
         }
 
@@ -363,7 +374,7 @@ class DownloadRunner(
             val message = "These files came from ${transfer.peerName}, which is no longer paired."
             discardPartials(d, transfer.id)
             files = d.store.files(transfer.id)
-            setStatus(TransferStatus.FAILED, PEER_CHANGED, message)
+            if (!setStatus(TransferStatus.FAILED, PEER_CHANGED, message)) return RunResult.Canceled
             d.log.w("transfer", "download ${transfer.id} failed: $PEER_CHANGED")
             d.notifier.failed(transfer, message)
             return RunResult.Failed(PEER_CHANGED, message)
@@ -371,7 +382,7 @@ class DownloadRunner(
 
         private suspend fun park(): RunResult {
             val reason = d.link.unreachableReason()
-            setStatus(TransferStatus.QUEUED, "unreachable", reason)
+            if (!setStatus(TransferStatus.QUEUED, "unreachable", reason)) return RunResult.Canceled
             d.log.w("transfer", "download ${transfer.id}: the PC is not reachable ($reason); it resumes when the PC is back")
             d.notifier.queued(transfer, reason)
             return RunResult.Waiting
@@ -381,12 +392,10 @@ class DownloadRunner(
     companion object {
         private val CONTENT_RANGE = Regex("bytes (\\d+)-(\\d+)/(\\d+)")
         private const val BUFFER_BYTES = 256 * 1024
-        private const val COMPLETE_ATTEMPTS = 3
         private const val MAX_RECREATED_ENTRIES = 2
 
         /** The error code of a transfer whose PC is not the paired one any more. */
         const val PEER_CHANGED = "peer_changed"
-        private const val COMPLETE_WAIT_MILLIS = 30_000L
 
         /** Deletes the entries of the files that aren't saved completely and forgets them. Files saved completely stay. */
         suspend fun discardPartials(d: TransferDeps, transferId: String) {

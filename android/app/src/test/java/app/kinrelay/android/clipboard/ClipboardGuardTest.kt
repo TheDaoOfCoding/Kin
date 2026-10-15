@@ -1,5 +1,7 @@
 package app.kinrelay.android.clipboard
 
+import app.kinrelay.android.log.LogFingerprint
+import app.kinrelay.android.protocol.Frames
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -60,12 +62,30 @@ class ClipboardGuardTest {
     }
 
     @Test
-    fun theFingerprintHasALengthAndAShortHashButNeverTheText() {
+    fun theFingerprintHasALengthAndAShortKeyedHashButNeverTheText() {
         val text = "my secret password 😀"
-        val fingerprint = ClipboardGuard.fingerprint(text)
-        assertEquals("len=20 sha=${ClipboardGuard.hash(text).take(8)}", fingerprint)
-        assertFalse(fingerprint.contains("secret"))
-        assertFalse(guard.describe().contains("secret"))
+        val key = ByteArray(32) { (it * 7).toByte() }
+        LogFingerprint.install(key)
+        try {
+            val fingerprint = ClipboardGuard.fingerprint(text)
+            assertEquals("len=20 sha=${LogFingerprint.mac(key, Frames.wireText(text))}", fingerprint)
+            assertFalse("not the unkeyed hash, which a dictionary of guesses could be run against", fingerprint.contains(ClipboardGuard.hash(text).take(8)))
+            assertFalse(fingerprint.contains("secret"))
+            assertFalse(guard.describe().contains("secret"))
+            // Another install has another key: the same text has another fingerprint.
+            LogFingerprint.install(ByteArray(32) { (it * 11 + 1).toByte() })
+            assertNotEquals(fingerprint, ClipboardGuard.fingerprint(text))
+        } finally {
+            LogFingerprint.install(null)
+        }
+        // With no key yet only the length is logged.
+        assertEquals("len=20", ClipboardGuard.fingerprint(text))
+    }
+
+    @Test
+    fun theKeyedHashIsAnHmacSha256CutToFourBytes() {
+        // RFC 4231 test case 2: HMAC-SHA256(key "Jefe", "what do ya want for nothing?") = 5bdcc146bf60754e6a042426089575c7...
+        assertEquals("5bdcc146", LogFingerprint.mac("Jefe".toByteArray(), "what do ya want for nothing?"))
     }
 
     @Test
@@ -83,6 +103,6 @@ class ClipboardGuardTest {
     fun describeIsNoneUntilSomethingWasSet() {
         assertEquals("none", guard.describe())
         guard.notePeerSet("x")
-        assertTrue(guard.describe().startsWith("sha="))
+        assertTrue(guard.describe().startsWith("set ageMs="))
     }
 }

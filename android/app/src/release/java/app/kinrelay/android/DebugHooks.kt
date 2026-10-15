@@ -14,4 +14,8 @@ object DebugHooks {
     /** Always false: a new file name is never refused on purpose. */
     @Suppress("UNUSED_PARAMETER")
     fun refuseNewNames(context: android.content.Context): Boolean = false
+
+    /** Always the phone's real maker. */
+    @Suppress("UNUSED_PARAMETER")
+    fun manufacturer(context: android.content.Context): String = android.os.Build.MANUFACTURER
 }

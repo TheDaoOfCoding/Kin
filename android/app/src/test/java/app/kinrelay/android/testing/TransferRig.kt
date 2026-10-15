@@ -1,5 +1,7 @@
 package app.kinrelay.android.testing
 
+import app.kinrelay.android.data.OutcomeRow
+import app.kinrelay.android.data.PendingFile
 import app.kinrelay.android.data.TransferEntity
 import app.kinrelay.android.data.TransferFileEntity
 import app.kinrelay.android.data.TransferStatus
@@ -7,6 +9,7 @@ import app.kinrelay.android.identity.Identity
 import app.kinrelay.android.link.DeliveryQueue
 import app.kinrelay.android.link.LinkConnection
 import app.kinrelay.android.link.LinkSession
+import app.kinrelay.android.link.readyFor
 import app.kinrelay.android.link.LocalHello
 import app.kinrelay.android.link.SessionListener
 import app.kinrelay.android.log.KinLog
@@ -48,7 +51,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 
-/** A store that keeps everything in memory (the app uses Room). */
+/** A store that keeps everything in memory (the app uses Room). It follows the same rules: a transfer that is over is never rewritten by [setStatus]. */
 class InMemoryTransferStore : TransferStore {
     val transfers = ConcurrentHashMap<String, TransferEntity>()
     val files = ConcurrentHashMap<String, MutableList<TransferFileEntity>>()
@@ -75,8 +78,40 @@ class InMemoryTransferStore : TransferStore {
         Unit
     }
 
-    override suspend fun setStatus(id: String, status: String, errorCode: String?, message: String?, finishedAt: Long?) {
-        transfers.computeIfPresent(id) { _, t -> t.copy(status = status, errorCode = errorCode, message = message, finishedAtMillis = finishedAt) }
+    override suspend fun setStatus(id: String, status: String, errorCode: String?, message: String?, finishedAt: Long?, owed: String?, owedId: String?): Boolean = synchronized(lock) {
+        val t = transfers[id] ?: return false
+        if (TransferStatus.isFinished(t.status)) return false
+        transfers[id] = t.copy(status = status, errorCode = errorCode, message = message, finishedAtMillis = finishedAt, owed = owed, owedId = owedId)
+        true
+    }
+
+    override suspend fun requeue(id: String, userRetry: Boolean): Boolean = synchronized(lock) {
+        val t = transfers[id] ?: return false
+        if ((t.status != TransferStatus.QUEUED && t.status != TransferStatus.FAILED) || t.retriedAs != null) return false
+        transfers[id] = t.copy(status = TransferStatus.QUEUED, errorCode = null, message = null, finishedAtMillis = null, userRetry = userRetry)
+        true
+    }
+
+    override suspend fun clearUserRetry(id: String) {
+        transfers.computeIfPresent(id) { _, t -> t.copy(userRetry = false) }
+    }
+
+    override suspend fun markStarted(id: String) {
+        transfers.computeIfPresent(id) { _, t -> t.copy(started = true) }
+    }
+
+    override suspend fun owing(peerDeviceId: String) =
+        transfers.values.filter { it.owed != null && it.peerDeviceId == peerDeviceId }.sortedWith(compareBy({ it.finishedAtMillis }, { it.id }))
+
+    override suspend fun clearOwed(id: String) {
+        transfers.computeIfPresent(id) { _, t -> t.copy(completeAcked = t.completeAcked || t.owed == "complete", owed = null, owedId = null) }
+    }
+
+    override suspend fun markCanceledByPeer(id: String, message: String): Boolean = synchronized(lock) {
+        val t = transfers[id] ?: return false
+        if (t.status != TransferStatus.FAILED || t.errorCode != "not_found") return false
+        transfers[id] = t.copy(status = TransferStatus.CANCELED, errorCode = "peer_canceled", message = message)
+        true
     }
 
     override suspend fun setCompleteAcked(id: String, acked: Boolean) {
@@ -87,9 +122,25 @@ class InMemoryTransferStore : TransferStore {
         transfers.computeIfPresent(id) { _, t -> t.copy(totalBytes = totalBytes) }
     }
 
+    override suspend fun addAttempt(id: String) {
+        transfers.computeIfPresent(id) { _, t -> t.copy(attempts = t.attempts + 1) }
+    }
+
+    /** A test can make the next `rename` or `supersede` fail half way, to see that nothing is left half done. */
+    @Volatile var failNextRename = false
+
     override suspend fun rename(oldId: String, newId: String) = synchronized(lock) {
+        // One transaction: if it can't be done, nothing changes.
+        if (failNextRename) { failNextRename = false; throw IllegalStateException("rename failed") }
         transfers.remove(oldId)?.let { transfers[newId] = it.copy(id = newId) }
         files.remove(oldId)?.let { list -> files[newId] = list.map { it.copy(transferId = newId) }.toMutableList() }
+        Unit
+    }
+
+    override suspend fun supersede(oldId: String, transfer: TransferEntity, files: List<TransferFileEntity>, message: String, finishedAt: Long) = synchronized(lock) {
+        transfers.computeIfPresent(oldId) { _, t -> t.copy(status = TransferStatus.FAILED, errorCode = "not_found", message = message, finishedAtMillis = finishedAt, retriedAs = transfer.id) }
+        transfers[transfer.id] = transfer
+        this.files[transfer.id] = files.toMutableList()
         Unit
     }
 
@@ -99,17 +150,30 @@ class InMemoryTransferStore : TransferStore {
 
     private fun unfinishedDownloads() = transfers.values.filter { it.direction == "down" && !TransferStatus.isFinished(it.status) }
 
-    override suspend fun pendingDownloadBytes() =
-        unfinishedDownloads().sumOf { t -> files[t.id].orEmpty().filter { !it.finished }.sumOf { maxOf(it.size - it.bytesDone, 0) } }
+    override suspend fun pendingDownloadFiles() =
+        unfinishedDownloads().flatMap { t -> files[t.id].orEmpty().filter { !it.finished }.map { PendingFile(t.id, it.fileId, it.size, it.bytesDone) } }
 
     override suspend fun ownedPartialUris() =
         unfinishedDownloads().flatMap { t -> files[t.id].orEmpty().filter { !it.finished }.mapNotNull { it.localUri } }.toSet()
 
-    override suspend fun liveIds() = transfers.values.filter { it.status in setOf("queued", "active", "failed") }.map { it.id }.toSet()
+    override suspend fun liveLocalIds() =
+        transfers.values.filter {
+            it.status == "queued" || it.status == "active" || (it.status == "failed" && it.retriedAs == null && files[it.id].orEmpty().isNotEmpty())
+        }.map { it.localId }.toSet()
+
+    override suspend fun outgoingOutcomes() =
+        transfers.values.filter { it.direction == "up" && (it.status == "done" || it.status == "failed") && it.retriedAs == null }.map { OutcomeRow(it.status, it.errorCode, it.attempts) }
 
     override suspend fun delete(id: String) {
         transfers.remove(id)
         files.remove(id)
+    }
+
+    /** The same rule as the Room query: the file rows of finished transfers beyond the newest [keep] go, the transfer rows stay. */
+    override suspend fun trim(keep: Int) {
+        val finished = transfers.values.filter { TransferStatus.isFinished(it.status) && it.owed == null }
+        val newest = transfers.values.sortedByDescending { it.createdAtMillis }.take(keep).map { it.id }.toSet()
+        finished.filter { it.id !in newest }.forEach { files.remove(it.id) }
     }
 }
 
@@ -134,7 +198,12 @@ class TempSources(private val root: File) : SourceFiles {
 
     fun fileOf(uri: String): File = byUri.getValue(uri)
 
+    /** A scripted answer to the next calls of `stat` (a file that changes and then disappears while a transfer starts over). One step per call. */
+    class StatStep(val info: SourceInfo?)
+    val statScript = java.util.concurrent.ConcurrentLinkedQueue<StatStep>()
+
     override fun stat(uri: String): SourceInfo? {
+        statScript.poll()?.let { return it.info }
         if (lost) return null
         val file = byUri[uri]?.takeIf { it.isFile } ?: return null
         return SourceInfo(file.length(), file.lastModified(), file.name, mimes[uri])
@@ -155,24 +224,24 @@ class TempSources(private val root: File) : SourceFiles {
         }
     }
 
-    override fun cacheCopy(uri: String, transferId: String, fileId: String): String? {
+    override fun cacheCopy(uri: String, cacheKey: String, fileId: String): String? {
         val source = byUri[uri] ?: return null
-        val target = File(File(cacheDir, transferId).also { it.mkdirs() }, fileId)
+        val target = File(File(cacheDir, cacheKey).also { it.mkdirs() }, fileId)
         source.copyTo(target, overwrite = true)
-        val cachedUri = "content://test-cache/$transferId/$fileId"
+        val cachedUri = "content://test-cache/$cacheKey/$fileId"
         byUri[cachedUri] = target
         cached += cachedUri
         return cachedUri
     }
 
-    override fun cacheText(text: String, transferId: String, fileId: String): String {
-        val target = File(File(cacheDir, transferId).also { it.mkdirs() }, fileId).also { it.writeBytes(text.toByteArray(Charsets.UTF_8)) }
-        return "content://test-cache/$transferId/$fileId".also { byUri[it] = target }
+    override fun cacheText(text: String, cacheKey: String, fileId: String): String {
+        val target = File(File(cacheDir, cacheKey).also { it.mkdirs() }, fileId).also { it.writeBytes(text.toByteArray(Charsets.UTF_8)) }
+        return "content://test-cache/$cacheKey/$fileId".also { byUri[it] = target }
     }
 
-    override fun deleteCache(transferId: String) {
-        File(cacheDir, transferId).deleteRecursively()
-        cached.removeAll { it.startsWith("content://test-cache/$transferId/") }
+    override fun deleteCache(cacheKey: String) {
+        File(cacheDir, cacheKey).deleteRecursively()
+        cached.removeAll { it.startsWith("content://test-cache/$cacheKey/") }
     }
 
     /** Pretends every cached copy is this old when the sweep asks (the real one reads the folder's modified time). */
@@ -261,7 +330,10 @@ class TempSink(private val root: File) : SaveSink {
 
     override fun pendingEntries(): List<String> = entries.filter { it.value.pending }.keys.toList()
 
-    override fun freeBytes(): Long = free
+    /** When set, the free space is this capacity minus the bytes the entries hold, so it shrinks as a download writes (like a real disk). */
+    @Volatile var capacity: Long? = null
+
+    override fun freeBytes(): Long = capacity?.let { it - entries.values.sumOf { e -> e.file.length() } } ?: free
 
     fun bytes(uri: String): ByteArray = entries.getValue(uri).file.readBytes()
     fun visible(): List<Entry> = entries.values.filter { !it.pending }
@@ -322,14 +394,17 @@ class TransferRig(
     private val deliveries = DeliveryQueue(KinLog.None).also { it.start(scope) }
     private val dedup = DedupMemory(System::currentTimeMillis)
 
+    /** The device ID of the rig's own fake PC. */
+    val pcId: String get() = pc.identity.deviceId
+
     /** The PC that is paired now. A test changes it to pair another PC (or null to unpair). */
     @Volatile var pairedPeer: PeerInfo? = PeerInfo(pc.identity.deviceId, "Desk PC")
 
     val link = object : TransferLink {
-        override suspend fun connection(waitMillis: Long, kick: Boolean): LinkConnection? {
+        override suspend fun connection(waitMillis: Long, kick: Boolean, peerDeviceId: String): LinkConnection? {
             val deadline = System.nanoTime() + waitMillis * 1_000_000
             while (true) {
-                current?.takeIf { it.isReady }?.let { return it }
+                current.readyFor(peerDeviceId)?.let { return it }
                 if (System.nanoTime() >= deadline) return null
                 delay(10)
             }
@@ -355,9 +430,14 @@ class TransferRig(
         else -> null
     }
 
-    /** Opens a new session to the fake PC and waits for its `hello`. */
-    fun connect(): LinkSession {
-        val client = KinTls(phone, pc.identity.deviceId).httpClient().newBuilder().callTimeout(0, TimeUnit.MILLISECONDS).build()
+    /** Other fake PCs a test connected to (closed with the rig). */
+    private val otherPcs = CopyOnWriteArrayList<FakePc>()
+
+    /** Opens a new session to the fake PC [to] (the rig's own by default) and waits for its `hello`. */
+    fun connect(to: FakePc = pc, dedup: DedupMemory = this.dedup): LinkSession {
+        if (to !== pc) { to.pairedPhones += phone.deviceId; otherPcs += to }
+        val peerId = to.identity.deviceId
+        val client = KinTls(phone, peerId).httpClient().newBuilder().callTimeout(0, TimeUnit.MILLISECONDS).build()
         val hellos = LinkedBlockingQueue<Hello>()
         val listener = object : SessionListener {
             override fun onHelloAccepted(peer: Hello) { hellos.add(peer) }
@@ -365,19 +445,21 @@ class TransferRig(
             override fun onPeerUnpaired() = Unit
             override fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean, sensitive: Boolean) = Unit
             override fun onClipboardReceived(id: String, text: String) = Unit
-            override fun acceptOffer(offer: Offer): String? = engine.acceptOffer(offer)
-            override fun onOfferReceived(fromName: String, offer: Offer) = deliveries.submit { engine.onOffer(fromName, offer) }
-            override fun onCancelReceived(transferId: String, reason: String) = deliveries.submit { engine.onPeerCancel(transferId, reason) }
+            override fun acceptOffer(offer: Offer): String? = engine.acceptOffer(offer, peerId)
+            override fun offerHistory(offer: Offer) = engine.offerHistory(offer, peerId)
+            override fun onOfferRepeated(fromName: String, offer: Offer) = deliveries.submit { engine.onOfferRepeated(peerId, offer) }
+            override fun onOfferReceived(fromName: String, offer: Offer) = deliveries.submit { engine.onOffer(peerId, fromName, offer) }
+            override fun onCancelReceived(transferId: String, reason: String) = deliveries.submit { engine.onPeerCancel(peerId, transferId, reason) }
         }
         val session = LinkSession(
-            client, PairingAddress("127.0.0.1", pc.port), LocalHello("Pixel 8", "android", "0.1.0"),
-            dedup, scope, { System.nanoTime() / 1_000_000 }, KinLog.None, listener,
+            client, PairingAddress("127.0.0.1", to.port), LocalHello("Pixel 8", "android", "0.1.0"),
+            dedup, scope, { System.nanoTime() / 1_000_000 }, KinLog.None, listener, peerId,
         )
         session.open()
         check(hellos.poll(5, TimeUnit.SECONDS) != null) { "no hello" }
         sessions += session
         current = session
-        pc.nextFrame() // the phone's own hello
+        to.nextFrame() // the phone's own hello
         return session
     }
 
@@ -406,6 +488,7 @@ class TransferRig(
     override fun close() {
         scope.cancel()
         pc.close()
+        otherPcs.forEach { it.close() }
         dir.deleteRecursively()
     }
 

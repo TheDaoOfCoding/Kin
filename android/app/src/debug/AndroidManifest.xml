@@ -31,6 +31,11 @@
                 <action android:name="app.kinrelay.android.debug.DELETE_RECEIVED" />
                 <action android:name="app.kinrelay.android.debug.MAKE_ORPHANS" />
                 <action android:name="app.kinrelay.android.debug.SWEEP" />
+                <action android:name="app.kinrelay.android.debug.TEXTS" />
+                <action android:name="app.kinrelay.android.debug.CANCEL_TEXT" />
+                <action android:name="app.kinrelay.android.debug.RETRY_TEXT" />
+                <action android:name="app.kinrelay.android.debug.FLUSH" />
+                <action android:name="app.kinrelay.android.debug.EXPIRE" />
             </intent-filter>
         </receiver>
 

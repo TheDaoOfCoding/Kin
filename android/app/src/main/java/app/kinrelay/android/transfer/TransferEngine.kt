@@ -5,9 +5,9 @@ import app.kinrelay.android.data.TransferEntity
 import app.kinrelay.android.data.TransferFileEntity
 import app.kinrelay.android.data.TransferKind
 import app.kinrelay.android.data.TransferStatus
-import app.kinrelay.android.protocol.Frames
-import app.kinrelay.android.protocol.MessageIds
+import app.kinrelay.android.link.LinkConnection
 import app.kinrelay.android.protocol.Offer
+import app.kinrelay.android.protocol.OfferHistory
 import app.kinrelay.android.protocol.Utf8
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -34,9 +34,13 @@ data class ShareSource(val uri: String, val nameHint: String? = null, val mimeHi
  * app's scope, and handles cancel, retry and recovery. Nothing here blocks the WebSocket: an `offer` is acked first, and the
  * download runs on its own coroutine.
  *
- * The persistent queue of 1.4 builds on this: a transfer that couldn't start is `queued` with its small files already copied into the
- * cache ([TransferStatus.QUEUED]); [retry] and [retryQueuedUploads] start it, and 1.4 only has to call the second one when the PC
- * comes back.
+ * The queue (1.4): every upload is stored as `queued` before it is tried, with its small files already copied into the cache when it
+ * couldn't start ([TransferStatus.QUEUED]). When the link is up again the [app.kinrelay.android.link.OutboxFlusher] starts the queued
+ * uploads in creation order ([queuedUploads], [startQueuedUpload]).
+ *
+ * A transfer belongs to one PC (its `peerDeviceId`). Everything that comes from a PC (an `offer`, a `cancel`) says which PC it came
+ * from, and a transfer is only ever started, accepted, cancelled or recorded for that PC: right after a re-pair the old PC's connection
+ * is briefly still the current one.
  */
 class TransferEngine(
     private val scope: CoroutineScope,
@@ -45,11 +49,12 @@ class TransferEngine(
     private val mimeForExtension: (String) -> String? = { null },
     private val httpFor: (app.kinrelay.android.link.HttpEndpoint) -> TransferHttp = ::TransferHttp,
 ) {
+    private val owedMessages = OwedMessages(d, timings.ackTimeoutMillis)
     private val uploadLock = Mutex()
     private val downloadLock = Mutex()
     private val jobs = ConcurrentHashMap<String, Job>()
 
-    /** Old transfer ID to new, for a transfer that started over after a shared file changed. */
+    /** Old transfer ID to new, for a transfer that started over under a new ID (a changed source, or a user Retry after `404`). */
     private val renamed = ConcurrentHashMap<String, String>()
 
     // ---------------------------------------------------------------- phone -> PC
@@ -109,6 +114,7 @@ class TransferEngine(
         return id
     }
 
+    /** Stored as `queued` first, then tried at once. With no connection it stays queued and goes out when the link is up again. */
     private suspend fun createUpload(id: String, peer: PeerInfo, files: List<TransferFileEntity>) {
         val transfer = TransferEntity(
             id, TransferDirection.UP, peer.deviceId, peer.name, TransferKind.FILE, TransferStatus.QUEUED,
@@ -121,8 +127,8 @@ class TransferEngine(
 
     private fun fallbackName(uri: String): String = uri.substringBefore('?').substringAfterLast('/').ifBlank { "file" }
 
-    private fun launchUpload(id: String) = launch(id, uploadLock) {
-        UploadRunner(d, timings, httpFor, onRenamed = { old, new -> rename(old, new) }).run(id)
+    private fun launchUpload(id: String, userRetry: Boolean = false) = launch(id, uploadLock) {
+        UploadRunner(d, timings, httpFor, onRenamed = { old, new -> rename(old, new) }, userRetry = userRetry).run(id)
     }
 
     private fun rename(old: String, new: String) {
@@ -136,32 +142,57 @@ class TransferEngine(
      * The gate for an `offer`, run before the ack. It returns null to accept, or the code of the `error` the phone sends *instead of*
      * the ack (protocol.md, Files: PC -> phone), which ends the offer's life:
      * - `too_large`: more than [MAX_OFFER_FILES] files, or sizes that overflow a 64-bit sum;
-     * - `bad_request`: a negative size, or a transfer ID that is already used by something else (an upload, a transfer of another PC, a
-     *   finished one). A transfer ID is never reused; only a re-offer of an unfinished download from the same PC resumes it;
+     * - `bad_request`: a negative size, an offer from a PC that isn't the paired one (only possible in the moment after a re-pair), or a
+     *   transfer ID that is already used by something else (an upload, a transfer of another PC, a finished one). A transfer ID is never
+     *   reused; only a re-offer of an unfinished download from the same PC resumes it;
      * - `disk_full`: the files don't fit in the free space once what the unfinished downloads still have to write, and what offers
-     *   accepted a moment ago have claimed, is taken away.
+     *   accepted a moment ago have claimed, is taken away. What a download still has to write is counted from the bytes it has really
+     *   written ([LiveProgress]), because the free space already shrank by them.
      *
-     * It runs on the socket's thread, not the main thread: the store lookups are short and are awaited here.
+     * [fromPeerDeviceId] is the PC whose connection the offer arrived on. It runs on the socket's thread, not the main thread: the store
+     * lookups are short and are awaited here.
      */
-    fun acceptOffer(offer: Offer): String? = runBlocking { gate(offer) }
+    fun acceptOffer(offer: Offer, fromPeerDeviceId: String): String? = runBlocking { gate(offer, fromPeerDeviceId) }
 
-    private suspend fun gate(offer: Offer): String? {
+    /**
+     * What the phone knows about the ID of an `offer` (protocol.md, Files: PC -> phone, item 52). **The same paired PC repeating an ID it
+     * offered before** is a [OfferHistory.REPEAT], whatever state the download is in: the phone answers the first response again (the ack)
+     * and downloads nothing a second time ([onOfferRepeated] does the rest). **Any other reuse** is [OfferHistory.REUSED] (`bad_request`):
+     * the ID of an upload of ours, of a transfer of another PC, an offer from a PC that isn't the paired one, or an offer whose file list
+     * (file IDs and sizes) differs from the first one. An ID the transfer store has never seen is [OfferHistory.NEW] (the receiver still
+     * checks its memory of message IDs: a `text` may have used it).
+     */
+    fun offerHistory(offer: Offer, fromPeerDeviceId: String): OfferHistory = runBlocking {
+        val existing = d.store.transfer(offer.id) ?: return@runBlocking OfferHistory.NEW
+        val peer = d.link.peer()
+        if (peer == null || peer.deviceId != fromPeerDeviceId) return@runBlocking OfferHistory.REUSED
+        if (existing.direction != TransferDirection.DOWN || existing.peerDeviceId != peer.deviceId) return@runBlocking OfferHistory.REUSED
+        // The file rows of a transfer that is long over may have been dropped (storage): then there is nothing to compare, and it is a repeat.
+        val stored = d.store.files(offer.id)
+        if (stored.isNotEmpty() && !sameFiles(stored, offer)) return@runBlocking OfferHistory.REUSED
+        OfferHistory.REPEAT
+    }
+
+    /** The file IDs and sizes of an offer are what the first offer said. */
+    private fun sameFiles(stored: List<TransferFileEntity>, offer: Offer): Boolean =
+        stored.size == offer.files.size && stored.associate { it.fileId to it.size } == offer.files.associate { it.fileId to it.size }
+
+    private suspend fun gate(offer: Offer, fromPeerDeviceId: String): String? {
         if (offer.files.size > MAX_OFFER_FILES) return "too_large"
         if (offer.files.any { it.size < 0 }) return "bad_request"
         var needed = 0L
         for (file in offer.files) needed = addOrNull(needed, file.size) ?: return "too_large"
-        val existing = d.store.transfer(offer.id)
-        if (existing != null) {
-            val peer = d.link.peer() ?: return "bad_request"
-            // The same PC re-offers a download that isn't finished: it resumes with what is stored, so there is nothing new to fit.
-            return if (canResume(existing, peer)) null else "bad_request"
-        }
+        val peer = d.link.peer()
+        if (peer == null || peer.deviceId != fromPeerDeviceId) return "bad_request"
+        // A repeat or a reuse never reaches the gate (the receiver asked [offerHistory] first); an ID the store knows is refused anyway.
+        if (d.store.transfer(offer.id) != null) return "bad_request"
         val claimed = synchronized(reservations) {
             val now = d.nowMillis()
             reservations.values.removeAll { now - it.atMillis > RESERVATION_MILLIS }
             reservations.values.fold(0L) { sum, r -> addOrNull(sum, r.bytes) ?: Long.MAX_VALUE }
         }
-        val stillToWrite = addOrNull(d.store.pendingDownloadBytes(), claimed) ?: return "too_large"
+        val written = d.progress.stillToWrite(d.store.pendingDownloadFiles()) ?: return "too_large"
+        val stillToWrite = addOrNull(written, claimed) ?: return "too_large"
         val required = addOrNull(needed, stillToWrite) ?: return "too_large"
         if (required > d.sink.freeBytes()) return "disk_full"
         synchronized(reservations) { reservations[offer.id] = Reservation(needed, d.nowMillis()) }
@@ -179,27 +210,20 @@ class TransferEngine(
 
     private val reservations = HashMap<String, Reservation>()
 
-    /** Only an unfinished download from the PC that is paired now can be started again by an `offer` with its ID. */
-    private fun canResume(existing: TransferEntity, peer: PeerInfo): Boolean =
-        existing.direction == TransferDirection.DOWN && existing.peerDeviceId == peer.deviceId && !TransferStatus.isFinished(existing.status)
-
-    /** A valid `offer` that was acked: remember it and download it. Returns at once; the download runs on its own coroutine. */
-    suspend fun onOffer(peerName: String, offer: Offer) {
+    /**
+     * A valid `offer` that was acked: remember it and download it. Returns at once; the download runs on its own coroutine. It is recorded
+     * for the PC it came from ([fromPeerDeviceId]), and only if that PC is the paired one.
+     */
+    suspend fun onOffer(fromPeerDeviceId: String, peerName: String, offer: Offer) {
         try {
             val peer = d.link.peer()
-            if (peer == null) {
-                d.log.w("transfer", "offer ${offer.id} from '$peerName' ignored: no PC is paired")
+            if (peer == null || peer.deviceId != fromPeerDeviceId) {
+                d.log.w("transfer", "offer ${offer.id} from '$peerName' ignored: that PC is not the paired one")
                 return
             }
-            val existing = d.store.transfer(offer.id)
-            if (existing != null) {
-                if (canResume(existing, peer)) {
-                    d.log.i("transfer", "offer ${offer.id} is already known; not starting it twice")
-                    launchDownload(offer.id)
-                } else {
-                    // A transfer ID is never reused (protocol.md). The rows are not touched: they may be an upload of ours.
-                    d.log.w("transfer", "offer ${offer.id} reuses the ID of another transfer; ignored")
-                }
+            if (d.store.transfer(offer.id) != null) {
+                // A transfer ID is never reused (protocol.md). The rows are not touched: they may be an upload of ours.
+                d.log.w("transfer", "offer ${offer.id} reuses the ID of another transfer; ignored")
                 return
             }
             val files = offer.files.mapIndexed { i, f ->
@@ -217,13 +241,33 @@ class TransferEngine(
         }
     }
 
+    /**
+     * A valid `offer` repeated by the paired PC (the receiver acked it again, see [offerHistory]); nothing is downloaded a second time.
+     * An **unfinished** download carries on (resumes with `Range` if it isn't running). A download that is **done** sends its `complete`
+     * again if the PC never acked it, and one that was **canceled or failed** sends its `cancel` again (both are owed until acked).
+     */
+    suspend fun onOfferRepeated(fromPeerDeviceId: String, offer: Offer) {
+        val peer = d.link.peer()
+        if (peer == null || peer.deviceId != fromPeerDeviceId) return
+        val transfer = d.store.transfer(offer.id) ?: return
+        if (transfer.direction != TransferDirection.DOWN || transfer.peerDeviceId != peer.deviceId) return
+        if (!TransferStatus.isFinished(transfer.status)) {
+            d.log.i("transfer", "offer ${offer.id} is repeated; the download carries on")
+            launchDownload(offer.id)
+            return
+        }
+        if (transfer.owed == null) return
+        d.log.i("transfer", "offer ${offer.id} is repeated; its ${transfer.owed} was not acked, so it is sent again")
+        owedMessages.send(d.connectionFor(transfer, timings.connectWaitMillis, kick = false), transfer.id)
+    }
+
     private fun launchDownload(id: String) = launch(id, downloadLock) {
         DownloadRunner(d, timings, httpFor, mimeForExtension).run(id)
     }
 
     // ---------------------------------------------------------------- cancel, retry, recovery
 
-    /** The user cancelled (the notification's Cancel). An upload sends `DELETE`; a download sends a `cancel` message. */
+    /** The user cancelled (the notification's Cancel, or Cancel in the history). An upload sends `DELETE`; a download sends a `cancel` message. */
     fun cancel(transferId: String) {
         scope.launch(Dispatchers.IO) {
             val id = resolve(transferId)
@@ -239,12 +283,13 @@ class TransferEngine(
     }
 
     private suspend fun cancelUpload(transfer: TransferEntity) {
-        d.store.setStatus(transfer.id, TransferStatus.CANCELED, "user", "Canceled.", d.nowMillis())
+        // A queued upload that a flush started a moment ago is stopped by the first line of `cancel`; this status change is the one that counts.
+        if (!d.store.setStatus(transfer.id, TransferStatus.CANCELED, "user", "Canceled.", d.nowMillis())) return
         d.notifier.clear(transfer.id)
-        d.sources.deleteCache(transfer.id)
+        d.sources.deleteCache(transfer.localId)
         // The PC drops its partial files. A retried DELETE that gets 404 counts as done (the transfer is already gone).
         repeat(DELETE_ATTEMPTS) { attempt ->
-            val endpoint = d.link.connection(if (attempt == 0) timings.connectWaitMillis else 1_000, kick = attempt == 0)?.httpEndpoint
+            val endpoint = d.connectionFor(transfer, if (attempt == 0) timings.connectWaitMillis else 1_000, kick = attempt == 0)?.httpEndpoint
             if (endpoint != null) {
                 try {
                     if (httpFor(endpoint).delete(transfer.id) is ApiResult.Ok) return
@@ -260,58 +305,117 @@ class TransferEngine(
     }
 
     private suspend fun cancelDownload(transfer: TransferEntity) {
+        // The `cancel` is owed to the PC from this write on: sent now if there is a connection, else after the next `hello`, until acked.
+        val owed = OwedMessages.cancel("user")
+        if (!d.store.setStatus(transfer.id, TransferStatus.CANCELED, "user", "Canceled.", d.nowMillis(), owed, OwedMessages.newMessageId())) return
         DownloadRunner.discardPartials(d, transfer.id)
-        d.store.setStatus(transfer.id, TransferStatus.CANCELED, "user", "Canceled.", d.nowMillis())
         d.notifier.clear(transfer.id)
-        val messageId = MessageIds.newId()
-        val connection = d.link.connection(timings.connectWaitMillis, kick = false)
-        connection?.sendAcked(messageId, Frames.cancel(messageId, transfer.id, "user"), timings.ackTimeoutMillis)
+        owedMessages.send(d.connectionFor(transfer, timings.connectWaitMillis, kick = false), transfer.id)
     }
 
-    /** The PC sent `cancel`. Unknown or finished transfers are ignored (the message was acked already). */
-    fun onPeerCancel(transferId: String, reason: String) {
+    /**
+     * The PC sent `cancel`. Unknown or finished transfers are ignored (the message was acked already), and so is a `cancel` from a PC
+     * that the transfer doesn't belong to. The status is read again after the job stopped: a transfer that finished meanwhile stays
+     * `done` (a late `cancel` must not turn a received file into a canceled one). **One exception:** a transfer that **failed with
+     * `not_found`** (the phone only found out through a `404`) is turned into "canceled on <PC>" by the `cancel` of the PC that owns it: that
+     * is what the PC says, and the history then says the same (protocol.md, item 52). It can never change `done`.
+     */
+    fun onPeerCancel(fromPeerDeviceId: String, transferId: String, reason: String) {
         scope.launch(Dispatchers.IO) {
             val id = resolve(transferId)
+            val first = d.store.transfer(id) ?: return@launch
+            if (first.peerDeviceId != fromPeerDeviceId) {
+                d.log.w("transfer", "a cancel for $id came from a PC the transfer doesn't belong to; ignored")
+                return@launch
+            }
+            if (TransferStatus.isFinished(first.status)) {
+                if (first.status == TransferStatus.FAILED && first.errorCode == "not_found" &&
+                    d.store.markCanceledByPeer(id, "Canceled on ${first.peerName}.")
+                ) {
+                    d.log.i("transfer", "$id: the PC's cancel turns a failed (not_found) transfer into a canceled one")
+                    d.notifier.clear(id)
+                }
+                return@launch
+            }
+            jobs[id]?.cancelAndJoin()
             val transfer = d.store.transfer(id) ?: return@launch
             if (TransferStatus.isFinished(transfer.status)) return@launch
-            jobs[id]?.cancelAndJoin()
+            val message = "Canceled on ${transfer.peerName}."
+            // The status change is guarded: if it doesn't apply, the transfer ended in the meantime and nothing else here may touch it.
+            if (!d.store.setStatus(id, TransferStatus.CANCELED, "peer_canceled", message, d.nowMillis())) return@launch
             d.log.i("transfer", "$id cancelled by the PC (reason '$reason')")
-            if (transfer.direction == TransferDirection.DOWN) DownloadRunner.discardPartials(d, id) else d.sources.deleteCache(id)
-            d.store.setStatus(id, TransferStatus.CANCELED, "peer_canceled", "${transfer.peerName} canceled the transfer.", d.nowMillis())
+            if (transfer.direction == TransferDirection.DOWN) DownloadRunner.discardPartials(d, id) else d.sources.deleteCache(transfer.localId)
             d.notifier.clear(id)
-            d.notifier.failed(transfer.copy(status = TransferStatus.CANCELED), "${transfer.peerName} canceled the transfer.")
+            d.notifier.failed(transfer.copy(status = TransferStatus.CANCELED), message)
         }
     }
 
-    /** Starts a transfer again: a queued upload (the Retry action), or a failed one. A download can only be resumed while it is queued. */
+    /**
+     * Starts a transfer again because the **user** asked (the Retry button): a queued one, or a failed upload. A download can only be
+     * resumed while it is queued. An upload first `POST`s its old transfer ID, so one the PC finished within 24 hours is recognised; on
+     * `404` it goes on under a new ID with only the files that never got a `200` ([UploadRunner]). Nothing else may do that: an
+     * automatic resume that gets `404` fails the transfer and sends nothing.
+     */
     fun retry(transferId: String) {
         scope.launch(Dispatchers.IO) {
             val id = resolve(transferId)
             val transfer = d.store.transfer(id) ?: return@launch
             val retryable = transfer.status == TransferStatus.QUEUED ||
                 (transfer.direction == TransferDirection.UP && transfer.status == TransferStatus.FAILED)
-            if (!retryable) return@launch
-            d.store.setStatus(id, TransferStatus.QUEUED)
-            if (transfer.direction == TransferDirection.UP) launchUpload(id) else launchDownload(id)
+            if (!retryable || transfer.retriedAs != null) return@launch
+            // The run that follows is the user's, even if it has to wait for the PC and the queue flush starts it later: it is stored.
+            if (!d.store.requeue(id, userRetry = transfer.direction == TransferDirection.UP)) return@launch
+            if (transfer.direction == TransferDirection.UP) launchUpload(id, userRetry = true) else launchDownload(id)
         }
     }
 
-    /** Starts every queued upload, oldest first. The persistent queue (1.4) calls this when the PC comes back. */
+    /** The queued uploads, oldest first (the queue flush merges them with the queued texts by creation time). */
+    suspend fun queuedUploads(): List<TransferEntity> =
+        d.store.unfinished().filter { it.direction == TransferDirection.UP && it.status == TransferStatus.QUEUED }
+
+    /** The queue flush starts a queued upload. Automatic: a `404` to its `POST` fails it, it never goes out under a new ID. */
+    fun startQueuedUpload(id: String) = launchUpload(id)
+
+    /** Starts every queued upload, oldest first. */
     suspend fun retryQueuedUploads() {
-        for (transfer in d.store.unfinished()) {
-            if (transfer.direction == TransferDirection.UP && transfer.status == TransferStatus.QUEUED) launchUpload(transfer.id)
-        }
+        for (transfer in queuedUploads()) launchUpload(transfer.id)
     }
 
     /**
-     * The link is up (or the service just started): bring back what an earlier run left behind. An `active` upload resumes (its
-     * source access is checked first), and a download resumes whether it is `active` or waiting for the PC. Queued uploads stay
-     * queued until [retry]. Safe to call at every connect.
+     * Queued uploads older than [maxAgeMillis] have expired: they fail with code `expired` and their cached copies go. (Texts have the
+     * same rule in the text queue.) **Only an upload that never started expires** (the spec's 7 days are for the queue); one the PC has
+     * answered follows the PC's `.part` rule (24 hours without progress), which the phone learns from a `404` when it resumes. Returns how
+     * many expired.
      */
-    suspend fun onLinkReady() {
+    suspend fun expireQueued(maxAgeMillis: Long): Int {
+        val now = d.nowMillis()
+        var expired = 0
+        for (transfer in queuedUploads()) {
+            if (transfer.started || now - transfer.createdAtMillis < maxAgeMillis || jobs[transfer.id]?.isActive == true) continue
+            if (d.store.setStatus(transfer.id, TransferStatus.FAILED, EXPIRED, "Expired: it waited in the queue for too long.", now)) {
+                d.sources.deleteCache(transfer.localId)
+                d.notifier.clear(transfer.id)
+                d.log.w("transfer", "${transfer.id} expired in the queue")
+                expired++
+            }
+        }
+        return expired
+    }
+
+    /**
+     * The link to the PC [fromPeerDeviceId] is up (or the service just started): bring back what an earlier run left behind. An `active`
+     * upload resumes (its source access is checked first), and a download resumes whether it is `active` or waiting for the PC. Only
+     * the transfers of that PC are touched. Queued uploads are started by the queue flush. Safe to call at every connect.
+     *
+     * **First** the `complete` and `cancel` messages that nobody acked are sent again on [connection] (protocol.md, Queue: kept until acked,
+     * re-sent after every `hello`, before the queue). Then the unfinished transfers resume.
+     */
+    suspend fun onLinkReady(fromPeerDeviceId: String, connection: LinkConnection? = null) {
         dropTransfersOfOtherPcs()
+        val link = connection ?: d.link.connection(0, false, fromPeerDeviceId)
+        if (link != null && link.peerDeviceId == fromPeerDeviceId) owedMessages.resendAll(link)
         for (transfer in d.store.unfinished()) {
-            if (jobs[transfer.id]?.isActive == true) continue
+            if (jobs[transfer.id]?.isActive == true || transfer.peerDeviceId != fromPeerDeviceId) continue
             when {
                 transfer.direction == TransferDirection.DOWN -> launchDownload(transfer.id)
                 transfer.status == TransferStatus.ACTIVE -> launchUpload(transfer.id)
@@ -346,8 +450,8 @@ class TransferEngine(
         val current = d.store.transfer(id) ?: return
         if (TransferStatus.isFinished(current.status)) return
         d.log.i("transfer", "$id cancelled: ${current.peerName} is not paired any more")
-        runCatching { if (current.direction == TransferDirection.DOWN) DownloadRunner.discardPartials(d, id) else d.sources.deleteCache(id) }
-        d.store.setStatus(id, TransferStatus.CANCELED, UNPAIRED, "${current.peerName} was unpaired.", d.nowMillis())
+        if (!d.store.setStatus(id, TransferStatus.CANCELED, UNPAIRED, "${current.peerName} was unpaired.", d.nowMillis())) return
+        runCatching { if (current.direction == TransferDirection.DOWN) DownloadRunner.discardPartials(d, id) else d.sources.deleteCache(current.localId) }
         d.notifier.clear(id)
     }
 
@@ -363,7 +467,8 @@ class TransferEngine(
             orphans.forEach { runCatching { d.sink.delete(it) } }
             orphans.size
         }
-        val removedCaches = d.sources.deleteCacheExcept(d.store.liveIds(), CACHE_SWEEP_MIN_AGE_MILLIS)
+        // Cached copies are keyed by the transfer's stable local ID, which survives a new transfer ID.
+        val removedCaches = d.sources.deleteCacheExcept(d.store.liveLocalIds(), CACHE_SWEEP_MIN_AGE_MILLIS)
         if (removedEntries > 0 || removedCaches > 0) {
             d.log.w("transfer", "start-up sweep: deleted $removedEntries unfinished entries and $removedCaches cached copies that no transfer owned")
         }
@@ -377,7 +482,8 @@ class TransferEngine(
         val files = d.store.files(t.id)
         val done = files.sumOf { if (it.finished) it.size else it.bytesDone }
         "${t.id} ${t.direction} ${t.status} ${done}/${t.totalBytes} files=${files.size} " +
-            "names=${files.joinToString("|") { it.finalName ?: it.name }} err=${t.errorCode}"
+            "names=${files.joinToString("|") { it.finalName ?: it.name }} err=${t.errorCode} retriedAs=${t.retriedAs} " +
+            "userRetry=${t.userRetry} started=${t.started} owed=${t.owed} completeAcked=${t.completeAcked}"
     }
 
     private fun resolve(id: String): String {
@@ -419,15 +525,18 @@ class TransferEngine(
         val transfer = runCatching { d.store.transfer(id) }.getOrNull() ?: return@withContext
         if (TransferStatus.isFinished(transfer.status)) return@withContext
         if (transfer.direction == TransferDirection.DOWN) runCatching { DownloadRunner.discardPartials(d, id) }
-        runCatching { d.store.setStatus(id, TransferStatus.FAILED, "internal", message, d.nowMillis()) }
+        val down = transfer.direction == TransferDirection.DOWN
+        val owed = if (down) OwedMessages.cancel("error") else null
+        val owedId = if (down) OwedMessages.newMessageId() else null
+        val changed = runCatching { d.store.setStatus(id, TransferStatus.FAILED, "internal", message, d.nowMillis(), owed, owedId) }.getOrDefault(false)
+        if (!changed) return@withContext
         runCatching { d.notifier.failed(transfer.copy(status = TransferStatus.FAILED), message) }
-        if (transfer.direction == TransferDirection.DOWN) {
+        if (down) {
             runCatching {
-                val messageId = MessageIds.newId()
                 val connection = withTimeoutOrNull(timings.connectWaitMillis + timings.ackTimeoutMillis) {
-                    d.link.connection(timings.connectWaitMillis, kick = false)
+                    d.connectionFor(transfer, timings.connectWaitMillis, kick = false)
                 }
-                connection?.sendAcked(messageId, Frames.cancel(messageId, id, "error"), timings.ackTimeoutMillis)
+                owedMessages.send(connection, id)
             }
         }
     }
@@ -440,6 +549,9 @@ class TransferEngine(
 
         /** The error code of a transfer cancelled because its PC was unpaired. */
         const val UNPAIRED = "unpaired"
+
+        /** The error code of a queued item that waited longer than the queue keeps it ([app.kinrelay.android.data.QueuePolicy.EXPIRY_MILLIS]). */
+        const val EXPIRED = "expired"
 
         private const val CACHE_SWEEP_MIN_AGE_MILLIS = 10 * 60_000L
 

@@ -126,6 +126,17 @@
             </intent-filter>
         </service>
 
+        <!-- "Export logs" on the Debug screen: the zip is read by the app the user picks in the share sheet, through a grant on the intent. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.exports"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/export_paths" />
+        </provider>
+
         <service
             android:name=".link.LinkService"
             android:exported="false"

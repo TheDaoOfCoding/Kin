@@ -230,7 +230,7 @@ class UploadFlowTest {
         r.pc.sendCancel(id, "user")
         val t = r.awaitStatus(id, TransferStatus.CANCELED)
         assertEquals("peer_canceled", t.errorCode)
-        assertTrue(r.notifier.failed.single().second.contains("canceled"))
+        assertEquals("Canceled on Desk PC.", r.notifier.failed.single().second)
         r.await("the runner to stop") { !r.engine.isRunning(id) }
         assertFalse(r.wake.held)
     }
@@ -310,7 +310,7 @@ class UploadFlowTest {
         val id = r.share("a.bin" to TransferRig.bytes(100))
         r.await("the transfer to be parked") { r.notifier.queued.isNotEmpty() }
         r.connect()
-        r.blocking { r.engine.onLinkReady() }
+        r.blocking { r.engine.onLinkReady(r.pcId) }
         Thread.sleep(300)
         assertEquals("the persistent queue is 1.4: a reconnect doesn't send it", TransferStatus.QUEUED, r.store.transfers.getValue(id).status)
         r.blocking { r.engine.retryQueuedUploads() }
@@ -329,7 +329,7 @@ class UploadFlowTest {
         r.store.transfers.computeIfPresent(id) { _, t -> t.copy(status = TransferStatus.ACTIVE) }
         r.store.files.getValue(id).replaceAll { it.copy(finished = false) }
         r.pc.files.uploads.getValue(id).files.getValue("f1").data = bytes.copyOf(90_000)
-        r.blocking { r.engine.onLinkReady() }
+        r.blocking { r.engine.onLinkReady(r.pcId) }
         r.awaitStatus(id, TransferStatus.DONE)
         assertArrayEquals(bytes, r.stored(id, "f1").data)
     }

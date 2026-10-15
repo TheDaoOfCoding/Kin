@@ -44,6 +44,12 @@ fun HomeScreen(
     onReconnect: () -> Unit,
     onUnpair: suspend () -> Unit,
     modifier: Modifier = Modifier,
+    recent: List<app.kinrelay.android.history.HistoryItem> = emptyList(),
+    nowMillis: Long = System.currentTimeMillis(),
+    onSeeHistory: () -> Unit = {},
+    onOpenItem: (app.kinrelay.android.history.HistoryItem) -> Unit = {},
+    onRetryItem: (app.kinrelay.android.history.HistoryItem) -> Unit = {},
+    onCancelItem: (app.kinrelay.android.history.HistoryItem) -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
     var pinging by remember { mutableStateOf(false) }
@@ -84,6 +90,11 @@ fun HomeScreen(
         if (lastPing != null) Text(UiText.ping(lastPing), style = MaterialTheme.typography.titleMedium)
         if (state is LinkState.Replaced || state is LinkState.Connecting) {
             OutlinedButton(onClick = onReconnect, modifier = Modifier.fillMaxWidth()) { Text("Reconnect now") }
+        }
+        if (recent.isNotEmpty()) {
+            Text("Recent", style = MaterialTheme.typography.titleMedium)
+            recent.take(3).forEach { HistoryRow(it, nowMillis, onOpenItem, onRetryItem, onCancelItem, modifier = Modifier.padding(horizontal = 0.dp)) }
+            TextButton(onClick = onSeeHistory) { Text("See all history") }
         }
         OutlinedButton(onClick = { confirmUnpair = true }, modifier = Modifier.fillMaxWidth()) {
             Text(if (state is LinkState.PairAgain) "Remove this PC" else "Unpair")

@@ -16,6 +16,7 @@ class DefaultLinkEnvironment(
     tls: KinTls,
     private val socketFactory: SocketFactory,
     private val discovery: suspend (shortId: String, timeoutMillis: Long) -> List<PairingAddress>,
+    private val peerDeviceId: String,
     private val local: LocalHello,
     private val dedup: DedupMemory,
     private val scope: CoroutineScope,
@@ -37,5 +38,5 @@ class DefaultLinkEnvironment(
         discovery(shortId, timeoutMillis)
 
     override fun openSession(address: PairingAddress, listener: SessionListener): LinkConnection =
-        LinkSession(client, address, local, dedup, scope, clock, log, listener, helloTimeoutMillis)
+        LinkSession(client, address, local, dedup, scope, clock, log, listener, peerDeviceId, helloTimeoutMillis)
 }

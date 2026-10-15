@@ -10,6 +10,9 @@ import app.kinrelay.android.data.DeviceEntity
 import app.kinrelay.android.data.KinDatabase
 import app.kinrelay.android.data.KinSettings
 import app.kinrelay.android.data.SeenMessageEntity
+import app.kinrelay.android.history.HistoryItem
+import app.kinrelay.android.history.HistoryRepository
+import app.kinrelay.android.history.SuccessRate
 import app.kinrelay.android.identity.Identity
 import app.kinrelay.android.identity.IdentityFailure
 import app.kinrelay.android.identity.IdentityLoad
@@ -18,11 +21,19 @@ import app.kinrelay.android.identity.IdentityUnavailableException
 import app.kinrelay.android.identity.KeystoreKeyWrapper
 import app.kinrelay.android.link.ArrivalSink
 import app.kinrelay.android.link.Clock
+import app.kinrelay.android.data.QueuePolicy
 import app.kinrelay.android.link.LinkController
+import app.kinrelay.android.link.OutboxFlusher
+import app.kinrelay.android.link.QueuedUpload
+import app.kinrelay.android.link.RoomTextStore
+import app.kinrelay.android.link.TextOutbox
+import app.kinrelay.android.link.UploadQueue
 import app.kinrelay.android.link.Notifications
 import app.kinrelay.android.link.OutgoingSender
 import app.kinrelay.android.link.TextFileSender
 import app.kinrelay.android.log.FileLog
+import app.kinrelay.android.log.LogFingerprint
+import app.kinrelay.android.log.LogKeyStore
 import app.kinrelay.android.pairing.DeviceInfo
 import app.kinrelay.android.pairing.PairingController
 import app.kinrelay.android.protocol.DedupMemory
@@ -103,7 +114,25 @@ class AppGraph(private val context: Context) {
     @Volatile var wakeLocks: AndroidWakeLocks? = null
         private set
 
-    /** Sends text to the PC and waits for the ack. Used by the share target, the text menu, the tile and the notification button. */
+    /** The text queue and the text history (milestone 1.4). */
+    val textOutbox: TextOutbox by lazy { TextOutbox(RoomTextStore(database.texts()), log) }
+
+    /** Sends the queue (texts and uploads, oldest first) after the PC's `hello` and after a new send while connected. */
+    val flusher: OutboxFlusher by lazy {
+        OutboxFlusher(
+            texts = textOutbox,
+            uploads = object : UploadQueue {
+                override suspend fun queued() = transfers.queuedUploads().map { QueuedUpload(it.id, it.createdAtMillis, it.peerDeviceId) }
+                override fun start(id: String) = transfers.startQueuedUpload(id)
+                override suspend fun expire(maxAgeMillis: Long) = transfers.expireQueued(maxAgeMillis)
+            },
+            pairedPeerDeviceId = { pairedDevice()?.deviceId },
+            alerts = notifications,
+            log = log,
+        )
+    }
+
+    /** Sends text to the PC: saved in the queue first, then sent. Used by the share target, the text menu, the tile and the notification button. */
     val sender: OutgoingSender by lazy {
         OutgoingSender(
             link = link,
@@ -112,6 +141,8 @@ class AppGraph(private val context: Context) {
             arrivals = ArrivalSink { settings.setLastArrival(it) },
             clock = Clock { SystemClock.elapsedRealtime() },
             log = log,
+            outbox = textOutbox,
+            flusher = flusher,
             textFiles = TextFileSender { wire ->
                 transfers.enqueueText(wire, TransferEngine.textFileName(System.currentTimeMillis())) != null
             },
@@ -124,13 +155,71 @@ class AppGraph(private val context: Context) {
         DeviceInfo(name = name, model = "${Build.MANUFACTURER} ${Build.MODEL}", appVersion = BuildConfig.VERSION_NAME)
     }
 
+    /** The history screen's list, and what it does with an item. */
+    val history: HistoryRepository by lazy { HistoryRepository(database.transfers(), database.texts()) }
+
+    /**
+     * Retry in the history (the user asked): a failed upload goes through [TransferEngine.retry] (its old ID is asked about first, a new ID
+     * only if the PC has used it up), a failed text goes out again as a new message.
+     */
+    fun retryItem(item: HistoryItem) {
+        scope.launch(Dispatchers.IO) {
+            if (!item.isText) {
+                transfers.retry(item.id)
+                return@launch
+            }
+            if (!textOutbox.retry(item.id)) return@launch
+            link.ensureRunning(appContext)
+            val peer = pairedDevice() ?: return@launch
+            link.await(OutgoingSender.CONNECT_WAIT_MILLIS, peer.deviceId)?.let { flusher.flush(it) }
+        }
+    }
+
+    /** The first-try success rate of the sends from this phone (targets.md #1). */
+    suspend fun successRate(): SuccessRate.Result = SuccessRate.compute(database.transfers().outgoingOutcomes(), database.texts().outgoingOutcomes())
+
+    /** Cancel in the history: a queued item never goes out. */
+    fun cancelItem(item: HistoryItem) {
+        scope.launch(Dispatchers.IO) { if (item.isText) textOutbox.cancel(item.id) else transfers.cancel(item.id) }
+    }
+
+    /** The name sent in `hello`: the one the user chose in Settings, or the system's. */
+    suspend fun deviceName(): String = settings.deviceName() ?: deviceInfo.name
+
+    /** A PC is gone (unpaired from either side, or replaced): what is unfinished with it ends, and nothing queued for it can go to another PC. */
+    suspend fun peerGone(deviceId: String) {
+        transfers.onUnpaired(deviceId)
+        textOutbox.onUnpaired(deviceId)
+    }
+
     private val dedupLoad = CompletableDeferred<DedupMemory>()
+
+    private companion object {
+        const val PRUNE_INTERVAL_MILLIS = 24L * 60 * 60 * 1000
+    }
 
     /** Creates the identity on first run, without blocking the main thread. */
     fun warmUp() {
-        // Cached copies of files that waited for the PC are kept for 24 hours, like the PC keeps partial files (architecture.md).
-        scope.launch(Dispatchers.IO) { AndroidSourceFiles(appContext).deleteCacheOlderThan(24L * 60 * 60 * 1000) }
-        // What a crash left behind and no transfer owns (pending gallery entries, cached copies) goes now, before downloads resume.
+        // The key of the log fingerprints (a keyed hash of a text, never the text): random per install, wrapped by the Keystore, never exported.
+        scope.launch(Dispatchers.IO) {
+            runCatching { LogFingerprint.install(LogKeyStore(File(context.filesDir, "log-key.bin"), KeystoreKeyWrapper("kin_log_wrap")).loadOrCreate()) }
+                .onFailure { log.w("app", "no log key (${it.javaClass.simpleName}): texts are logged by length only") }
+        }
+        // Texts that were being sent when the app stopped are queued again, and what waited too long expires (it never goes out).
+        scope.launch(Dispatchers.IO) {
+            runCatching { textOutbox.recoverAtStart() }
+            runCatching { flusher.expire() }
+            prune()
+        }
+        // The same housekeeping once a day, for a phone that stays connected for weeks (it also runs at every connect).
+        scope.launch(Dispatchers.IO) {
+            while (true) {
+                delay(PRUNE_INTERVAL_MILLIS)
+                prune()
+            }
+        }
+        // What a crash left behind and no transfer owns (pending gallery entries, and cached copies of transfers that are not live: a queued,
+        // active or failed upload keeps its copies, whatever their age) goes now, before downloads resume.
         scope.launch(Dispatchers.IO) { runCatching { transfers.sweepOrphans() } }
         // The paired PC shows up in the share sheet's top row (the direct-share shortcut) and goes away when it is unpaired.
         scope.launch {
@@ -143,11 +232,11 @@ class AppGraph(private val context: Context) {
                 log.w("identity", "the stored identity was replaced: ${load.replaced}")
                 val gone = database.devices().all()
                 database.devices().deleteAll()
-                gone.forEach { transfers.onUnpaired(it.deviceId) }
+                gone.forEach { peerGone(it.deviceId) }
                 log.w("identity", "the new identity replaces the old one; paired PCs were removed")
             }
             val identity = load.identity
-            log.i("identity", "device ${identity.deviceId} (short ${identity.shortId})")
+            log.i("identity", "device ${identity.shortId}")
             mutableIdentity.value = identity
             dedupLoad.complete(loadDedup())
         }
@@ -169,6 +258,15 @@ class AppGraph(private val context: Context) {
                 delay(wait)
             }
         }
+    }
+
+    /**
+     * Keeps the database small (at every connect, at start, and once a day): the file rows of finished transfers and the bodies of finished
+     * texts beyond the 500 the history shows go. The transfer rows stay for ever: a transfer ID is never used twice.
+     */
+    suspend fun prune() {
+        runCatching { database.transfers().trim(QueuePolicy.HISTORY_LIMIT) }
+        runCatching { textOutbox.prune() }
     }
 
     suspend fun identity(): Identity = mutableIdentity.filterNotNull().first()

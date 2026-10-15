@@ -2,7 +2,6 @@ package app.kinrelay.android.link
 
 import android.Manifest
 import android.app.Notification
-import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
@@ -11,6 +10,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -18,42 +18,42 @@ import androidx.core.net.toUri
 import app.kinrelay.android.MainActivity
 import app.kinrelay.android.R
 import app.kinrelay.android.clipboard.ClipboardSendActivity
+import app.kinrelay.android.notify.NotificationChannels
+import app.kinrelay.android.notify.NotificationLedger
+import app.kinrelay.android.notify.TextArrivals
+import app.kinrelay.android.notify.TrailingThrottle
+import app.kinrelay.android.transfer.TransferActionReceiver
 
 /**
- * The service notification (with its "Send clipboard" action), "Ping from <name>", "Text from <name>",
- * send failures, and the toasts. It is the real [Alerts].
+ * The service notification (with its "Send clipboard" action), "Ping from <name>", the texts from the PC, send problems, and the toasts.
+ * It is the real [Alerts].
+ *
+ * Texts from the PC share **one** notification that is updated ("3 texts from Desk PC"), at most twice a second, with the last update
+ * always posted ([TrailingThrottle]): a burst of 60 texts is one notification, not 60 (Android drops new notifications beyond 50 per app).
+ * Send problems keep at most [MAX_PROBLEMS] notifications ([NotificationLedger]), each under its own ID, on the arrivals channel (default
+ * importance), because a "not sent" notice that makes no sound is a notice nobody sees.
  */
 class Notifications(context: Context) : Alerts {
     private val context = context.applicationContext
     private val manager = this.context.getSystemService(NotificationManager::class.java)
     private val main = Handler(Looper.getMainLooper())
+    private val arrivals = TextArrivals()
+    private val problems = NotificationLedger(MAX_PROBLEMS)
+    private var problemCounter = 0
+
+    private val textPoster = TrailingThrottle(
+        intervalMillis = TEXT_UPDATE_MILLIS,
+        now = { SystemClock.elapsedRealtime() },
+        schedule = { delay, task -> main.postDelayed(task, delay) },
+        action = ::postTexts,
+    )
 
     init {
-        manager.createNotificationChannel(
-            NotificationChannel(LINK_CHANNEL, "Connection status", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "Shows whether your PC is connected"
-                setShowBadge(false)
-            }
-        )
-        manager.createNotificationChannel(
-            NotificationChannel(PING_CHANNEL, "Pings", NotificationManager.IMPORTANCE_DEFAULT).apply {
-                description = "A ping sent from your PC"
-            }
-        )
-        manager.createNotificationChannel(
-            NotificationChannel(TEXT_CHANNEL, "Text from your PC", NotificationManager.IMPORTANCE_DEFAULT).apply {
-                description = "Text and links sent from your PC. They are also copied to the clipboard"
-            }
-        )
-        manager.createNotificationChannel(
-            NotificationChannel(PROBLEM_CHANNEL, "Send problems", NotificationManager.IMPORTANCE_DEFAULT).apply {
-                description = "Something you sent to your PC didn't arrive"
-            }
-        )
+        NotificationChannels.ensure(this.context)
     }
 
     fun link(text: String): Notification =
-        NotificationCompat.Builder(context, LINK_CHANNEL)
+        NotificationCompat.Builder(context, NotificationChannels.LINK)
             .setSmallIcon(R.drawable.ic_stat_kin)
             .setContentTitle("Kin")
             .setContentText(text)
@@ -71,7 +71,7 @@ class Notifications(context: Context) : Alerts {
 
     fun pingFrom(name: String) {
         if (!canPost()) return
-        val notification = NotificationCompat.Builder(context, PING_CHANNEL)
+        val notification = NotificationCompat.Builder(context, NotificationChannels.ARRIVALS)
             .setSmallIcon(R.drawable.ic_stat_kin)
             .setContentTitle("Ping from $name")
             .setAutoCancel(true)
@@ -82,41 +82,78 @@ class Notifications(context: Context) : Alerts {
 
     override fun textFrom(pcName: String, messageId: String, text: String?, openUrl: String?) {
         if (!canPost()) return
-        val title = "Text from $pcName"
-        val builder = NotificationCompat.Builder(context, TEXT_CHANNEL)
+        arrivals.add(pcName, text?.let { preview(it, LONG_PREVIEW, singleLine = false) }, openUrl)
+        textPoster.request()
+    }
+
+    /** The user opened the app or swiped the notification away: the next text starts a new "Text from <PC>". */
+    fun textsSeen() {
+        if (!arrivals.isEmpty()) arrivals.reset()
+    }
+
+    private fun postTexts() {
+        val state = arrivals.state()
+        if (state.count == 0 || !canPost()) return
+        val title = TextArrivals.title(state)
+        val builder = NotificationCompat.Builder(context, NotificationChannels.ARRIVALS)
             .setSmallIcon(R.drawable.ic_stat_kin)
             .setContentTitle(title)
             .setAutoCancel(true)
+            .setOnlyAlertOnce(state.count > 1)
             .setContentIntent(openApp())
+            .setDeleteIntent(dismissed())
+            .setNumber(state.count)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             // The text is private: the lock screen shows only the title.
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
             .setPublicVersion(
-                NotificationCompat.Builder(context, TEXT_CHANNEL).setSmallIcon(R.drawable.ic_stat_kin).setContentTitle(title).build()
+                NotificationCompat.Builder(context, NotificationChannels.ARRIVALS).setSmallIcon(R.drawable.ic_stat_kin).setContentTitle(title).build()
             )
-        // No text means sensitive text: the title is all there is.
-        if (text != null) {
-            builder.setContentText(preview(text, SHORT_PREVIEW))
-                .setStyle(NotificationCompat.BigTextStyle().bigText(preview(text, LONG_PREVIEW, singleLine = false)))
+        val shown = state.lines
+        if (state.count == 1) {
+            // No text means sensitive text: the title is all there is.
+            shown.firstOrNull()?.let { builder.setContentText(preview(it, SHORT_PREVIEW)).setStyle(NotificationCompat.BigTextStyle().bigText(it)) }
+        } else {
+            val style = NotificationCompat.InboxStyle().setBigContentTitle(title)
+            shown.forEach { style.addLine(it?.let { line -> preview(line, SHORT_PREVIEW) } ?: TextArrivals.SENSITIVE_LINE) }
+            if (state.count > shown.size) style.setSummaryText("and ${state.count - shown.size} earlier")
+            builder.setStyle(style).setContentText(shown.lastOrNull()?.let { preview(it, SHORT_PREVIEW) } ?: TextArrivals.SENSITIVE_LINE)
         }
-        if (openUrl != null) {
-            val view = Intent(Intent.ACTION_VIEW, openUrl.toUri()).addCategory(Intent.CATEGORY_BROWSABLE).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        state.openUrl?.let { url ->
+            val view = Intent(Intent.ACTION_VIEW, url.toUri()).addCategory(Intent.CATEGORY_BROWSABLE).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             val pending = PendingIntent.getActivity(
-                context, messageId.hashCode(), view, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                context, url.hashCode(), view, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )
             builder.addAction(R.drawable.ic_stat_kin, "Open", pending)
         }
-        manager.notify(messageId, TEXT_ID, builder.build())
+        manager.notify(TEXT_ID, builder.build())
     }
 
     override fun sent(pcName: String?, arrivalMillis: Long) = message("Sent to ${pcName ?: "your PC"}")
+
+    override fun queued(pcName: String?, reason: String, afterNoReply: Boolean) {
+        val pc = pcName ?: "your PC"
+        message(if (afterNoReply) "No reply from $pc yet. Saved: Kin sends it again when $pc is back." else "Saved. Kin sends it when $pc is back. $reason")
+    }
+
+    override fun sentLater(pcName: String?) = message("Sent to ${pcName ?: "your PC"}")
 
     override fun sendFailed(title: String, reason: String) {
         if (!canPost()) {
             message("$title. $reason")
             return
         }
-        val notification = NotificationCompat.Builder(context, PROBLEM_CHANNEL)
+        // Its own ID each time: a problem is never an update of an earlier one (and so never rate-limited away), and at most MAX_PROBLEMS stay.
+        val key = "problem-${problemCounter++}"
+        val evicted = synchronized(problems) {
+            val live = runCatching { manager.activeNotifications.filter { it.id == PROBLEM_ID }.mapNotNull { it.tag }.toSet() }.getOrNull()
+            if (live != null) problems.retainOnly(live)
+            problems.claim(key, title)
+        }
+        evicted.forEach { manager.cancel(it, PROBLEM_ID) }
+        // A problem ("Not sent: <PC> offline") needs to be seen: it goes on the arrivals channel (default importance, so it makes a sound and
+        // can appear on screen). The low-importance transfers channel is for progress, and showed these in the shade only, in silence.
+        val notification = NotificationCompat.Builder(context, NotificationChannels.ARRIVALS)
             .setSmallIcon(R.drawable.ic_stat_kin)
             .setContentTitle(title)
             .setContentText(reason)
@@ -124,7 +161,7 @@ class Notifications(context: Context) : Alerts {
             .setAutoCancel(true)
             .setContentIntent(openApp())
             .build()
-        manager.notify(PROBLEM_ID, notification)
+        manager.notify(key, PROBLEM_ID, notification)
     }
 
     override fun message(text: String) {
@@ -139,6 +176,11 @@ class Notifications(context: Context) : Alerts {
         PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
     )
 
+    private fun dismissed(): PendingIntent = PendingIntent.getBroadcast(
+        context, 2, Intent(context, TransferActionReceiver::class.java).setAction(TransferActionReceiver.ACTION_TEXTS_DISMISSED),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+    )
+
     private fun sendClipboard(): PendingIntent = PendingIntent.getActivity(
         context, 1, ClipboardSendActivity.intent(context),
         PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
@@ -149,10 +191,10 @@ class Notifications(context: Context) : Alerts {
         private const val PING_ID = 2
         private const val TEXT_ID = 3
         private const val PROBLEM_ID = 4
-        private const val LINK_CHANNEL = "link"
-        private const val PING_CHANNEL = "pings"
-        private const val TEXT_CHANNEL = "text"
-        private const val PROBLEM_CHANNEL = "problems"
+
+        /** At most this many send-problem notifications stay up (the oldest goes first). */
+        const val MAX_PROBLEMS = 5
+        private const val TEXT_UPDATE_MILLIS = 500L
         private const val SHORT_PREVIEW = 100
         private const val LONG_PREVIEW = 600
 

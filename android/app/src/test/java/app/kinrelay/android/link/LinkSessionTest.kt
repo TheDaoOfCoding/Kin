@@ -69,7 +69,7 @@ class LinkSessionTest {
         val client: OkHttpClient = KinTls(phone, pinned).httpClient().newBuilder().callTimeout(0, MILLISECONDS).build()
         return LinkSession(
             client, PairingAddress("127.0.0.1", pc.port), LocalHello("Pixel 8", "android", "0.1.0"),
-            DedupMemory(System::currentTimeMillis), scope, { System.nanoTime() / 1_000_000 }, KinLog.None, events, helloTimeoutMillis,
+            DedupMemory(System::currentTimeMillis), scope, { System.nanoTime() / 1_000_000 }, KinLog.None, events, pinned, helloTimeoutMillis,
         )
     }
 

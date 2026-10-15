@@ -10,6 +10,10 @@ import app.kinrelay.android.protocol.Hello
 import app.kinrelay.android.protocol.MAX_TEXT_BYTES
 import app.kinrelay.android.protocol.Utf8
 import app.kinrelay.android.testing.FakePc
+import app.kinrelay.android.testing.FakeUploadQueue
+import app.kinrelay.android.transfer.PeerInfo
+import app.kinrelay.android.testing.InMemoryTextStore
+import app.kinrelay.android.testing.RecordingAlerts
 import app.kinrelay.android.testing.str
 import app.kinrelay.android.tls.KinTls
 import java.util.concurrent.CopyOnWriteArrayList
@@ -61,26 +65,14 @@ class TextFlowTest {
         }
     }
 
-    private class FakeAlerts : Alerts {
-        class TextAlert(val pc: String, val id: String, val text: String?, val openUrl: String?)
-        val texts = LinkedBlockingQueue<TextAlert>()
-        val sent = CopyOnWriteArrayList<Pair<String?, Long>>()
-        val failures = CopyOnWriteArrayList<Pair<String, String>>()
-        val messages = CopyOnWriteArrayList<String>()
-        override fun textFrom(pcName: String, messageId: String, text: String?, openUrl: String?) { texts.add(TextAlert(pcName, messageId, text, openUrl)) }
-        override fun sent(pcName: String?, arrivalMillis: Long) { sent += pcName to arrivalMillis }
-        val failureTitles = LinkedBlockingQueue<String>()
-        override fun sendFailed(title: String, reason: String) { failures += title to reason; failureTitles += title }
-        override fun message(text: String) { messages += text }
-    }
-
     private class Harness(val pc: FakePc, val session: LinkSession) {
         val clipboard = FakeClipboard()
-        val alerts = FakeAlerts()
+        val alerts = RecordingAlerts()
         val guard = ClipboardGuard({ now })
         val arrivals = CopyOnWriteArrayList<Long>()
         @Volatile var now = 1_000_000L
         lateinit var queue: DeliveryQueue
+        val store = InMemoryTextStore()
     }
 
     private fun pc(block: FakePc.() -> Unit = {}): FakePc = FakePc().apply { pairedPhones += phone.deviceId }.apply(block).start().also { pcs += it }
@@ -103,7 +95,7 @@ class TextFlowTest {
         }
         val session = LinkSession(
             client, PairingAddress("127.0.0.1", pc.port), LocalHello("Pixel 8", "android", "0.1.0"),
-            DedupMemory(System::currentTimeMillis), scope, { System.nanoTime() / 1_000_000 }, KinLog.None, listener,
+            DedupMemory(System::currentTimeMillis), scope, { System.nanoTime() / 1_000_000 }, KinLog.None, listener, pc.identity.deviceId,
         )
         harness = Harness(pc, session)
         harness.queue = DeliveryQueue(KinLog.None).also { it.start(scope) }
@@ -113,21 +105,26 @@ class TextFlowTest {
         return harness
     }
 
+    private fun Harness.defaultLink(): OutgoingLink = object : OutgoingLink {
+        override suspend fun await(waitMillis: Long, peerDeviceId: String): LinkConnection? = session.readyFor(peerDeviceId)
+        override fun unreachableReason() = "not connected"
+        override suspend fun peer() = PeerInfo(pc.identity.deviceId, "Desk PC")
+    }
+
     private fun Harness.sender(
         ackTimeoutMillis: Long = OutgoingSender.ACK_TIMEOUT_MILLIS,
         link: OutgoingLink? = null,
         textFiles: TextFileSender = TextFileSender.None,
-    ) = OutgoingSender(
-        link = link ?: object : OutgoingLink {
-            override suspend fun await(waitMillis: Long): LinkConnection? = session.takeIf { it.isReady }
-            override fun unreachableReason() = "not connected"
-            override suspend fun peerName() = "Desk PC"
-        },
-        alerts = alerts, guard = guard, arrivals = { arrivals += it }, clock = { System.nanoTime() / 1_000_000 }, log = KinLog.None,
-        ackTimeoutMillis = ackTimeoutMillis,
-        textFiles = textFiles,
-    )
-
+        log: KinLog = KinLog.None,
+    ): OutgoingSender {
+        val outbox = TextOutbox(store, log, ackTimeoutMillis = ackTimeoutMillis)
+        val flusher = OutboxFlusher(outbox, FakeUploadQueue(), { pc.identity.deviceId }, alerts, log)
+        return OutgoingSender(
+            link = link ?: defaultLink(),
+            alerts = alerts, guard = guard, arrivals = { arrivals += it }, clock = { System.nanoTime() / 1_000_000 }, log = log,
+            outbox = outbox, flusher = flusher, textFiles = textFiles,
+        )
+    }
     private fun Harness.sendText(
         text: String,
         source: SendSource = SendSource.SHARE,
@@ -374,27 +371,56 @@ class TextFlowTest {
         val log = object : KinLog {
             override fun log(level: Char, component: String, message: String) { lines += message }
         }
-        val sender = OutgoingSender(
-            link = object : OutgoingLink {
-                override suspend fun await(waitMillis: Long): LinkConnection? = h.session.takeIf { it.isReady }
-                override fun unreachableReason() = "x"
-                override suspend fun peerName() = "Desk PC"
-            },
-            alerts = h.alerts, guard = h.guard, arrivals = { }, clock = { System.nanoTime() / 1_000_000 }, log = log,
-        )
         val secret = "correct horse battery staple"
-        assertTrue(h.sendText(secret, sender = sender, sensitive = true) is SendOutcome.Delivered)
+        assertTrue(h.sendText(secret, sender = h.sender(log = log), sensitive = true) is SendOutcome.Delivered)
         val hash = ClipboardGuard.hash(secret).take(8)
-        assertTrue(lines.joinToString("\n"), lines.none { it.contains(secret) || it.contains(hash) || it.contains("len=${secret.length}") })
+        assertTrue(lines.joinToString("\n"), lines.none { it.contains(secret) || it.contains(hash) || it.contains("len=${secret.length}") || it.contains("${secret.length} bytes") })
+        assertTrue("the sender logged something, so the check above means something", lines.any { it.contains("sensitive text sent") })
+        // A sensitive text never reaches the database (it can't be queued, so nothing of it is stored).
+        assertTrue(h.store.items.isEmpty())
     }
 
     @Test
-    fun noAckWithinTheTimeoutIsNoReplyAndTheConnectionIsTreatedAsDead() {
+    fun aSensitiveTextWithNoConnectionIsNotQueuedAndTheUserIsTold() {
+        val h = connect()
+        val none = object : OutgoingLink {
+            override suspend fun await(waitMillis: Long, peerDeviceId: String): LinkConnection? = null
+            override fun unreachableReason() = "This phone isn't on Wi-Fi."
+            override suspend fun peer() = PeerInfo(h.pc.identity.deviceId, "Desk PC")
+        }
+        val outcome = h.sendText("hunter2", sender = h.sender(link = none), sensitive = true)
+        assertEquals(SendOutcome.NotSent("This phone isn't on Wi-Fi."), outcome)
+        assertTrue("nothing is stored, not even for a moment", h.store.items.isEmpty())
+        assertTrue("and it isn't reported as queued", h.alerts.queued.isEmpty())
+        assertEquals("the user is told, in a notification", 1, h.alerts.failures.size)
+        assertTrue(h.alerts.failures.single().first.startsWith("Not sent: Desk PC offline"))
+        assertTrue(h.pc.nextOfType("text", 400) == null)
+        assertTrue(h.arrivals.isEmpty())
+    }
+
+    @Test
+    fun aSensitiveTextThatGetsNoAckIsNotQueuedEither() {
+        val h = connect(pc { ackTexts = false })
+        val outcome = h.sendText("hunter2", sender = h.sender(ackTimeoutMillis = 300), sensitive = true)
+        assertTrue(outcome is SendOutcome.NotSent)
+        assertTrue("not stored for a later try", h.store.items.isEmpty())
+        assertTrue(h.alerts.queued.isEmpty())
+        assertEquals(1, h.alerts.failures.size)
+        assertTrue(h.arrivals.isEmpty())
+    }
+
+    @Test
+    fun noAckWithinTheTimeoutRequeuesTheTextAndTheConnectionIsTreatedAsDead() {
         val h = connect(pc { ackTexts = false })
         val outcome = h.sendText("nobody answers", sender = h.sender(ackTimeoutMillis = 300))
-        assertEquals(SendOutcome.NoReply, outcome)
+        assertEquals(SendOutcome.Queued("No reply from Desk PC yet.", afterNoReply = true), outcome)
         assertTrue(h.arrivals.isEmpty())
-        assertTrue(h.alerts.failures.single().first.startsWith("No reply from Desk PC"))
+        assertEquals("not a failure: no 'failed' notification", 0, h.alerts.failures.size)
+        assertEquals(listOf(Triple<String?, String, Boolean>("Desk PC", "No reply from Desk PC yet.", true)), h.alerts.queued.toList())
+        // Back in the queue, not failed, and it keeps its ID for the next try.
+        val item = h.store.items.values.single()
+        assertEquals("queued", item.status)
+        assertEquals(1, item.attempts)
         blocking { h.session.awaitEnd() } // the socket was cancelled, so the session ends
         assertFalse(h.session.isReady)
     }
@@ -404,7 +430,7 @@ class TextFlowTest {
         assertEquals(5_000L, OutgoingSender.ACK_TIMEOUT_MILLIS)
         val h = connect(pc { ackTexts = false })
         val started = System.nanoTime()
-        assertEquals(SendOutcome.NoReply, h.sendText("waiting for the full timeout"))
+        assertTrue(h.sendText("waiting for the full timeout") is SendOutcome.Queued)
         val waitedMillis = (System.nanoTime() - started) / 1_000_000
         assertTrue("waited $waitedMillis ms", waitedMillis in 4_900..7_000)
     }
@@ -420,18 +446,21 @@ class TextFlowTest {
     }
 
     @Test
-    fun withNoConnectionTheUserGetsPcNotReachableAndNothingIsSent() {
+    fun withNoConnectionTheTextIsSavedInTheQueueAndNothingIsSent() {
         val h = connect()
         val none = object : OutgoingLink {
-            override suspend fun await(waitMillis: Long): LinkConnection? = null
+            override suspend fun await(waitMillis: Long, peerDeviceId: String): LinkConnection? = null
             override fun unreachableReason() = "This phone isn't on Wi-Fi."
-            override suspend fun peerName() = "Desk PC"
+            override suspend fun peer() = PeerInfo(h.pc.identity.deviceId, "Desk PC")
         }
         val outcome = h.sendText("lost", sender = h.sender(link = none))
-        assertEquals(SendOutcome.NotReachable("This phone isn't on Wi-Fi."), outcome)
-        val (title, reason) = h.alerts.failures.single()
-        assertEquals("PC not reachable", title)
-        assertTrue(reason, reason.contains("Desk PC") && reason.contains("Wi-Fi"))
+        assertEquals(SendOutcome.Queued("This phone isn't on Wi-Fi.", afterNoReply = false), outcome)
+        assertEquals(listOf(Triple<String?, String, Boolean>("Desk PC", "This phone isn't on Wi-Fi.", false)), h.alerts.queued.toList())
+        assertEquals("a queued text is not a failure", 0, h.alerts.failures.size)
+        val item = h.store.items.values.single()
+        assertEquals("queued", item.status)
+        assertEquals("lost", item.body)
+        assertEquals(0, item.attempts)
         assertTrue(h.pc.nextOfType("text", 400) == null)
         assertTrue(h.arrivals.isEmpty())
     }
@@ -491,5 +520,34 @@ class TextFlowTest {
         h.pc.sendClipboard("g-4", "from the PC")
         h.clipboard.writes.poll(5, SECONDS)!!
         assertTrue(h.sendText("typed on the phone", SendSource.CLIPBOARD) is SendOutcome.Delivered)
+    }
+
+    @Test
+    fun theEchoPathLogsTheSkipWithNoFingerprintForASensitiveTextAndAKeyedFingerprintForAnOrdinaryOne() {
+        app.kinrelay.android.log.LogFingerprint.install(ByteArray(32) { (it + 3).toByte() })
+        try {
+            val h = connect()
+            val lines = CopyOnWriteArrayList<String>()
+            val log = object : KinLog {
+                override fun log(level: Char, component: String, message: String) { lines += message }
+            }
+            val secret = "1234 5678"
+            h.guard.notePeerSet(secret)
+            assertEquals(SendOutcome.Echo, h.sendText(secret, SendSource.CLIPBOARD, sender = h.sender(log = log), sensitive = true))
+            val skip = lines.single()
+            assertTrue("the skip is logged, so the e2e can see the guard work: $skip", skip.startsWith("send skipped (CLIPBOARD): the text is what the PC just set"))
+            assertFalse("no fingerprint, no length, no text for a sensitive one: $skip", skip.contains("len=") || skip.contains("sha=") || skip.contains(secret) || skip.contains(ClipboardGuard.hash(secret).take(8)))
+            lines.clear()
+
+            val ordinary = "not a secret, just text"
+            h.guard.notePeerSet(ordinary)
+            assertEquals(SendOutcome.Echo, h.sendText(ordinary, SendSource.CLIPBOARD, sender = h.sender(log = log)))
+            val line = lines.single()
+            assertTrue(line, line.contains("len=${ordinary.length} sha="))
+            assertFalse("the hash is keyed, not the SHA-256 of the text", line.contains(ClipboardGuard.hash(ordinary).take(8)))
+            assertFalse(line.contains(ordinary))
+        } finally {
+            app.kinrelay.android.log.LogFingerprint.install(null)
+        }
     }
 }

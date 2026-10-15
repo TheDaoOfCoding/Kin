@@ -45,18 +45,19 @@ class LinkController(private val graph: AppGraph) : OutgoingLink, TransferLink {
         return result
     }
 
-    private fun readySession(): LinkConnection? = runtime?.currentSession?.takeIf { it.isReady }
+    /** The current connection, if it is ready and goes to the PC [peerDeviceId] (right after a re-pair the old one is briefly still current). */
+    private fun readySession(peerDeviceId: String): LinkConnection? = runtime?.currentSession.readyFor(peerDeviceId)
 
     /**
      * A connection for a send. If there is none, it starts the service if needed, asks the loop to try now,
      * and waits up to [waitMillis]. It gives up early when waiting can't help (no permission, the PC doesn't
      * trust this phone, versions differ).
      */
-    override suspend fun await(waitMillis: Long): LinkConnection? = connection(waitMillis, kick = true)
+    override suspend fun await(waitMillis: Long, peerDeviceId: String): LinkConnection? = connection(waitMillis, kick = true, peerDeviceId)
 
     /** [await], but with [kick] false it only waits (a transfer waiting for the PC to come back must not reset the backoff). */
-    override suspend fun connection(waitMillis: Long, kick: Boolean): LinkConnection? {
-        readySession()?.let { return it }
+    override suspend fun connection(waitMillis: Long, kick: Boolean, peerDeviceId: String): LinkConnection? {
+        readySession(peerDeviceId)?.let { return it }
         if (graph.pairedDevice() == null) return null
         if (kick) {
             ensureRunning(graph.appContext)
@@ -64,7 +65,7 @@ class LinkController(private val graph: AppGraph) : OutgoingLink, TransferLink {
         }
         val deadline = SystemClock.elapsedRealtime() + waitMillis
         while (true) {
-            readySession()?.let { return it }
+            readySession(peerDeviceId)?.let { return it }
             val state = state.value
             val hopeless = state == LinkState.PermissionNeeded || state == LinkState.PairAgain || state == LinkState.UpdateApp
             if (hopeless || SystemClock.elapsedRealtime() >= deadline) return null
@@ -74,7 +75,6 @@ class LinkController(private val graph: AppGraph) : OutgoingLink, TransferLink {
 
     override fun unreachableReason(): String = UiText.unreachable(state.value)
 
-    override suspend fun peerName(): String? = graph.pairedDevice()?.name
 
     override suspend fun peer(): PeerInfo? = graph.pairedDevice()?.let { PeerInfo(it.deviceId, it.name) }
 
@@ -84,8 +84,8 @@ class LinkController(private val graph: AppGraph) : OutgoingLink, TransferLink {
         graph.log.i("link", "unpairing from '${device.name}'")
         graph.database.devices().delete(device.deviceId)
         // Transfers with this PC end here: nothing of them may go to a PC that is paired later.
-        graph.transfers.onUnpaired(device.deviceId)
-        runtime?.currentSession?.sendUnpairAndClose()
+        graph.peerGone(device.deviceId)
+        runtime?.currentSession?.takeIf { it.peerDeviceId == device.deviceId }?.sendUnpairAndClose()
         context.stopService(Intent(context, LinkService::class.java))
         mutableLastPing.value = null
     }
@@ -94,3 +94,6 @@ class LinkController(private val graph: AppGraph) : OutgoingLink, TransferLink {
         const val POLL_MILLIS = 100L
     }
 }
+
+/** This connection if it is ready and goes to the PC [peerDeviceId]; null otherwise. A connection to another PC is never used for it. */
+fun LinkConnection?.readyFor(peerDeviceId: String): LinkConnection? = this?.takeIf { it.isReady && it.peerDeviceId == peerDeviceId }

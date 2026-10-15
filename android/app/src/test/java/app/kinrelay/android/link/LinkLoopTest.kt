@@ -26,6 +26,7 @@ class LinkLoopTest {
         val ended = CompletableDeferred<SessionEnd>()
         var closedNormally: String? = null
         override val isReady = true
+        override val peerDeviceId = "pc"
         override fun open() = Unit
         override suspend fun awaitEnd() = ended.await()
         override fun closeNormally(reason: String) {
@@ -315,5 +316,68 @@ class LinkLoopTest {
         assertEquals("the disconnect is reported like any other", 1, host.disconnected.size)
         advance(3_600_000)
         assertEquals(1, env.sessions.size)
+    }
+
+    // ---------------------------------------------------------------- the network came back (1.4 review)
+
+    @Test
+    fun aNetworkThatComesBackResetsTheBackoffAndTriesAtOnce() = runTest {
+        val env = Env(this)
+        val loop = loop(env, Host(listOf(known)))
+        loop.start()
+        advance(36_000) // attempts at 0, 5 s and 35 s: the next wait would be 2 minutes
+        assertEquals(listOf(0L, 5_000, 35_000), env.discoverTimes)
+
+        loop.networkChanged()
+        runCurrent()
+
+        assertEquals("tried at once, not after the 2 minutes", listOf(0L, 5_000, 35_000, 36_000), env.discoverTimes)
+        // The steps start again from the first: 5 s, then 30 s. Repeated failures on a network that stays the same still climb.
+        advance(4_999)
+        assertEquals(4, env.discoverTimes.size)
+        advance(1)
+        assertEquals(listOf(0L, 5_000, 35_000, 36_000, 41_000), env.discoverTimes)
+        advance(29_999)
+        assertEquals(5, env.discoverTimes.size)
+        advance(1)
+        assertEquals(71_000L, env.discoverTimes.last())
+        loop.stop("test")
+    }
+
+    @Test
+    fun aNetworkChangeWhileConnectedDoesNothing() = runTest {
+        val env = Env(this).apply { winners = setOf(known) }
+        val loop = loop(env, Host(listOf(known)))
+        loop.start()
+        runCurrent()
+        env.sessions.single().listener.onHelloAccepted(peer)
+        runCurrent()
+
+        loop.networkChanged()
+        runCurrent()
+
+        assertEquals(LinkState.Connected("Desk PC", known), loop.state.value)
+        assertEquals("the connection was not touched", 1, env.sessions.size)
+        assertEquals(null, env.sessions.single().closedNormally)
+        loop.stop("test")
+    }
+
+    @Test
+    fun aNetworkChangeDoesNotWakeALoopThatStoppedOnPurpose() = runTest {
+        val env = Env(this).apply { winners = setOf(known) }
+        val loop = loop(env, Host(listOf(known)))
+        loop.start()
+        runCurrent()
+        // Another phone took this PC's place (4001): the loop waits for the user, not for the network.
+        env.sessions[0].ended.complete(end(4001, helloFor = 1_000))
+        runCurrent()
+        assertEquals(LinkState.Replaced, loop.state.value)
+
+        loop.networkChanged()
+        runCurrent()
+        advance(60_000)
+
+        assertEquals(1, env.sessions.size)
+        loop.stop("test")
     }
 }

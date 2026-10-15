@@ -67,10 +67,17 @@ dependencies {
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.okhttp.mockwebserver)
     testImplementation(libs.okhttp.tls)
+    // A real SQLite on the JVM, for the migration test (the unit tests have no Android SQLite).
+    testImplementation(libs.sqlite.bundled.jvm)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
+}
+
+ksp {
+    // Every database version is exported and checked in: the migration tests read the old schemas from here.
+    arg("room.schemaLocation", "$projectDir/schemas")
 }

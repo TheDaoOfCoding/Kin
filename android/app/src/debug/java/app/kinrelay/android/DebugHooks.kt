@@ -27,4 +27,12 @@ object DebugHooks {
      * (`adb shell run-as app.kinrelay.android touch files/debug-refuse-names`).
      */
     fun refuseNewNames(context: android.content.Context): Boolean = java.io.File(context.filesDir, "debug-refuse-names").exists()
+
+    /**
+     * The phone maker the setup screen picks its guide for. With the file `files/debug-oem` present, its first line is used instead of
+     * `Build.MANUFACTURER`, so the emulator can show the Xiaomi, Samsung ... steps
+     * (`adb shell "run-as app.kinrelay.android sh -c 'echo xiaomi > files/debug-oem'"`).
+     */
+    fun manufacturer(context: android.content.Context): String =
+        java.io.File(context.filesDir, "debug-oem").takeIf { it.exists() }?.readLines()?.firstOrNull()?.trim()?.takeIf { it.isNotEmpty() } ?: android.os.Build.MANUFACTURER
 }

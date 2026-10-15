@@ -103,6 +103,8 @@ class TextAndUrlVectorsTest {
                 alerts = object : app.kinrelay.android.link.Alerts {
                     override fun textFrom(pcName: String, messageId: String, text: String?, openUrl: String?) { shown += Triple(text, openUrl, pcName) }
                     override fun sent(pcName: String?, arrivalMillis: Long) = Unit
+                    override fun queued(pcName: String?, reason: String, afterNoReply: Boolean) = Unit
+                    override fun sentLater(pcName: String?) = Unit
                     override fun sendFailed(title: String, reason: String) = Unit
                     override fun message(text: String) = Unit
                 },

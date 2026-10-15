@@ -166,7 +166,7 @@ class DownloadFlowTest {
                 app.kinrelay.android.data.TransferEntity("have", "down", r.pc.identity.deviceId, "Desk PC", "file", TransferStatus.ACTIVE, 1, null, 40_000, null, null, false),
                 listOf(app.kinrelay.android.data.TransferFileEntity("have", "f1", 0, "done.bin", entry.finalName, "application/octet-stream", 40_000, 40_000, entry.uri, null, false)),
             )
-            r.engine.onLinkReady()
+            r.engine.onLinkReady(r.pcId)
         }
         r.awaitStatus("have", TransferStatus.DONE)
         assertTrue("no GET at all", r.pc.files.calls.none { it.method == "GET" })

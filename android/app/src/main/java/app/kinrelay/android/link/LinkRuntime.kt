@@ -2,6 +2,7 @@ package app.kinrelay.android.link
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
@@ -15,6 +16,7 @@ import app.kinrelay.android.pairing.PairingAddress
 import app.kinrelay.android.protocol.CloseAction
 import app.kinrelay.android.protocol.Hello
 import app.kinrelay.android.protocol.Offer
+import app.kinrelay.android.protocol.OfferHistory
 import app.kinrelay.android.tls.KinTls
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -48,6 +50,17 @@ class LinkRuntime(
     private var network: Network? = null
     private var loop: LinkLoop? = null
     private var stateJob: Job? = null
+
+    // What the current network looked like at the last callback (guarded by [lock]); null until the first one after a switch.
+    private var seenAddresses: Set<String>? = null
+    private var seenValidated: Boolean? = null
+
+    /** True when the addresses of the current network are not what they were at the last callback (the first callback only records them). */
+    private fun noteAddresses(addresses: Set<String>): Boolean = (seenAddresses != null && seenAddresses != addresses).also { seenAddresses = addresses }
+
+    /** True when the network has just become usable (or stopped being) since the last callback. */
+    private fun noteValidated(validated: Boolean): Boolean = (seenValidated != null && seenValidated != validated).also { seenValidated = validated }
+
     private val mutableState = MutableStateFlow<LinkState>(LinkState.NotOnWifi)
     val state: StateFlow<LinkState> = mutableState
 
@@ -62,6 +75,18 @@ class LinkRuntime(
                     switchTo(network)
                 }
             }
+        }
+
+        // The same Wi-Fi network can change under a loop that keeps failing (it got an address, the internet check passed): that is "the network
+        // came back" too, and the next attempt must not wait for a backoff that was earned before.
+        override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+            val addresses = linkProperties.linkAddresses.map { it.address.hostAddress.orEmpty() }.toSet()
+            scope.launch { lock.withLock { if (network == this@LinkRuntime.network && noteAddresses(addresses)) loop?.networkChanged() } }
+        }
+
+        override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+            val validated = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+            scope.launch { lock.withLock { if (network == this@LinkRuntime.network && noteValidated(validated)) loop?.networkChanged() } }
         }
 
         override fun onLost(network: Network) {
@@ -116,6 +141,8 @@ class LinkRuntime(
     private suspend fun switchTo(newNetwork: Network) {
         stopLoop("network changed")
         network = newNetwork
+        seenAddresses = null
+        seenValidated = null
         if (!permissionGranted()) {
             graph.log.w("link", "the Nearby devices permission is missing; not connecting")
             setState(LinkState.PermissionNeeded)
@@ -126,9 +153,10 @@ class LinkRuntime(
         val shortId = DeviceIds.shortIdOfDeviceId(device.deviceId) ?: return
         val environment = DefaultLinkEnvironment(
             tls = KinTls(identity, device.deviceId),
+            peerDeviceId = device.deviceId,
             socketFactory = newNetwork.socketFactory,
             discovery = mdns::discover,
-            local = LocalHello(graph.deviceInfo.name, "android", graph.deviceInfo.appVersion),
+            local = LocalHello(graph.deviceName(), "android", graph.deviceInfo.appVersion),
             dedup = graph.dedup(),
             scope = scope,
             clock = clock,
@@ -171,8 +199,13 @@ class LinkRuntime(
             devices.updateName(device.deviceId, peer.name)
             graph.settings.countConnect()
             graph.log.i("link", "connected to '${peer.name}' via $address")
-            // Transfers an earlier run left behind (or that were waiting for the PC) carry on.
-            graph.transfers.onLinkReady()
+            val ready = currentSession.readyFor(device.deviceId)
+            // The `complete` and `cancel` messages nobody acked go out again first, then the transfers an earlier run left behind (or that
+            // were waiting for the PC) carry on.
+            graph.transfers.onLinkReady(device.deviceId, ready)
+            // The queue goes out after the hello, oldest first (milestone 1.4).
+            ready?.let { graph.flusher.flush(it) }
+            graph.prune()
         }
 
         override suspend fun onDisconnected(end: SessionEnd, action: CloseAction) {
@@ -187,21 +220,28 @@ class LinkRuntime(
             notifications.pingFrom(fromName)
         }
 
-        override suspend fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean, sensitive: Boolean) =
+        override suspend fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean, sensitive: Boolean) {
             incoming.onText(fromName, id, text, isUrl, sensitive)
+            // An explicit text from the PC is history; a sensitive one is never stored, and the automatic clipboard never gets here.
+            runCatching { graph.textOutbox.recordIncoming(device.deviceId, fromName, id, text, isUrl, sensitive) }
+        }
 
         override suspend fun onClipboardReceived(id: String, text: String) = incoming.onClipboard(text)
 
-        override fun acceptOffer(offer: Offer): String? = graph.transfers.acceptOffer(offer)
+        override fun acceptOffer(offer: Offer): String? = graph.transfers.acceptOffer(offer, device.deviceId)
 
-        override suspend fun onOfferReceived(fromName: String, offer: Offer) = graph.transfers.onOffer(fromName, offer)
+        override fun offerHistory(offer: Offer): OfferHistory = graph.transfers.offerHistory(offer, device.deviceId)
 
-        override suspend fun onCancelReceived(transferId: String, reason: String) = graph.transfers.onPeerCancel(transferId, reason)
+        override suspend fun onOfferRepeated(fromName: String, offer: Offer) = graph.transfers.onOfferRepeated(device.deviceId, offer)
+
+        override suspend fun onOfferReceived(fromName: String, offer: Offer) = graph.transfers.onOffer(device.deviceId, fromName, offer)
+
+        override suspend fun onCancelReceived(transferId: String, reason: String) = graph.transfers.onPeerCancel(device.deviceId, transferId, reason)
 
         override suspend fun onPeerUnpaired() {
             graph.log.i("link", "the PC unpaired this phone")
             graph.database.devices().delete(device.deviceId)
-            graph.transfers.onUnpaired(device.deviceId)
+            graph.peerGone(device.deviceId)
             onStopRequested()
         }
     }

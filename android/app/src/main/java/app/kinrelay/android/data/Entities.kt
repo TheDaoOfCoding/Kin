@@ -1,6 +1,8 @@
 package app.kinrelay.android.data
 
+import androidx.room3.ColumnInfo
 import androidx.room3.Entity
+import androidx.room3.Index
 import androidx.room3.PrimaryKey
 
 /** A paired PC (architecture.md, "Storage"). [lastAddresses] is a comma-separated `host:port` list, best first. */
@@ -48,7 +50,10 @@ object TransferStatus {
  * A transfer (architecture.md, "Storage"). [id] is the transfer ID of the wire. [errorCode] is a protocol error code
  * (`disk_full`, `too_large`, `internal`, `not_found`, ...) or one of ours; [message] is the sentence shown to the user.
  */
-@Entity(tableName = "transfers")
+@Entity(
+    tableName = "transfers",
+    indices = [Index(value = ["status", "createdAtMillis"]), Index(value = ["createdAtMillis"]), Index(value = ["owed"])],
+)
 data class TransferEntity(
     @PrimaryKey val id: String,
     val direction: String,
@@ -63,6 +68,28 @@ data class TransferEntity(
     val message: String?,
     /** Downloads only: the PC acked our `complete`. */
     val completeAcked: Boolean,
+    /**
+     * A stable local key that never changes, even when [id] does (a changed source starts over under a new transfer ID). The cached
+     * copies of an upload live in a folder named after it. Equal to [id] when the transfer is created.
+     */
+    @ColumnInfo(defaultValue = "''") val localId: String = id,
+    /** Uploads: the ID of the transfer a user Retry made for the files that never got a `200` (this one stays as it ended). */
+    val retriedAs: String? = null,
+    /** Uploads: how many times the phone tried to send it (the first-try success rate counts the ones that needed more than one). */
+    @ColumnInfo(defaultValue = "0") val attempts: Int = 0,
+    /**
+     * Uploads: the user asked for the next run (Retry) and it hasn't reached its `POST` yet. It survives a Retry made while offline: the
+     * upload parks as queued and the queue flush starts it later, and that run is still the user's (a `404` may then start a new transfer).
+     */
+    @ColumnInfo(defaultValue = "0") val userRetry: Boolean = false,
+    /** Uploads: the PC has answered a `POST` for it (the transfer exists there). A started upload follows the `.part` rule, not the 7-day queue expiry. */
+    @ColumnInfo(defaultValue = "0") val started: Boolean = false,
+    /**
+     * Downloads: a message to the PC that nobody acked yet, kept until it is acked and sent again after every `hello`: `complete`, or
+     * `cancel:<reason>`. Null when nothing is owed. [owedId] is its message ID (the same ID every time it is sent).
+     */
+    val owed: String? = null,
+    val owedId: String? = null,
 )
 
 /**
@@ -85,4 +112,45 @@ data class TransferFileEntity(
     val sourceModifiedMillis: Long?,
     /** Downloads: saved completely (the entry is no longer pending). */
     val finished: Boolean,
+)
+
+/** Where a text came from. [AUTO_CLIPBOARD] is never stored (the automatic sync is not history); it exists so a filter can say so. */
+object TextSource {
+    const val SHARE = "share"
+    const val PROCESS_TEXT = "process_text"
+    const val CLIPBOARD = "clipboard"
+    const val DEBUG = "debug"
+
+    /** A text the PC sent (a hotkey send): history of the receiving side. */
+    const val PC = "pc"
+    const val AUTO_CLIPBOARD = "auto_clipboard"
+}
+
+/**
+ * A text sent to or received from the PC (milestone 1.4): the persistent queue and the history. [id] is the message ID of the wire.
+ * [body] is the text in wire form (LF only). It is dropped for a sensitive text as soon as the item is over (delivered, failed or
+ * canceled), and a received sensitive text is never stored at all.
+ */
+@Entity(
+    tableName = "texts",
+    indices = [Index(value = ["createdAtMillis"]), Index(value = ["direction", "status", "createdAtMillis"])],
+)
+data class TextItemEntity(
+    @PrimaryKey val id: String,
+    val direction: String,
+    val peerDeviceId: String,
+    val peerName: String,
+    val status: String,
+    val createdAtMillis: Long,
+    val finishedAtMillis: Long?,
+    val body: String?,
+    val byteSize: Long,
+    val sensitive: Boolean,
+    val isUrl: Boolean,
+    val source: String,
+    val errorCode: String?,
+    val message: String?,
+    val attempts: Int,
+    /** A failed text that a user Retry sent again as a new message: the ID of the new one (this row stays as it ended). */
+    val retriedAs: String? = null,
 )
