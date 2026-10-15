@@ -1,6 +1,6 @@
 # Phase 1.4 integration: queue, history, notifications on the real Windows app and the real debug APK
 
-Run 2026-10-15 on Windows 11 Pro 10.0.26300 with `kin_api37` (Android 17) and `kin_api29` (Android 10), the release `Kin.exe` (built with `tauri build`; developer mode: `--dev-bind 127.0.0.1`, throwaway data and received folders) and the debug APK. Inputs: [phase-1-4-desktop.md](phase-1-4-desktop.md), [phase-1-4-android.md](phase-1-4-android.md) (both with their "1.4 review fixes"), [protocol.md](../protocol.md) (changelog 45 to 52, Queue). **Nothing is committed.** Script: `tools/e2e-1-4.ps1` (usage at the end). Screenshots: [phase-1-4-integration-screens/](phase-1-4-integration-screens/).
+Run 2026-10-15 on Windows 11 Pro 10.0.26300 with `kin_api37` (Android 17) and `kin_api29` (Android 10), the release `Kin.exe` (built with `tauri build`; developer mode: `--dev-bind 127.0.0.1`, throwaway data and received folders) and the debug APK. Inputs: [phase-1-4-desktop.md](phase-1-4-desktop.md), [phase-1-4-android.md](phase-1-4-android.md) (both with their "1.4 review fixes"), [protocol.md](../protocol.md) (changelog 45 to 52, Queue). **This was run on the uncommitted 1.4 tree; it is committed now (`2f6edd8` protocol, `207bfd9` Windows app, `6435996` Android app, `45cb130` this run's script and results).** Script: `tools/e2e-1-4.ps1` (usage at the end). Screenshots: [phase-1-4-integration-screens/](phase-1-4-integration-screens/).
 
 This is the second version of this document. The first described the run **before** the Opus review fixes. The review fixes changed what the two sides do when the PC cancels an upload while the phone is away (changelog 52), so scenarios S7 and S10 were rewritten; the rest of what changed is under "Since the first run".
 
@@ -68,21 +68,21 @@ Findings of the first run that the review fixes changed: the Android receiver ac
 
 ### Screenshots replaced
 
-The committed pictures showed this person's Windows user name (`C:\Users\SOL 02\…`) and the PC name "EMPIRE". Every picture on both sides was looked at.
+The committed pictures showed this person's real Windows user name (in paths under `C:\Users\<user name>\…`) and the real PC name. (Neutral stand-ins are used for both in the text of this table, and in all the result documents since milestone 1.5.) Every picture on both sides was looked at.
 
 | Picture | Was | Now |
 |---|---|---|
-| `phase-1-4-desktop-screens/02-settings.png` | PC name `EMPIRE` (twice) and `C:\Users\SOL 02\AppData\Local\Temp\kin14-shots-…\received` | recaptured: `DESK-PC`, `C:\Kin-demo\received` |
+| `phase-1-4-desktop-screens/02-settings.png` | the real PC name (twice) and a path under the real user profile (`C:\Users\<user name>\AppData\Local\Temp\kin14-shots-…\received`) | recaptured: `DESK-PC`, `C:\Kin-demo\received` |
 | `phase-1-4-desktop-screens/04-drop.png` | the same received path | recaptured: `C:\Kin-demo\received` |
-| `phase-1-4-desktop-screens/05-pairing.png` | `EMPIRE · 5ZVH-XBPY` | recaptured: `DESK-PC` |
+| `phase-1-4-desktop-screens/05-pairing.png` | the real PC name and the short ID | recaptured: `DESK-PC`. **Recaptured again in 1.5** (see the end of this section): the QR code held the LAN address of the PC |
 | `phase-1-4-desktop-screens/01-history.png`, `03-debug.png` | nothing personal in the window, but the top rows showed pieces of the text of a window behind | the same pictures with the top 3 and bottom 2 pixel rows cut off (the new captures were cut 2 and 2). The debug window shows the Windows network name "Network 4" (a generic name, Public); it was kept |
-| `phase-1-4-integration-screens/11-text-burst.png`, `11-transfer-storm.png` | "20 texts from EMPIRE", "Connected to EMPIRE", "File from EMPIRE …" | recaptured by the run: `DESK-PC` |
-| `phase-1-2-integration-screens/01-confirm-pairing.png` | `EMPIRE` (tracked, committed before) | recaptured by the `e2e-1-2` run: `DESK-PC` |
-| `phase-1-2-android-screens/10-api29-confirm-screen.png` | "This will replace EMPIRE." | the name pixelated (taken on a run that can't be repeated as it was) |
-| `phase-1-4-android-screens/29-02-history.png` | "To / From EMPIRE" on eight rows | the name pixelated on those rows |
-| `phase-1-4-android-screens/29-04-debug.png` | `EMPIRE` in the recent errors and the connection history | the text under "Recent errors" and "Connections" pixelated |
+| `phase-1-4-integration-screens/11-text-burst.png`, `11-transfer-storm.png` | "20 texts from <the real PC name>", "Connected to <the real PC name>", "File from <the real PC name> …" | recaptured by the run: `DESK-PC` |
+| `phase-1-2-integration-screens/01-confirm-pairing.png` | the real PC name (tracked, committed before) | recaptured by the `e2e-1-2` run: `DESK-PC` |
+| `phase-1-2-android-screens/10-api29-confirm-screen.png` | "This will replace <the real PC name>." | the name pixelated (taken on a run that can't be repeated as it was) |
+| `phase-1-4-android-screens/29-02-history.png` | "To / From <the real PC name>" on eight rows | the name pixelated on those rows |
+| `phase-1-4-android-screens/29-04-debug.png` | the real PC name in the recent errors and the connection history | the text under "Recent errors" and "Connections" pixelated |
 
-No picture shows an IP address (the emulator's `10.0.2.2` is not one), a user name or a path after this. The other pictures (`phase-1-2-android-screens`, `phase-1-3-android-screens`, the rest of `phase-1-4-android-screens`) show "Fake PC", the emulator's own names (`AndroidWifi`, `T-Mobile, 5G`, `sdk_gphone64_x86_64`) and nothing else. **Not done:** the text of the older result documents still says "EMPIRE" (e.g. `phase-1-1-integration.md`, `phase-1-2-integration.md`) and `phase-1-4-desktop.md` names `C:\Users\SOL02~1` in the 8.3 test; these are words, not pictures.
+**Corrected in milestone 1.5** (the first version of this paragraph said that no picture shows an IP address, and that was wrong for one picture): the QR code of `phase-1-4-desktop-screens/05-pairing.png` held the pairing link, and the pairing link holds the PC's LAN address, so the picture carried a real address (the QR code is not readable by eye, but any phone can read it). `desktop/capture-windows.ps1` now starts Kin with `--dev-qr-address 10.0.2.2`, so the QR code holds the emulator's name for the PC and nothing of the PC it was taken on, and the picture was recaptured with it (PC name `DESK-PC`). **No other picture shows an address.** The text under `phase-1-4-android-screens/29-05-export-share-sheet.png` ("Recent errors") carried the real PC name twice; it is pixelated now. After this no picture shows an IP address (other than the emulator's `10.0.2.2`), a user name or a path. The other pictures (`phase-1-2-android-screens`, `phase-1-3-android-screens`, the rest of `phase-1-4-android-screens`) show "Fake PC", the emulator's own names (`AndroidWifi`, `T-Mobile, 5G`, `sdk_gphone64_x86_64`) and nothing else. The words of the older result documents were made neutral in milestone 1.5 too (the PC name is `DESK-PC`, a user folder is `C:\Users\Anna Berg`, its 8.3 form `ANNABE~1`).
 
 ## Bugs fixed (first run, still true)
 

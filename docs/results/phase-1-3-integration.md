@@ -1,6 +1,6 @@
 # Phase 1.3 result: integration (real Windows app + real Android app, files in both directions)
 
-Run 2026-10-15 by the integration agent. The two halves of milestone 1.3 were built independently from [protocol.md](../protocol.md), by [the desktop agent](phase-1-3-desktop.md) and [the Android agent](phase-1-3-android.md). This is the first time they moved files to each other. Nothing is committed.
+Run 2026-10-15 by the integration agent. The two halves of milestone 1.3 were built independently from [protocol.md](../protocol.md), by [the desktop agent](phase-1-3-desktop.md) and [the Android agent](phase-1-3-android.md). This is the first time they moved files to each other. (This was written on the uncommitted tree; it is committed since.)
 
 **Setup:** the real release `Kin.exe` (rebuilt twice here, see "Bugs fixed") in developer mode (`--dev-bind 127.0.0.1 --dev-qr-address 10.0.2.2`, loopback only, a throwaway data dir, **a throwaway `--dev-received-dir`**, never `%APPDATA%\Kin` or the real Downloads), and the real debug APK, on `kin_api37` (Android 17) and `kin_api29` (Android 10). The PC is reached as `10.0.2.2:47821`. The real Windows clipboard was used and **saved and restored in every format** by every run (the user's clipboard held HTML and Chromium's own formats: 7 formats, put back each time).
 

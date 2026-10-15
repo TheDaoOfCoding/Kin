@@ -1,6 +1,6 @@
 # Phase 1.4: Windows app (queue, history, settings, debug)
 
-Built and measured 2026-10-15 on Windows 11 Pro 10.0.26300, Ryzen 9 7900X, 31 GB RAM (the PC of [phase-1-1-desktop.md](phase-1-1-desktop.md)). Code is in `desktop/` (see [desktop/README.md](../../desktop/README.md)), the spec and vectors in `docs/protocol.md` and `protocol/`. This is the Windows half of milestone 1.4 ([phase-1-mvp.md](../phases/phase-1-mvp.md)); the Android half was built in parallel from the same spec. **Nothing is committed.** `android/` was not touched.
+Built and measured 2026-10-15 on Windows 11 Pro 10.0.26300, Ryzen 9 7900X, 31 GB RAM (the PC of [phase-1-1-desktop.md](phase-1-1-desktop.md)). Code is in `desktop/` (see [desktop/README.md](../../desktop/README.md)), the spec and vectors in `docs/protocol.md` and `protocol/`. This is the Windows half of milestone 1.4 ([phase-1-mvp.md](../phases/phase-1-mvp.md)); the Android half was built in parallel from the same spec. (Written on the uncommitted tree; committed since in `2f6edd8` and `207bfd9`.) `android/` was not touched.
 
 **The Opus review blocked this milestone; the fixes are in [1.4 review fixes](#14-review-fixes) at the end (spec item 52, 356 tests, 6,387 vector checks, 64 real-app checks). The text below is the state before them.**
 
@@ -139,7 +139,7 @@ The target is under 30 MB ([targets.md](../targets.md) #5). The windows are dest
 
 ## 1.4 review fixes
 
-Done 2026-10-15 on the same uncommitted tree, after the reviewer's findings on the desktop, the spec and the tooling (the Android findings are the other agent's). Nothing is committed, nothing of `android/` was touched. `file:line` are in the tree as it is now.
+Done 2026-10-15 on the same uncommitted tree (committed since in `2f6edd8` and `207bfd9`), after the reviewer's findings on the desktop, the spec and the tooling (the Android findings are the other agent's). Nothing of `android/` was touched. `file:line` are in the tree as it is now.
 
 ### Blocking
 
@@ -214,7 +214,7 @@ Done 2026-10-15 on the same uncommitted tree, after the reviewer's findings on t
 
 ### The exported zip, opened
 
-A real run for the purpose (not the repo's script): the release `Kin.exe`, `--data-dir` under the **8.3 form of %TEMP%** (`C:\Users\SOL02~1\AppData\Local\Temp\kin-inspect-…`, so the logs hold the short path), the fake phone, an upload of `Secret Plan 2026.docx`, a PC → phone send of `My Private Notes.txt`, then `--dev-export-logs`, then the zip opened with .NET `ZipFile`: entries `README.txt`, `logs/kin.log` (26 lines), `status.json`, `debug.json`, 6,592 bytes. **Absent:** the long profile path (`C:\Users\SOL 02`), the user name, the 8.3 folder and the `SOL02~1` part in any case, any `C:\Users\<name>` other than `<user>`, any IPv4 address, both file names, any `<name>.part` path, the network name (`Network 4`; `debug.json` has `"networks": [ { "category": "Public" } ]`), the PC name, `log-key`, any token or key. **Present instead:** `data dir %USERPROFILE%\AppData\Local\Temp\kin-inspect-…\data`, `<ip>`, `<phone>`, device IDs cut to 8 characters, `1 file from <phone> (21 characters of names shown)`. The folder and the processes were removed afterwards.
+A real run for the purpose (not the repo's script): the release `Kin.exe`, `--data-dir` under the **8.3 form of %TEMP%** (`C:\Users\ANNABE~1\AppData\Local\Temp\kin-inspect-…`, so the logs hold the short path), the fake phone, an upload of `Secret Plan 2026.docx`, a PC → phone send of `My Private Notes.txt`, then `--dev-export-logs`, then the zip opened with .NET `ZipFile`: entries `README.txt`, `logs/kin.log` (26 lines), `status.json`, `debug.json`, 6,592 bytes. **Absent:** the long profile path (`C:\Users\Anna Berg`), the user name, the 8.3 folder and the `ANNABE~1` part in any case, any `C:\Users\<name>` other than `<user>`, any IPv4 address, both file names, any `<name>.part` path, the network name (`Network 4`; `debug.json` has `"networks": [ { "category": "Public" } ]`), the PC name, `log-key`, any token or key. **Present instead:** `data dir %USERPROFILE%\AppData\Local\Temp\kin-inspect-…\data`, `<ip>`, `<phone>`, device IDs cut to 8 characters, `1 file from <phone> (21 characters of names shown)`. The folder and the processes were removed afterwards.
 
 ### Rulings I made, for the reviewer
 

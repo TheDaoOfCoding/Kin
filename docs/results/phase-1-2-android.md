@@ -22,7 +22,7 @@ Summary: the six fixes the 1.1 review required are done, and the phone now recei
 | 5e | **Fixture duplicate removed.** The three `android-generated-cert.*` files in `app/src/test/resources/fixtures/` are deleted. `CertificateBuilderTest` reads `protocol/fixtures/android-client.{der,json}` (the `protocol/` folder is already a test resource directory). The exporter now writes to `app/build/fixture-export/` (copy by hand). | `CertificateBuilderTest.kt`, `README.md` | `committedFixtureIsAValidProfileCertificateWithItsExpectedId` |
 | 6 | **Docs and the permission state.** `ACCESS_LOCAL_NETWORK` is risk **R12** in `docs/risks.md`, and "denied / revoked later / older Android" are in the Phase 1 test plan (`docs/phases/phase-1-mvp.md`, "Permission cases"). In the app: requested when it opens and before a pairing (as in 1.1), a new `LinkState.PermissionNeeded`: no connection is attempted while the permission is missing, and Home, the first-run screen and the service notification say **"Nearby devices permission needed"** with an "Allow in settings" button. It is re-checked when the app opens (and the loop retried), and also while connection attempts fail, so a revoke while running shows up. | `link/LinkRuntime.kt:120`, `:151`; `ui/HomeScreen.kt` (`LocalNetworkCard`); `MainActivity.kt` | emulator API 37: `pm revoke` gives the state (screenshot 08), `pm grant` and opening the app reconnects. Not unit-tested (Android classes) |
 
-**One more bug found and fixed on the way:** pairing a *different* PC while the service was running kept the connection loop of the old PC (its ID is pinned in the loop's TLS setup), so the new PC never connected until the service restarted. Now `LinkController.devicePaired()` rebuilds the loop (`link/LinkRuntime.kt:101`, `pairing/PairingController.kt:108`). It showed up on the API 29 emulator, which still had the integration run's PC ("EMPIRE") paired, and it was reachable before 1.2 too (not by any UI flow in 1.1, now by a confirmed link).
+**One more bug found and fixed on the way:** pairing a *different* PC while the service was running kept the connection loop of the old PC (its ID is pinned in the loop's TLS setup), so the new PC never connected until the service restarted. Now `LinkController.devicePaired()` rebuilds the loop (`link/LinkRuntime.kt:101`, `pairing/PairingController.kt:108`). It showed up on the API 29 emulator, which still had the integration run's PC ("DESK-PC") paired, and it was reachable before 1.2 too (not by any UI flow in 1.1, now by a confirmed link).
 
 ## The 1.2 features
 
@@ -89,7 +89,7 @@ Both runs: debug APK, fake PC on `127.0.0.1:47831` (reached as `10.0.2.2`), noth
 
 | Check | API 37 (`kin_api37`) | API 29 (`kin_api29`) |
 |---|---|---|
-| Deep link opens the **confirmation screen**, nothing is contacted (the fake PC saw 0 `POST /v1/pair`) | yes (01, 03) | yes (10); it also showed "This will replace EMPIRE" (a PC left paired by the integration run) |
+| Deep link opens the **confirmation screen**, nothing is contacted (the fake PC saw 0 `POST /v1/pair`) | yes (01, 03) | yes (10); it also showed "This will replace DESK-PC" (a PC left paired by the integration run) |
 | Cancel contacts nothing; Confirm pairs and connects | yes | yes (after the re-pair fix above) |
 | Failed pairing while paired: card on Home, PC kept, Dismiss | yes (04) | not repeated |
 | PC `clipboard` sets the real clipboard, acked (read with `DebugClipboardActivity`) | yes, `len=21` including an emoji and `é` | yes |

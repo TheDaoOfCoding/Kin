@@ -1,6 +1,6 @@
 # Phase 1.1 result: integration (real Windows app + real Android app)
 
-Run 2026-10-14 by the integration agent. The two halves of milestone 1.1 were built independently from [protocol.md](../protocol.md), by [the desktop agent](phase-1-1-desktop.md) and [the Android agent](phase-1-1-android.md). This is the first time they talked to each other. Nothing is committed.
+Run 2026-10-14 by the integration agent. The two halves of milestone 1.1 were built independently from [protocol.md](../protocol.md), by [the desktop agent](phase-1-1-desktop.md) and [the Android agent](phase-1-1-android.md). This is the first time they talked to each other. (This was written on the uncommitted tree; it is committed since.)
 
 **Setup:** the real release `Kin.exe` (`desktop/build.ps1` output, unchanged) in developer mode (`--dev-bind 127.0.0.1 --dev-qr-address 10.0.2.2`, loopback only, a throwaway data dir, never `%APPDATA%\Kin`), and the real debug APK, on the `kin_api37` (Android 17) and `kin_api29` (Android 10) emulators. The PC is reached as `10.0.2.2:47821`. `ACCESS_LOCAL_NETWORK` was granted with `adb shell pm grant` on API 37.
 
@@ -14,7 +14,7 @@ Run 2026-10-14 by the integration agent. The two halves of milestone 1.1 were bu
 | 2a | Pair through the deep link | 37 | **PASS** | Link opened, phone "Connected", PC `phone_connected`, 3.6 s from the link to connected (cold app, two TLS handshakes) |
 | 2b | Device rows match | 37 | **PASS** | PC ID on the phone `laxXyRYe…` = `status.json deviceId`; phone ID `2RQ3ypsR…` = the PC's `devices[0].deviceId`; Home shows `PC ID: SWWF-PSIW` and `This phone: 3EKD-PSU3`, and both short IDs were recomputed from the full IDs independently |
 | 2c | Ping phone → PC | 37 | **PASS** | RTT 9.3 ms (first), 8.3 ms; PC logs `toast: Ping from sdk_gphone64_x86_64` |
-| 2d | Ping PC → phone | 37 | **PASS** | RTT 4.1 ms (`Ping: 4 ms`, `lastPing.rttMs` in `status.json`); phone notification "Ping from EMPIRE" (`dumpsys notification`) and `link: ping received from 'EMPIRE'` |
+| 2d | Ping PC → phone | 37 | **PASS** | RTT 4.1 ms (`Ping: 4 ms`, `lastPing.rttMs` in `status.json`); phone notification "Ping from DESK-PC" (`dumpsys notification`) and `link: ping received from 'DESK-PC'` |
 | 2e | Kill the desktop, restart it: the phone reconnects through its backoff | 37 | **PASS** | PC killed (`Stop-Process -Force`), the phone saw `Connection reset` and logged `next attempt in 5 s` (first backoff step). The PC was listening again 4.0 s after the kill, and the phone was connected **6.1 s after the kill, 2.1 s after the PC was listening again** (the 5 s step ran out 2 s later) |
 | 2f | Emulator Wi-Fi off, then on | 37 | **PASS** | `Wi-Fi lost` → `closing with 1000 (Wi-Fi lost)` → state `NotOnWifi` (read with `STATE`). `Wi-Fi available` → connected **0.1 s later** (a new loop per network, no backoff). See open issue 1: the PC didn't learn the phone had gone |
 | 2g | `kill -9` of the app process | 37 | **PASS** | `START_STICKY` restarted the service (new pid, `isForeground=true types=0x10`), `kill detected`, `kills=1`, connected again 1.9 s after the kill. The PC logged the broken connection (`peer closed connection without sending TLS close_notify`) and accepted the new one |
