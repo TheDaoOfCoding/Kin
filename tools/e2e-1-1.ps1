@@ -3,6 +3,7 @@
 # Exits 0 if every check passed, 1 otherwise. Later milestones extend the section marked "EXTEND HERE".
 # -Milestone 1.2 adds the text, link and clipboard scenarios of tools\e2e-1-2-scenarios.ps1 (use tools\e2e-1-2.ps1, which sets it).
 # -Milestone 1.3 adds the file scenarios of tools\e2e-1-3-scenarios.ps1 (use tools\e2e-1-3.ps1, which sets it).
+# -Milestone 1.4 adds the queue, expiry, 404 and notification scenarios of tools\e2e-1-4-scenarios.ps1 (use tools\e2e-1-4.ps1, which sets it).
 #
 #   tools\e2e-1-1.ps1                      # kin_api37 (Android 17)
 #   tools\e2e-1-1.ps1 -Avd kin_api29       # Android 10
@@ -17,15 +18,35 @@ param(
     [string]$Avd = 'kin_api37',
     [switch]$Build,
     [switch]$KeepRunning,
-    [ValidateSet('1.1', '1.2', '1.3')][string]$Milestone = '1.1',
+    [ValidateSet('1.1', '1.2', '1.3', '1.4')][string]$Milestone = '1.1',
     [switch]$DiscardClipboard,   # 1.2: go on although the PC clipboard holds more than plain text (it can't be put back, and is lost)
-    [string[]]$Only = @(),       # 1.3: run only these scenarios (S1, S2, ...), for debugging
+    [string[]]$Only = @(),       # 1.3, 1.4: run only these scenarios (S1, S2, ...), for debugging
     [int]$BigMb = 40,            # 1.3: size of the "big file" with one drop (the emulator does about 2 MB/s; 200 to 500 is for a manual run)
-    [string]$ScreenshotDir = (Join-Path $PSScriptRoot '..\docs\results\phase-1-2-integration-screens'),
+    [int]$BurstTexts = 20,       # 1.4: texts in the notification burst (the full check is 60)
+    [int]$BurstFiles = 6,        # 1.4: transfers in the notification storm (the full check is 15)
+    [string]$ScreenshotDir = '',   # default: an ignored folder in %LOCALAPPDATA%\Temp\kin-e2e-screens\phase-1-<n>; with -UpdateScreens: docs\results\phase-1-<n>-integration-screens
+    [switch]$UpdateScreens,        # write the pictures to the tracked docs\results folder of the milestone (a run never overwrites a committed picture without this)
     [string]$Kin = (Join-Path $PSScriptRoot '..\desktop\src-tauri\target\release\Kin.exe'),
     [string]$Apk = (Join-Path $PSScriptRoot '..\android\app\build\outputs\apk\debug\app-debug.apk')
 )
+# Kin takes the PC's name from COMPUTERNAME and shows it on the phone, so every picture of a notification or a pairing screen would carry the real
+# name of this computer. A neutral name for the run (put back at the end).
+$script:OrigComputerName = $env:COMPUTERNAME
+$script:PcName = 'DESK-PC'
+$env:COMPUTERNAME = $script:PcName
 $ErrorActionPreference = 'Continue'   # Windows PowerShell 5.1 turns native stderr text into errors under 'Stop'
+# Where the pictures go. The tracked folders of docs\results hold the pictures of the reports: a run writes there only when asked (-UpdateScreens),
+# otherwise to a folder in the temp area that no repository tracks. (An explicit -ScreenshotDir that points into docs\results is treated the same.)
+$TrackedScreens = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\docs\results'))
+$TempScreens = Join-Path $env:LOCALAPPDATA ('Temp\kin-e2e-screens\phase-1-{0}' -f $Milestone.Split('.')[1])
+if (-not $ScreenshotDir) {
+    $ScreenshotDir = if ($UpdateScreens) { Join-Path $PSScriptRoot ('..\docs\results\phase-1-{0}-integration-screens' -f $Milestone.Split('.')[1]) } else { $TempScreens }
+}
+$ScreenshotDir = [IO.Path]::GetFullPath($ScreenshotDir)
+if (-not $UpdateScreens -and $ScreenshotDir.StartsWith($TrackedScreens, [StringComparison]::OrdinalIgnoreCase)) {
+    Write-Host "NOTE: $ScreenshotDir is a tracked folder; the pictures go to $TempScreens instead (pass -UpdateScreens to write there)"
+    $ScreenshotDir = $TempScreens
+}
 
 foreach ($name in 'ANDROID_HOME', 'JAVA_HOME') {
     if (-not (Get-Item "env:$name" -ErrorAction SilentlyContinue)) {
@@ -75,14 +96,15 @@ function Phone-Cmd([string]$Command, [string]$Wait = '') {
     return $script:l
 }
 function Parse-Rtt($line) { if ($line -match 'Rtt\(millis=([0-9.]+)\)') { [double]$Matches[1] } else { $null } }
-if ($Milestone -in '1.2', '1.3') { . (Join-Path $PSScriptRoot 'e2e-1-2-scenarios.ps1') }   # 1.3 reuses its helpers
-if ($Milestone -eq '1.3') { . (Join-Path $PSScriptRoot 'e2e-1-3-scenarios.ps1') }
+if ($Milestone -in '1.2', '1.3', '1.4') { . (Join-Path $PSScriptRoot 'e2e-1-2-scenarios.ps1') }   # 1.3 and 1.4 reuse its helpers
+if ($Milestone -in '1.3', '1.4') { . (Join-Path $PSScriptRoot 'e2e-1-3-scenarios.ps1') }          # ... and those of 1.3
+if ($Milestone -eq '1.4') { . (Join-Path $PSScriptRoot 'e2e-1-4-scenarios.ps1') }
 function Phone-State { $l = Phone-Cmd 'STATE'; $h = @{}; if ($l) { foreach ($m in [regex]::Matches($l, '(\w+)=(\S+)')) { $h[$m.Groups[1].Value] = $m.Groups[2].Value } }; $h }
 
 $started = @{ Emulator = $false; Kin = $false }
 try {
     if ($Milestone -eq '1.2') { Save-PcClipboard $DiscardClipboard.IsPresent }   # before anything can touch it
-    if ($Milestone -eq '1.3') { Save-AllClipboard }                               # every format: 1.3 puts an image on it
+    if ($Milestone -in '1.3', '1.4') { Save-AllClipboard }                        # every format: 1.3 puts an image on it
     if ($Build) {
         Say 'building Kin.exe'
         Push-Location (Join-Path $Repo 'desktop'); . .\_env.ps1
@@ -99,6 +121,12 @@ try {
     }
     $Kin = (Resolve-Path $Kin -ErrorAction Stop).Path
     $Apk = (Resolve-Path $Apk -ErrorAction Stop).Path
+    # `cargo test --release` (and `cargo build --release`) overwrites target\release\Kin.exe with a build that loads the dev server instead of its
+    # own pages. `tauri build` writes the exe and then the installer a moment later, so an exe that is newer than the installer is not from it.
+    $installer = Get-ChildItem (Join-Path (Split-Path $Kin) 'bundle\nsis') -Filter 'Kin_*_x64-setup.exe' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1
+    if (-not $installer -or (Get-Item $Kin).LastWriteTime -gt $installer.LastWriteTime.AddSeconds(30)) {
+        throw 'Kin.exe is not from `tauri build` (the installer in bundle\nsis is missing or older: `cargo test --release` replaces the exe with a dev-server build). Run with -Build, or desktop\build.ps1.'
+    }
     if (Get-Process Kin -ErrorAction SilentlyContinue) { throw 'Kin.exe is already running; quit it first (a dev instance and a normal one share the single-instance slot).' }
 
     # ---- emulator, install, permission
@@ -111,12 +139,12 @@ try {
     Say "API $sdk"
     # Files of an earlier install stay in Pictures/Kin, Movies/Kin and Download/Kin but the new install can't see (or replace) them, and a same-named
     # file then clashes with the new one: delete what the old install made while it can still do it.
-    if ($Milestone -eq '1.3' -and ((A shell pm path $Pkg | Out-String) -match 'package:')) {
+    if ($Milestone -in '1.3', '1.4' -and ((A shell pm path $Pkg | Out-String) -match 'package:')) {
         A shell am broadcast -a app.kinrelay.android.debug.DELETE_RECEIVED -n "$Pkg/.debug.DebugCommandReceiver" | Out-Null
         Start-Sleep -Seconds 3
     }
     A uninstall $Pkg 2>&1 | Out-Null
-    if ($Milestone -eq '1.3') {
+    if ($Milestone -in '1.3', '1.4') {
         # ... and whatever an earlier run that died left behind (the shell may delete what no app can see)
         @'
 rm -rf /sdcard/Download/Kin /sdcard/Pictures/Kin /sdcard/Movies/Kin
@@ -186,6 +214,7 @@ content delete --uri content://media/external/file --where "_data LIKE '/storage
     # ---- EXTEND HERE: later milestones add their scenarios (text, clipboard, files, ...) before the unpair.
     if ($Milestone -eq '1.2') { Run-Milestone12 }
     if ($Milestone -eq '1.3') { Run-Milestone13 }
+    if ($Milestone -eq '1.4') { Run-Milestone14 }
 
     # ---- unpair from the phone: the PC cleans up
     Phone-Cmd 'UNPAIR' | Out-Null
@@ -197,7 +226,8 @@ catch {
     $script:Failures.Add("exception: $_")
 }
 finally {
-    if ($Milestone -eq '1.3' -and $started.Emulator) { try { Clear-Phone13 } catch { Say "could not clean the phone: $_" } }   # the test files, before the emulator goes
+    # (not when the emulator never came up: adb would wait for a device for ever)
+    if ($Milestone -in '1.3', '1.4' -and $started.Emulator -and ((A get-state | Out-String) -match 'device')) { try { Clear-Phone13 } catch { Say "could not clean the phone: $_" } }   # the test files, before the emulator goes
     if (-not $KeepRunning) {
         Say 'tearing down'
         if ($started.Kin) {
@@ -208,10 +238,12 @@ finally {
         if ($started.Emulator) { Invoke-EmuScript 'stop.ps1' @('-All') 120 | Out-Null }
         & $Adb kill-server 2>$null | Out-Null
     }
+    $env:COMPUTERNAME = $script:OrigComputerName
     # After Kin has quit, so that the restored text is not synced to the phone. Also with -KeepRunning: it is the user's clipboard.
     if ($Milestone -eq '1.2') { Restore-PcClipboard }
-    if ($Milestone -eq '1.3') { Restore-AllClipboard }
-    if ($Milestone -eq '1.3') { Remove-Work13 }
+    if ($Milestone -in '1.3', '1.4') { Restore-AllClipboard }
+    if ($Milestone -in '1.3', '1.4') { Remove-Work13 }
+    if ($Milestone -eq '1.4') { Remove-Work14 }
     $shouldKeep = $script:Failures.Count -gt 0 -or $KeepRunning
     if ($shouldKeep -and (Test-Path $Data)) { Say "data and logs kept in $Data" }
     elseif (Test-Path $Data) { try { [IO.Directory]::Delete($Data, $true) } catch { Say "could not remove $Data" } }

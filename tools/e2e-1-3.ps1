@@ -18,6 +18,8 @@ param(
     [switch]$KeepRunning,
     [string[]]$Only = @(),
     [int]$BigMb = 40,
+    [switch]$UpdateScreens,
+    [string]$ScreenshotDir,
     [string]$Kin,
     [string]$Apk
 )

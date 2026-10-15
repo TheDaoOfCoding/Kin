@@ -97,8 +97,9 @@ function Phone-Transfers {
         $lines = @(A logcat -d -s KinRelay)
     }
     foreach ($l in $lines) {
-        if ($l -match 'CMD TRANSFER (\S+) (up|down) (\w+) (\d+)/(\d+) files=(\d+) names=(.*) err=(\S*)\s*$') {
-            [pscustomobject]@{ Id = $Matches[1]; Dir = $Matches[2]; Status = $Matches[3]; Done = [long]$Matches[4]; Total = [long]$Matches[5]; Files = [int]$Matches[6]; Names = $Matches[7]; Err = $Matches[8] }
+        # 1.4 added ` retriedAs=<id or null>` and then ` userRetry= started= owed= completeAcked=`: a field that is added later must not break the parse
+        if ($l -match 'CMD TRANSFER (\S+) (up|down) (\w+) (\d+)/(\d+) files=(\d+) names=(.*) err=(\S*)(?: retriedAs=(\S*))?(?: .*)?$') {
+            [pscustomobject]@{ Id = $Matches[1]; Dir = $Matches[2]; Status = $Matches[3]; Done = [long]$Matches[4]; Total = [long]$Matches[5]; Files = [int]$Matches[6]; Names = $Matches[7]; Err = $Matches[8]; RetriedAs = $Matches[9] }
         }
     }
 }

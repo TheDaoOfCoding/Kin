@@ -15,6 +15,7 @@ param(
     [switch]$Build,
     [switch]$KeepRunning,
     [switch]$DiscardClipboard,
+    [switch]$UpdateScreens,
     [string]$Kin,
     [string]$Apk,
     [string]$ScreenshotDir

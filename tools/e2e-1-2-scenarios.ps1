@@ -66,6 +66,8 @@ function Wait-PhoneClip([string]$Expected, [int]$Seconds = 6) {
 function Phone-Notification([string]$Tag) {
     $d = A shell dumpsys notification --noredact | Out-String
     $r = ($d -split 'NotificationRecord\(') | Where-Object { $_ -match "tag=$([regex]::Escape($Tag)) " } | Select-Object -First 1
+    # 1.4: the texts from the PC are one notification (id 3, no tag) that the app updates: "Text from <PC>" for one text, "N texts from <PC>" after that
+    if (-not $r) { $r = ($d -split 'NotificationRecord\(') | Where-Object { $_ -match 'pkg=app\.kinrelay\.android ' -and $_ -match ' id=3 tag=null ' } | Select-Object -First 1 }
     if (-not $r) { return $null }
     $actions = @()
     if ($r -match '(?s)actions=\{(.*?)\}\s+extras') { $actions = @([regex]::Matches($Matches[1], '\[\d+\] "([^"]+)"') | ForEach-Object { $_.Groups[1].Value }) }
@@ -101,7 +103,14 @@ function Copy-OnPc([string]$Text, [int]$TimeoutSec = 8) {
     if ($lc) { $lc | Add-Member -NotePropertyName WallMs -NotePropertyValue $ms -Force }
     $lc
 }
+function Phone-SeenTexts {
+    # 1.4: opening the app starts the text notification afresh (the next text is "Text from <PC>" again, not "2 texts from <PC>")
+    A shell input keyevent KEYCODE_HOME | Out-Null
+    A shell am start -n "$Pkg/.MainActivity" | Out-Null
+    Start-Sleep -Milliseconds 800
+}
 function Hotkey-Send([int]$TimeoutSec = 8) {
+    Phone-SeenTexts
     $before = (Get-Status).lastSent.text.id
     & $Kin --send-clipboard
     Wait-Until { $script:lt = (Get-Status).lastSent.text; $script:lt -and $script:lt.id -ne $before -and $script:lt.result } $TimeoutSec | Out-Null
@@ -115,20 +124,26 @@ function Clipboard-Alias { A shell am start -n "$Pkg/.debug.SendClipboardAlias" 
 function Set-PhoneClip([string]$Text) { A logcat -c | Out-Null; A shell "am broadcast -a app.kinrelay.android.debug.SET_CLIPBOARD -n $Pkg/.debug.DebugCommandReceiver --es text '$Text'" | Out-Null; Start-Sleep -Milliseconds 500 }
 # The "Send clipboard" button of the service notification, tapped for real: shade down, the notification expanded, a tap.
 function Tap-NotificationAction {
-    for ($try = 0; $try -lt 3; $try++) {
+    # This used to fail now and then: the shade opens at a speed that depends on the emulator, the first uiautomator dump of a just-opened shade can
+    # be empty, and the service notification is sometimes collapsed. So: start from a quiet home screen, wait for the shade by looking (up to 5 s)
+    # instead of for a fixed time, expand the notification's row when it is collapsed, and try five times with the shade closed in between.
+    for ($try = 0; $try -lt 5; $try++) {
+        A shell cmd statusbar collapse | Out-Null
+        A shell input keyevent KEYCODE_HOME | Out-Null
+        Start-Sleep -Milliseconds 700
         A shell cmd statusbar expand-notifications | Out-Null
-        Start-Sleep -Milliseconds 1500
-        if (Tap-UiText 'Send clipboard' 1) { A shell cmd statusbar collapse | Out-Null; return $true }
+        $found = Wait-Until { Tap-UiText 'Send clipboard' 1 } 5
+        if ($found) { Start-Sleep -Milliseconds 300; A shell cmd statusbar collapse | Out-Null; return $true }
         # the service notification is collapsed: find its row and pull it down
         A shell uiautomator dump /sdcard/kin-e2e-ui.xml | Out-Null
         $x = A shell cat /sdcard/kin-e2e-ui.xml | Out-String
-        if ($x -match 'text="Connected to [^"]*"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"') {
+        if ($x -match 'text="Connected to [^"]*"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"' -or $x -match 'text="Kin"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"') {
             $y = [int]$Matches[2]
             A shell input swipe 600 $y 600 ($y + 320) 300 | Out-Null
-            Start-Sleep -Milliseconds 1200
-            if (Tap-UiText 'Send clipboard' 1) { A shell cmd statusbar collapse | Out-Null; return $true }
+            if (Wait-Until { Tap-UiText 'Send clipboard' 1 } 3) { Start-Sleep -Milliseconds 300; A shell cmd statusbar collapse | Out-Null; return $true }
         }
         A shell cmd statusbar collapse | Out-Null
+        Start-Sleep -Seconds 1
     }
     return $false
 }
@@ -303,7 +318,7 @@ function Run-Milestone12 {
     $tx = Hotkey-Send 15
     Check 'S8 hotkey text of exactly 128 KiB is sent as a text message and acked' ($tx -and $tx.result -eq 'acked' -and $tx.chars -eq 131072 -and -not $tx.asFile) "tap to ack $($tx.tapToAckMs) ms asFile=$($tx.asFile)"
     $script:Timings['S8 hotkey text of 131,072 characters (tap to ack)'] = "$($tx.tapToAckMs) ms"
-    Check 'S8 ... and the phone copied it' (Wait-Until { (Phone-Log) -match "text from 'EMPIRE' len=131072 sha=\w+ isUrl=false openable=false written=true" } 8)
+    Check 'S8 ... and the phone copied it' (Wait-Until { (Phone-Log) -match "text from '$($script:PcName)' len=131072 sha=\w+ isUrl=false openable=false written=true" } 8)
     $lc = Copy-OnPc ('c' * 131073) 15
     Check 'S8 a clipboard over 128 KiB is not sent (too_large)' ($lc -and $lc.result -eq 'too_large') "$($lc.result)"
     $tx = Hotkey-Send 15
