@@ -16,30 +16,21 @@ function Use-Text([string]$t) { $script:Texts.Add($t); $t }
 function Esc-Cr([string]$s) { ($s -replace "`r", '\r' -replace "`n", '\n') }
 
 # ---------------------------------------------------------------- the PC clipboard
+# Every format is saved and put back (desktop\clipboard-backup.ps1: text in all its encodings, HTML, images, file lists, the password-manager
+# marks). Since 1.3 this replaces the plain-text-only backup: a clipboard that holds a web page copy no longer stops the run.
+# -DiscardClipboard is kept for the old callers and does nothing now.
+if (-not (Get-Command Save-Clipboard -ErrorAction SilentlyContinue)) { . (Join-Path $Repo 'desktop\clipboard-backup.ps1') }   # defines Save-Clipboard, Restore-Clipboard, Get-ClipboardFormats
 function Save-PcClipboard([bool]$Discard) {
     Add-Type -AssemblyName System.Windows.Forms
-    $d = [Windows.Forms.Clipboard]::GetDataObject()
-    $formats = if ($d) { @($d.GetFormats()) } else { @() }
-    $plain = 'Text', 'UnicodeText', 'System.String', 'OEMText', 'Locale'
-    $other = @($formats | Where-Object { $_ -notin $plain })
-    if ($other.Count -gt 0 -and -not $Discard) {
-        throw "the PC clipboard holds more than plain text ($($other -join ', ')) and cannot be put back exactly; copy something plain, or pass -DiscardClipboard"
-    }
-    $script:SavedClip = Get-Clipboard -Raw
-    if ($null -ne $script:SavedClip) { [IO.File]::WriteAllText($script:ClipBackupFile, $script:SavedClip, (New-Object Text.UTF8Encoding($false))) }
+    $script:PcClipBackup = Save-Clipboard | Select-Object -Last 1
     $script:ClipSaved = $true
-    Say ("saved the PC clipboard ({0}; backup file {1})" -f $(if ($null -eq $script:SavedClip) { 'empty' } else { "$($script:SavedClip.Length) chars" }), $script:ClipBackupFile)
 }
 function Restore-PcClipboard {
     if (-not $script:ClipSaved) { return }
-    try {
-        if ($null -eq $script:SavedClip) { [Windows.Forms.Clipboard]::Clear() } else { Set-Clipboard -Value $script:SavedClip }
-        Start-Sleep -Milliseconds 300
-        $now = Get-Clipboard -Raw
-        $ok = if ($null -eq $script:SavedClip) { [string]::IsNullOrEmpty($now) } else { $now -ceq $script:SavedClip }
-        Check 'PC clipboard restored' $ok
-        if ($ok) { try { [IO.File]::Delete($script:ClipBackupFile) } catch { } } else { Say "NOT restored; the original text is in $($script:ClipBackupFile)" }
-    } catch { Check 'PC clipboard restored' $false "$_ (original in $($script:ClipBackupFile))" }
+    $ok = $false
+    try { $ok = [bool](Restore-Clipboard $script:PcClipBackup | Select-Object -Last 1) } catch { Say "restore failed: $_" }
+    Check 'PC clipboard restored' $ok
+    $script:ClipSaved = $false
 }
 function Pc-Clip { try { Get-Clipboard -Raw } catch { $null } }
 
@@ -56,10 +47,12 @@ function Phone-Clip {
     $line = $null
     Wait-Until { $script:cl = (A logcat -d -s KinRelay) | Where-Object { $_ -match 'CMD CLIPBOARD' } | Select-Object -Last 1; [bool]$script:cl } 8 | Out-Null
     $line = $script:cl
-    if (-not $line -or $line -notmatch 'CMD CLIPBOARD len=(\d+) sha=(\w+) text="(?s)(.*)"\s*$') { return $null }
+    # 1.3 added `sensitive=<bool>` between the hash and the text
+    if (-not $line -or $line -notmatch 'CMD CLIPBOARD len=(?<len>\d+) sha=(?<sha>\w+)(?: sensitive=(?<sens>\w+))? text="(?s)(?<text>.*)"\s*$') { return $null }
+    $len = [int]$Matches['len']; $sha = $Matches['sha']; $sens = ($Matches['sens'] -eq 'true')
     # the debug hook escapes line ends as \n and \r and a backslash as \\
-    $t = [regex]::Replace($Matches[3], '\\(.)', { param($m) switch ($m.Groups[1].Value) { 'n' { "`n" } 'r' { "`r" } 't' { "`t" } default { $m.Groups[1].Value } } })
-    [pscustomobject]@{ Len = [int]$Matches[1]; Sha = $Matches[2]; Text = $t }
+    $t = [regex]::Replace($Matches['text'], '\\(.)', { param($m) switch ($m.Groups[1].Value) { 'n' { "`n" } 'r' { "`r" } 't' { "`t" } default { $m.Groups[1].Value } } })
+    [pscustomobject]@{ Len = $len; Sha = $sha; Text = $t; Sensitive = $sens }
 }
 
 # The ack goes out before the phone writes the clipboard, so a read right after an ack may still see the old text: wait for it.
@@ -300,31 +293,21 @@ function Run-Milestone12 {
         Check "S6 PC -> phone [$txt]: Open action only for http(s)" ($tx.result -eq 'acked' -and $nt -and $hasOpen -eq $u.Open) "actions=$($nt.Actions -join ',')"
     }
 
-    # ---- 8. large text, PC -> phone (the 1 MiB limit is on the whole JSON frame: 1,048,502 characters of `clipboard`, 1,048,493 of `text`)
+    # ---- 8. large text, PC -> phone. Since 1.3 (protocol.md, "Text messages") a sender sends a `text` or `clipboard` message only up to 128 KiB
+    # (131,072 bytes of UTF-8): a longer clipboard is not sent (`too_large`), a longer hotkey text goes as a .txt file (1.3's S10c checks the file).
+    # The receivers' own limit is still 1 MiB, but no sender uses it any more, so there is nothing to send above 128 KiB as a message.
     Say 'scenario 8: large text'
-    # Android 10 puts a clipboard text into the binder parcel as UTF-16 (2 bytes a character), Android 17 as Latin-1: 400,000 fits on both
-    $lc = Copy-OnPc ('c' * 400000) 15
-    Check 'S8 400,000 characters: clipboard acked' ($lc -and $lc.result -eq 'acked') "tap to ack $($lc.tapToAckMs) ms"
-    Check 'S8 ... and written to the phone clipboard' (Wait-Until { (Phone-Log) -match 'clipboard from the PC len=400000 sha=\w+ written=true' } 8)
-    Copy-OnPc ('c' * 1048493) 15 | Out-Null
+    $lc = Copy-OnPc ('c' * 131072) 15
+    Check 'S8 clipboard of exactly 128 KiB: acked' ($lc -and $lc.result -eq 'acked') "tap to ack $($lc.tapToAckMs) ms"
+    Check 'S8 ... and written to the phone clipboard' (Wait-Until { (Phone-Log) -match 'clipboard from the PC len=131072 sha=\w+ written=true' } 8)
     $tx = Hotkey-Send 15
-    Check 'S8 text of exactly 1,048,493 characters is acked' ($tx -and $tx.result -eq 'acked' -and $tx.chars -eq 1048493) "tap to ack $($tx.tapToAckMs) ms"
-    $script:Timings['S8 hotkey text of 1,048,493 characters (tap to ack)'] = "$($tx.tapToAckMs) ms"
-    # Android's clipboard is a binder call of about 1 MB, so the longest texts are acked but can't be copied: the user must be told
-    $script:copied = ''
-    $got = Wait-Until { if ((Phone-Log) -match "text from 'EMPIRE' len=1048493 sha=\w+ isUrl=false openable=false written=(true|false)") { $script:copied = $Matches[1] }; [bool]$script:copied } 8
-    $copied = $script:copied
-    Check 'S8 the phone received the text and logged whether it could copy it' $got "written=$copied"
-    if ($copied -eq 'false') {
-        Check 'S8 the phone says it could not copy a text that long' (Wait-Until { (A shell dumpsys notification --noredact | Out-String) -match 'copy the text from your PC' } 8)
-    }
-    $lc = Copy-OnPc ('c' * 1048503) 15
-    Check 'S8 a clipboard over 1 MiB is not sent (too_large)' ($lc -and $lc.result -eq 'too_large') "$($lc.result)"
-    $toasts = Pc-LogCount 'over 1 MiB'
-    Copy-OnPc ('c' * 1048494) 15 | Out-Null
+    Check 'S8 hotkey text of exactly 128 KiB is sent as a text message and acked' ($tx -and $tx.result -eq 'acked' -and $tx.chars -eq 131072 -and -not $tx.asFile) "tap to ack $($tx.tapToAckMs) ms asFile=$($tx.asFile)"
+    $script:Timings['S8 hotkey text of 131,072 characters (tap to ack)'] = "$($tx.tapToAckMs) ms"
+    Check 'S8 ... and the phone copied it' (Wait-Until { (Phone-Log) -match "text from 'EMPIRE' len=131072 sha=\w+ isUrl=false openable=false written=true" } 8)
+    $lc = Copy-OnPc ('c' * 131073) 15
+    Check 'S8 a clipboard over 128 KiB is not sent (too_large)' ($lc -and $lc.result -eq 'too_large') "$($lc.result)"
     $tx = Hotkey-Send 15
-    Check 'S8 text over 1 MiB: not sent, a notice on the PC' ($tx -and $tx.result -eq 'too_large' -and (Pc-LogCount 'over 1 MiB') -gt $toasts) "$($tx.result)"
-
+    Check 'S8 a hotkey text over 128 KiB goes as a .txt file offer instead' ($tx -and $tx.result -eq 'acked' -and $tx.asFile -eq $true) "result=$($tx.result) asFile=$($tx.asFile)"
     # ---- 11. logs
     Say 'scenario 11: logs'
     $pcAll = Pc-Log

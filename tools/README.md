@@ -2,6 +2,10 @@
 
 Scripts for soak tests and benchmarks. Measured results go in `docs/results/`, not here.
 
+## e2e-1-1.ps1, e2e-1-2.ps1, e2e-1-3.ps1
+
+End-to-end checks on the emulator with the real `Kin.exe` (developer mode, loopback only, throwaway data dir and received folder) and the real debug APK. `e2e-1-1.ps1` is the base (emulator, install, pairing, ping, teardown); `e2e-1-2.ps1` and `e2e-1-3.ps1` run it with `-Milestone 1.2` / `1.3` and add the scenarios of `e2e-1-2-scenarios.ps1` (text, links, clipboard) and `e2e-1-3-scenarios.ps1` (files both ways, big file with a Wi-Fi drop, cancel, `disk_full`, `source_changed`, tricky file names, the text rules). They use the real PC clipboard: every format is saved first and put back at the end. Exit code 0 only if every check passed. Run them from `powershell -ExecutionPolicy Bypass -File ...`; to capture the output from a tool that reads a pipe, send it to a file (`Start-Process ... -RedirectStandardOutput`), because the adb server a run starts holds the pipe open. Usage and the results: [phase-1-3-integration.md](../docs/results/phase-1-3-integration.md).
+
 ## net-check.ts
 
 Phase 0, step 5 in [phase-0-setup.md](../docs/phases/phase-0-setup.md): checks that a phone on Wi-Fi can reach this PC.

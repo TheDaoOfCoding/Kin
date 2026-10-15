@@ -2,6 +2,7 @@
 # and the real debug APK. Pair by deep link, ping both ways, check the state on both sides, tear everything down.
 # Exits 0 if every check passed, 1 otherwise. Later milestones extend the section marked "EXTEND HERE".
 # -Milestone 1.2 adds the text, link and clipboard scenarios of tools\e2e-1-2-scenarios.ps1 (use tools\e2e-1-2.ps1, which sets it).
+# -Milestone 1.3 adds the file scenarios of tools\e2e-1-3-scenarios.ps1 (use tools\e2e-1-3.ps1, which sets it).
 #
 #   tools\e2e-1-1.ps1                      # kin_api37 (Android 17)
 #   tools\e2e-1-1.ps1 -Avd kin_api29       # Android 10
@@ -16,8 +17,10 @@ param(
     [string]$Avd = 'kin_api37',
     [switch]$Build,
     [switch]$KeepRunning,
-    [ValidateSet('1.1', '1.2')][string]$Milestone = '1.1',
+    [ValidateSet('1.1', '1.2', '1.3')][string]$Milestone = '1.1',
     [switch]$DiscardClipboard,   # 1.2: go on although the PC clipboard holds more than plain text (it can't be put back, and is lost)
+    [string[]]$Only = @(),       # 1.3: run only these scenarios (S1, S2, ...), for debugging
+    [int]$BigMb = 40,            # 1.3: size of the "big file" with one drop (the emulator does about 2 MB/s; 200 to 500 is for a manual run)
     [string]$ScreenshotDir = (Join-Path $PSScriptRoot '..\docs\results\phase-1-2-integration-screens'),
     [string]$Kin = (Join-Path $PSScriptRoot '..\desktop\src-tauri\target\release\Kin.exe'),
     [string]$Apk = (Join-Path $PSScriptRoot '..\android\app\build\outputs\apk\debug\app-debug.apk')
@@ -72,20 +75,25 @@ function Phone-Cmd([string]$Command, [string]$Wait = '') {
     return $script:l
 }
 function Parse-Rtt($line) { if ($line -match 'Rtt\(millis=([0-9.]+)\)') { [double]$Matches[1] } else { $null } }
-if ($Milestone -eq '1.2') { . (Join-Path $PSScriptRoot 'e2e-1-2-scenarios.ps1') }
+if ($Milestone -in '1.2', '1.3') { . (Join-Path $PSScriptRoot 'e2e-1-2-scenarios.ps1') }   # 1.3 reuses its helpers
+if ($Milestone -eq '1.3') { . (Join-Path $PSScriptRoot 'e2e-1-3-scenarios.ps1') }
 function Phone-State { $l = Phone-Cmd 'STATE'; $h = @{}; if ($l) { foreach ($m in [regex]::Matches($l, '(\w+)=(\S+)')) { $h[$m.Groups[1].Value] = $m.Groups[2].Value } }; $h }
 
 $started = @{ Emulator = $false; Kin = $false }
 try {
     if ($Milestone -eq '1.2') { Save-PcClipboard $DiscardClipboard.IsPresent }   # before anything can touch it
+    if ($Milestone -eq '1.3') { Save-AllClipboard }                               # every format: 1.3 puts an image on it
     if ($Build) {
         Say 'building Kin.exe'
         Push-Location (Join-Path $Repo 'desktop'); . .\_env.ps1
         powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 | Out-Null; $ok = $LASTEXITCODE -eq 0; Pop-Location
         Check 'build desktop' $ok
         Say 'building the debug APK'
-        Push-Location (Join-Path $Repo 'android'); cmd /c "gradlew.bat assembleDebug" | Out-Null; $ok = $LASTEXITCODE -eq 0
-        cmd /c "gradlew.bat --stop" | Out-Null; Pop-Location
+        # `Push-Location` moves PowerShell's own location, which a native command started with `&` uses as its working directory.
+        # (`cmd /c "gradlew.bat ..."` didn't find the wrapper: it ran in the process's directory.) `-p` says where the project is as well.
+        $androidDir = Join-Path $Repo 'android'
+        Push-Location $androidDir; & .\gradlew.bat -p $androidDir assembleDebug | Out-Null; $ok = $LASTEXITCODE -eq 0
+        & .\gradlew.bat -p $androidDir --stop | Out-Null; Pop-Location
         Check 'build android' $ok
         if (-not $ok) { throw 'build failed' }
     }
@@ -97,9 +105,24 @@ try {
     Say "starting $Avd"
     $started.Emulator = $true
     if (-not (Invoke-EmuScript 'start.ps1' @('-Avd', $Avd)) -or ((A shell getprop sys.boot_completed | Out-String).Trim() -ne '1')) { throw "emulator $Avd did not start (see tools\emulator\emulator-$Avd.log)" }
+    # The emulator boots from the snapshot the last run left, and a run that died with Wi-Fi switched off (scenarios turn it off on purpose) left it off.
+    A shell svc wifi enable | Out-Null
     $sdk = [int](A shell getprop ro.build.version.sdk | Out-String).Trim()
     Say "API $sdk"
+    # Files of an earlier install stay in Pictures/Kin, Movies/Kin and Download/Kin but the new install can't see (or replace) them, and a same-named
+    # file then clashes with the new one: delete what the old install made while it can still do it.
+    if ($Milestone -eq '1.3' -and ((A shell pm path $Pkg | Out-String) -match 'package:')) {
+        A shell am broadcast -a app.kinrelay.android.debug.DELETE_RECEIVED -n "$Pkg/.debug.DebugCommandReceiver" | Out-Null
+        Start-Sleep -Seconds 3
+    }
     A uninstall $Pkg 2>&1 | Out-Null
+    if ($Milestone -eq '1.3') {
+        # ... and whatever an earlier run that died left behind (the shell may delete what no app can see)
+        @'
+rm -rf /sdcard/Download/Kin /sdcard/Pictures/Kin /sdcard/Movies/Kin
+content delete --uri content://media/external/file --where "_data LIKE '/storage/emulated/0/%/Kin/%'"
+'@ | & $Adb -s $Serial shell | Out-Null
+    }
     $out = (& $Adb -s $Serial install -r $Apk 2>&1 | Out-String)
     Check 'install' ($out -match 'Success')
     if ($sdk -ge 37) {
@@ -112,7 +135,9 @@ try {
     # ---- the desktop app: developer mode, loopback only, throwaway data dir
     New-Item -ItemType Directory $Data | Out-Null
     $started.Kin = $true
-    Start-Process $Kin -ArgumentList '--data-dir', ('"{0}"' -f $Data), '--dev-bind', '127.0.0.1', '--dev-qr-address', '10.0.2.2', '--dev-print-pair-url', '--dev-no-windows' | Out-Null
+    # --dev-received-dir: received files never go to the real Downloads\Kin
+    $KinArgs = @('--data-dir', ('"{0}"' -f $Data), '--dev-bind', '127.0.0.1', '--dev-qr-address', '10.0.2.2', '--dev-received-dir', ('"{0}"' -f (Join-Path $Data 'received')), '--dev-print-pair-url', '--dev-no-windows')
+    Start-Process $Kin -ArgumentList $KinArgs | Out-Null
     Check 'desktop started' (Wait-Until { (Get-Status).state -eq 'not_paired' } 30)
     $pc = Get-Status
     Check 'desktop listens on loopback' ($pc.bind -eq '127.0.0.1') "port $($pc.port)"
@@ -127,8 +152,14 @@ try {
     if ($Milestone -eq '1.2') { Test-ConfirmationScreen $url $pc }   # a link without AUTO_CONFIRM must not pair by itself
     $sw = [Diagnostics.Stopwatch]::StartNew()
     # AUTO_CONFIRM is the debug build's way past the confirmation screen that every link from outside the app gets
-    A shell am start -a android.intent.action.VIEW -d "'$url'" --ez app.kinrelay.android.AUTO_CONFIRM true 2>$null | Out-Null
-    $paired = Wait-Until { (Get-Status).state -eq 'phone_connected' } 40
+    # Right after the emulator booted the first connection to 10.0.2.2 now and then fails ("Couldn't reach the PC") although the PC never saw it:
+    # the code is still valid, so the same link is opened again (up to three times).
+    $paired = $false
+    for ($try = 1; $try -le 3 -and -not $paired; $try++) {
+        if ($try -gt 1) { Say "pairing attempt $try (the phone could not reach the PC the first time)" }
+        A shell am start -a android.intent.action.VIEW -d "'$url'" --ez app.kinrelay.android.AUTO_CONFIRM true 2>$null | Out-Null
+        $paired = Wait-Until { (Get-Status).state -eq 'phone_connected' } $(if ($try -lt 3) { 20 } else { 40 })
+    }
     Check 'paired and connected' $paired ("{0:N1} s" -f $sw.Elapsed.TotalSeconds)
     $pc = Get-Status
     $ph = Phone-State
@@ -154,6 +185,7 @@ try {
 
     # ---- EXTEND HERE: later milestones add their scenarios (text, clipboard, files, ...) before the unpair.
     if ($Milestone -eq '1.2') { Run-Milestone12 }
+    if ($Milestone -eq '1.3') { Run-Milestone13 }
 
     # ---- unpair from the phone: the PC cleans up
     Phone-Cmd 'UNPAIR' | Out-Null
@@ -165,6 +197,7 @@ catch {
     $script:Failures.Add("exception: $_")
 }
 finally {
+    if ($Milestone -eq '1.3' -and $started.Emulator) { try { Clear-Phone13 } catch { Say "could not clean the phone: $_" } }   # the test files, before the emulator goes
     if (-not $KeepRunning) {
         Say 'tearing down'
         if ($started.Kin) {
@@ -177,6 +210,8 @@ finally {
     }
     # After Kin has quit, so that the restored text is not synced to the phone. Also with -KeepRunning: it is the user's clipboard.
     if ($Milestone -eq '1.2') { Restore-PcClipboard }
+    if ($Milestone -eq '1.3') { Restore-AllClipboard }
+    if ($Milestone -eq '1.3') { Remove-Work13 }
     $shouldKeep = $script:Failures.Count -gt 0 -or $KeepRunning
     if ($shouldKeep -and (Test-Path $Data)) { Say "data and logs kept in $Data" }
     elseif (Test-Path $Data) { try { [IO.Directory]::Delete($Data, $true) } catch { Say "could not remove $Data" } }

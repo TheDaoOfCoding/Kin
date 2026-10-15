@@ -6,10 +6,10 @@
 #   tools\e2e-1-2.ps1                      # kin_api37
 #   tools\e2e-1-2.ps1 -Avd kin_api29
 #   tools\e2e-1-2.ps1 -Build               # build Kin.exe and the debug APK first
-#   tools\e2e-1-2.ps1 -DiscardClipboard    # go on although the PC clipboard holds more than plain text (it is lost)
+#   tools\e2e-1-2.ps1 -DiscardClipboard    # no longer needed (kept so old command lines work)
 #
-# It uses the REAL Windows clipboard: it saves the text on it first and puts it back at the end (a copy is also in
-# %TEMP%\kin-e2e-clipboard-backup.txt until it is restored). Exit code 0 only if every check passed.
+# It uses the REAL Windows clipboard: every format on it (text, HTML, an image, ...) is saved first and put back at the end, after Kin has
+# quit (desktop\clipboard-backup.ps1). Exit code 0 only if every check passed.
 param(
     [string]$Avd = 'kin_api37',
     [switch]$Build,
