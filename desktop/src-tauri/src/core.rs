@@ -37,6 +37,12 @@ pub enum Event {
     /// A phone paired. The UI shows the "New device paired" notice.
     DevicePaired(DeviceRow),
     Toast(String),
+    /// A toast that has a file name in it. `text` is shown, `log_text` is what goes to the log (the name as a short hash): a file name
+    /// is the user's own and stays out of a log line (see desktop/README.md, "Logs").
+    ToastRedacted {
+        text: String,
+        log_text: String,
+    },
     /// "Text from <phone>" with a preview. With `has_link` a click on the toast opens the link (`Core::toast_clicked`). The
     /// preview is the user's own text: it goes to the toast and nowhere else (never to a log).
     TextToast {
@@ -94,6 +100,8 @@ pub struct Snapshot {
     pub auto_clipboard_sync: bool,
     /// The progress of the transfers that are going ("sending 45%"), for the tray's tooltip.
     pub transfers: Option<String>,
+    /// How many sends wait in the queue for the phone.
+    pub queued: usize,
 }
 
 impl Snapshot {
@@ -161,7 +169,10 @@ impl PingReport {
 pub struct Core {
     pub config: Config,
     pub identity: Identity,
-    pub pc_name: String,
+    /// The name sent in `hello` and shown to the phone: the `deviceName` setting, else the computer's name (`Core::pc_name()`).
+    pc_name: Mutex<String>,
+    /// The computer's name, for when the setting is empty.
+    default_pc_name: String,
     pub db: Db,
     pub connections: Connections,
     pairing: Mutex<Pairing>,
@@ -178,6 +189,8 @@ pub struct Core {
     /// File transfers (1.3): both directions, by transfer ID.
     pub transfers: Transfers,
     pub hooks: Hooks,
+    /// The queue of 1.4 (queue.rs).
+    pub(crate) queue: crate::queue::QueueState,
     pub(crate) next_toast_id: AtomicU32,
     pub(crate) clipboard: Arc<dyn Clipboard>,
     pub(crate) opener: Arc<dyn UrlOpener>,
@@ -213,19 +226,29 @@ pub fn short_transfer(id: &str) -> &str {
     id.len().checked_sub(8).and_then(|from| id.get(from..)).unwrap_or(id)
 }
 
+/// A file name as it may appear in a log: a short hash of it, `<file 1a2b3c4d>`. A file name is the user's own, so a normal log line never has
+/// one. The name itself is logged only at debug level, which is off.
+pub fn name_tag(name: &str) -> String {
+    format!("<file {}>", crate::clipboard::short_hash(name))
+}
+
 pub fn computer_name() -> String {
     std::env::var("COMPUTERNAME").ok().filter(|n| !n.is_empty()).unwrap_or_else(|| "Windows PC".to_string())
 }
 
 impl Core {
     pub fn new(config: Config, identity: Identity, db: Db, pc_name: String, events: UnboundedSender<Event>, services: Services) -> Core {
+        // The key of the tags that the log uses for texts and file names (`privacy.rs`).
+        crate::privacy::init(&config.data_dir);
         let settings = Settings::load(&config.data_dir);
         let hotkey = HotkeyStatus { accelerator: settings.hotkey.clone(), registered: false, error: None };
         let config_for_hooks = config.clone();
+        let shown_name = settings.device_name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| pc_name.clone());
         let core = Core {
             config,
             identity,
-            pc_name,
+            pc_name: Mutex::new(shown_name),
+            default_pc_name: pc_name,
             db,
             connections: Connections::default(),
             pairing: Mutex::new(Pairing::default()),
@@ -240,13 +263,29 @@ impl Core {
             toast_targets: Mutex::new(ToastTargets::default()),
             transfers: Transfers::default(),
             hooks: hooks_of(&config_for_hooks),
+            queue: crate::queue::QueueState::default(),
             next_toast_id: AtomicU32::new(0),
             clipboard: services.clipboard,
             opener: services.opener,
             clock: services.clock,
         };
         core.recover_transfers();
+        core.prune_storage(unix_ms() as i64);
         core
+    }
+
+    /// The name this PC shows to the phone (`hello`, the pairing code and the pairing window).
+    pub fn pc_name(&self) -> String {
+        lock(&self.pc_name).clone()
+    }
+
+    /// The computer's own name, which is the device name when the setting is empty.
+    pub fn default_pc_name(&self) -> &str {
+        &self.default_pc_name
+    }
+
+    pub(crate) fn set_shown_pc_name(&self, name: String) {
+        *lock(&self.pc_name) = name;
     }
 
     pub fn emit(&self, event: Event) {
@@ -282,7 +321,13 @@ impl Core {
         } else {
             LinkState::PhoneOffline
         };
-        Snapshot { state, devices, auto_clipboard_sync: self.auto_clipboard_sync(), transfers: self.transfer_summary() }
+        Snapshot {
+            state,
+            devices,
+            auto_clipboard_sync: self.auto_clipboard_sync(),
+            transfers: self.transfer_summary(),
+            queued: self.queue_len(),
+        }
     }
 
     /// The contents of `status.json`, for scripts that want to know what the app is doing.
@@ -307,7 +352,9 @@ impl Core {
             "bind": self.config.bind_ip().to_string(),
             "deviceId": self.identity.device_id,
             "shortId": self.identity.short_id,
-            "pcName": self.pc_name,
+            "pcName": self.pc_name(),
+            "queue": self.queue_status(),
+            "tray": { "status": crate::tray::status_text(&snap), "tooltip": crate::tray::tooltip(&snap) },
             "pairing": pairing_expires_ms.map(|e| json!({ "active": true, "expiresAtMs": e })),
             "devices": snap.devices,
             "lastPing": last_ping,
@@ -348,7 +395,7 @@ impl Core {
             Session { expires_ms: 0, svg: None, paired: None }
         } else {
             let token = lock(&self.pairing).begin(now);
-            let url = pairing::pair_url(&addresses, &self.identity.device_id, &token, Some(&self.pc_name));
+            let url = pairing::pair_url(&addresses, &self.identity.device_id, &token, Some(&self.pc_name()));
             self.dev_publish_pair_url(&url);
             log::info!("pairing started: {} address(es), valid for {} s", addresses.len(), pairing::TOKEN_TTL.as_secs());
             Session { expires_ms: unix_ms() + pairing::TOKEN_TTL.as_millis() as u64, svg: Some(pairing::qr_svg(&url)), paired: None }
@@ -414,7 +461,7 @@ impl Core {
         Some(PairingView {
             status,
             svg: if status == "waiting" { s.svg.clone() } else { None },
-            pc_name: self.pc_name.clone(),
+            pc_name: self.pc_name(),
             short_id: encoding::format_short_id(&self.identity.short_id),
             expires_at_ms: s.expires_ms,
             device: s.paired.clone(),
@@ -489,6 +536,7 @@ impl Core {
     /// accepted yet), as protocol.md describes.
     pub fn remove_device(&self, device_id: &str) -> Result<bool> {
         let removed = self.db.remove_device(device_id)?;
+        let _ = self.db.delete_pending_cancels_of(device_id);
         log::info!("device {} removed: {removed}", short(device_id));
         self.connections.revoke(device_id);
         self.emit(Event::PairingChanged);
@@ -514,12 +562,24 @@ impl Core {
                         Ok(Ok(SendOutcome::Ack(rtt))) => PingReport::Rtt(rtt),
                         Ok(Ok(SendOutcome::Failed(code))) => PingReport::Failed(code),
                         Ok(Ok(SendOutcome::NotConnected)) => PingReport::NotConnected,
-                        Ok(Ok(SendOutcome::NoReply)) | Ok(Err(_)) | Err(_) => PingReport::NoReply,
+                        Ok(Ok(SendOutcome::NoReply | SendOutcome::Lost)) | Ok(Err(_)) | Err(_) => PingReport::NoReply,
                     }
                 }
             }
         };
         *lock(&self.last_ping) = Some((unix_ms(), report.clone()));
+        // The round trip and the errors of pings are in the debug window (a ping is not a send: it is left out of the success rate).
+        let outcome = match &report {
+            PingReport::Rtt(d) => Some(("ok", None, Some(d.as_secs_f64() * 1000.0))),
+            PingReport::NoReply => Some(("failed", Some("no_reply".to_string()), None)),
+            PingReport::Failed(code) => Some(("failed", Some(code.clone()), None)),
+            PingReport::NotConnected => None,
+        };
+        if let Some((result, error, rtt)) = outcome {
+            let id = encoding::uuid_v7(unix_ms());
+            self.record_send_start(&id, "ping", 1, false);
+            self.record_send_end(&id, "ping", unix_ms() as i64, 1, result, error.as_deref(), rtt);
+        }
         self.emit(Event::Toast(report.text()));
         self.emit(Event::StateChanged);
         report

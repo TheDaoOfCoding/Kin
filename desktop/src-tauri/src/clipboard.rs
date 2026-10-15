@@ -112,9 +112,10 @@ pub fn text_hash(text: &str) -> [u8; 32] {
     sha256(text.as_bytes())
 }
 
-/// The first 8 hex digits of the hash: enough to follow one text through a log, and nothing that gives the text away.
+/// What a log line says to let one text be followed through the log: 8 hex digits of an **HMAC-SHA256 under a per-installation key** that is
+/// kept protected and never exported (`privacy.rs`). It is not a plain hash of the text, so a guess can't be checked against it.
 pub fn short_hash(text: &str) -> String {
-    text_hash(text)[..4].iter().map(|b| format!("{b:02x}")).collect()
+    crate::privacy::tag(text.as_bytes())
 }
 
 /// The wire form of a text (protocol.md, "Line ends"): LF only. Every CRLF becomes LF in one left-to-right pass, and a lone CR stays.
@@ -881,8 +882,9 @@ mod tests {
     fn the_hash_follows_the_text_and_gives_nothing_away() {
         assert_eq!(text_hash("a"), text_hash("a"));
         assert_ne!(text_hash("a"), text_hash("b"));
-        assert_eq!(short_hash("hello"), "2cf24dba");
         assert_eq!(short_hash("hello").len(), 8);
+        assert_eq!(short_hash("hello"), short_hash("hello"));
+        assert_ne!(short_hash("hello"), "2cf24dba", "the tag is keyed: it is not the first digits of the plain SHA-256 of the text");
     }
 
     #[test]

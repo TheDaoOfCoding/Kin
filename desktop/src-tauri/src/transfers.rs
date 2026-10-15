@@ -220,8 +220,9 @@ pub struct Entry {
     pub device_id: String,
     pub direction: Direction,
     pub created_ms: u64,
-    /// Out: when the offer expires. In: not used.
-    pub expires_ms: u64,
+    /// Out: when the offer expires (24 hours after it was sent; a send into a dead connection that is repeated after the reconnect
+    /// starts the 24 hours again, see `queue.rs`). In: not used.
+    expires: AtomicU64,
     /// In: the folder the files go to.
     pub dest_dir: PathBuf,
     pub files: Vec<Arc<FileShared>>,
@@ -232,6 +233,8 @@ pub struct Entry {
     pub canceled: AtomicBool,
     /// Set by the one call of `drop_transfer` that does the work (a second cancel, from the other side, finds it set and does nothing).
     pub dropped: AtomicBool,
+    /// In: the phone had to ask again (a `POST` for a transfer that was already there), so it was not a first-try success (metrics.rs).
+    pub resumed: AtomicBool,
 }
 
 impl Entry {
@@ -249,18 +252,28 @@ impl Entry {
             device_id: device_id.to_string(),
             direction,
             created_ms: now_ms,
-            expires_ms,
+            expires: AtomicU64::new(expires_ms),
             dest_dir,
             files,
             meta: Mutex::new(Meta { status: Status::Active, finished_ms: None, error: None, speed: Speed::default() }),
             moved: AtomicU64::new(0),
             canceled: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
+            resumed: AtomicBool::new(false),
         })
     }
 
     pub fn status(&self) -> Status {
         lock(&self.meta).status
+    }
+
+    /// When the offer expires, in Unix milliseconds (`u64::MAX` for an upload).
+    pub fn expires_ms(&self) -> u64 {
+        self.expires.load(Ordering::Relaxed)
+    }
+
+    pub fn set_expires_ms(&self, at: u64) {
+        self.expires.store(at, Ordering::Relaxed);
     }
 
     /// Whether a transfer that is over has been known for as long as the PC answers for it (24 hours since it ended): its ID is then
@@ -643,6 +656,7 @@ impl Core {
                 return Err(Failure::not_found());
             }
             Some(e) => {
+                e.resumed.store(true, Ordering::Relaxed);
                 let have: HashSet<&str> = e.files.iter().map(|f| f.file_id.as_str()).collect();
                 let want: HashSet<&str> = req.files.iter().map(|f| f.file_id.as_str()).collect();
                 if have != want {
@@ -921,7 +935,8 @@ impl Core {
             match opened {
                 Ok(f) => handle = Some(f),
                 Err(e) => {
-                    log::error!("opening {} failed: {e}", path.display());
+                    // The path of a `.part` file has the file's name in it: the log says which transfer and file number, not which file.
+                    log::error!("upload {}: opening the .part file of file {} failed: {e}", short_transfer(&entry.id), file.idx + 1);
                     return Err(Failure::internal());
                 }
             }
@@ -1159,6 +1174,8 @@ impl Core {
             return;
         }
         let _ = self.db.set_transfer_status(&entry.id, "done", now as i64, None);
+        let attempts = if entry.resumed.load(Ordering::Relaxed) { 2 } else { 1 };
+        self.record_send_end(&entry.id, "upload", entry.created_ms as i64, attempts, "ok", None, None);
         let from = self.db.get_device(&entry.device_id).ok().flatten().map_or_else(|| "your phone".to_string(), |d| d.name);
         log::info!("upload {} is done: {} file(s), {} bytes", short_transfer(&entry.id), entry.files.len(), entry.total_bytes());
         self.emit(Event::StateChanged);
@@ -1215,6 +1232,25 @@ impl Core {
                 let _ = self.db.clear_file_path(&entry.id, &file_id);
             }
         }
+        // The record of the send: a cancel the user made (here or on the phone) is not a failure, anything else that ended it is.
+        if final_status != Status::Done {
+            let kind = if entry.direction == Direction::In { "upload" } else { "offer" };
+            let attempts = if entry.resumed.load(Ordering::Relaxed) { 2 } else { 1 };
+            match (final_status, error) {
+                (Status::Canceled, Some("user" | "peer") | None) => {
+                    self.record_send_end(&entry.id, kind, entry.created_ms as i64, attempts, "canceled", None, None)
+                }
+                (_, code) => self.record_send_end(
+                    &entry.id,
+                    kind,
+                    entry.created_ms as i64,
+                    attempts,
+                    "failed",
+                    Some(code.unwrap_or("canceled")),
+                    None,
+                ),
+            }
+        }
         self.transfers.remove(&entry.id);
         log::info!("transfer {} {}", short_transfer(&entry.id), final_status.as_str());
         self.emit(Event::StateChanged);
@@ -1239,7 +1275,7 @@ impl Core {
     /// A `complete` message from the phone: the offer is done and is not served any more.
     pub async fn peer_completed(&self, device_id: &str, transfer_id: &str) {
         let Some(entry) = self.transfers.get(transfer_id).filter(|e| e.device_id == device_id && e.direction == Direction::Out) else {
-            log::info!("complete for an unknown transfer {} from device {}: ignored", short_transfer(transfer_id), short(device_id));
+            self.late_complete(device_id, transfer_id);
             return;
         };
         let now = Core::now_ms();
@@ -1250,6 +1286,7 @@ impl Core {
             file.done.store(file.size, Ordering::Relaxed);
         }
         let _ = self.db.set_transfer_status(&entry.id, "done", now as i64, None);
+        self.record_send_end(&entry.id, "offer", entry.created_ms as i64, 1, "ok", None, None);
         let temp: Vec<PathBuf> = entry.files.iter().map(|f| f.data()).filter(|d| d.temp_source).map(|d| d.path).collect();
         if !temp.is_empty() {
             let _ = tokio::task::spawn_blocking(move || temp.iter().for_each(|p| remove_temp_source(p))).await;
@@ -1257,6 +1294,26 @@ impl Core {
         log::info!("the phone has all the files of offer {}", short_transfer(transfer_id));
         let from = self.db.get_device(device_id).ok().flatten().map_or_else(|| "your phone".to_string(), |d| d.name);
         self.emit(Event::Toast(format!("Sent {} file(s) to {from}", entry.files.len())));
+        self.emit(Event::StateChanged);
+    }
+
+    /// A `complete` for an offer that is not in memory. Usually it is for nothing we know (ignored, as the spec says). But the phone did get
+    /// the offer if our record says it was sent and not acked (`queued` with a send time), or if we failed it because a phone answered a
+    /// repeat with `bad_request` ("that ID was used before", which is what an older phone says to an offer it has already finished): its
+    /// `complete` is the truth, so the offer is **done** (changelog 52).
+    fn late_complete(&self, device_id: &str, transfer_id: &str) {
+        if !self.db.late_complete_candidate(transfer_id, device_id).unwrap_or(false) {
+            log::info!("complete for an unknown transfer {} from device {}: ignored", short_transfer(transfer_id), short(device_id));
+            return;
+        }
+        let now = Core::now_ms();
+        let _ = self.db.set_transfer_status(transfer_id, "done", now as i64, None);
+        let _ = self.db.reopen_send(transfer_id); // it was recorded as failed; the phone says it worked
+        self.record_send_end(transfer_id, "offer", now as i64, 1, "ok", None, None);
+        self.discard_sources(transfer_id);
+        log::info!("a late complete: the phone has all the files of offer {}", short_transfer(transfer_id));
+        let from = self.db.get_device(device_id).ok().flatten().map_or_else(|| "your phone".to_string(), |d| d.name);
+        self.emit(Event::Toast(format!("Sent files to {from}")));
         self.emit(Event::StateChanged);
     }
 
@@ -1340,7 +1397,11 @@ impl Core {
             .into_iter()
             .filter(|(t, _)| t.status != "active")
             .take(RECENT_KEPT)
-            .map(|(t, files)| recent_json(&t, &files))
+            .map(|(t, files)| {
+                // The drop window says "To <phone>" / "From <phone>" for these rows too.
+                let peer = self.db.get_device(&t.device_id).ok().flatten().map_or_else(|| "phone".to_string(), |d| d.name);
+                recent_json(&t, &files, &peer)
+            })
             .collect();
         json!({ "active": active, "recent": recent, "receivedFolder": self.received_dir().to_string_lossy() })
     }
@@ -1400,11 +1461,15 @@ impl Core {
     /// memory any more, and the `.part` files that the database still assigns to a transfer that is over. Run at start and every hour.
     /// **Nothing is deleted that no record names:** a file in the received folder is the user's unless a record says it is ours.
     pub async fn clean_up(self: &Arc<Self>) {
-        let now = Core::now_ms();
+        self.clean_up_at(Core::now_ms()).await;
+    }
+
+    /// `clean_up` as of `now` (a test moves the clock by hand).
+    pub async fn clean_up_at(self: &Arc<Self>, now: u64) {
         for entry in self.transfers.all() {
             let status = entry.status();
             match (entry.direction, status) {
-                (Direction::Out, Status::Active) if entry.expires_ms <= now => {
+                (Direction::Out, Status::Active) if entry.expires_ms() <= now => {
                     log::info!("offer {} expired", short_transfer(&entry.id));
                     self.send_cancel_message(&entry.device_id, &entry.id, "expired");
                     self.drop_transfer(&entry, Status::Failed, Some("expired")).await;
@@ -1438,13 +1503,23 @@ impl Core {
         .await;
     }
 
-    /// A temporary `.txt` of a long text that no offer uses any more (the app was closed before the offer ended) goes after a day.
+    /// A temporary `.txt` of a long text that no offer uses any more (the app was closed before the offer ended) goes after a day. **In use**
+    /// means a transfer in memory points at it *or the database says a queued or active item does*: a queued offer (a long text waiting for the
+    /// phone) lives in the database alone until it is flushed, and its `.txt` is the only copy of the text.
     fn remove_orphan_outgoing(&self, now_ms: u64) {
         let Ok(read) = std::fs::read_dir(self.config.data_dir.join(crate::outgoing::OUTGOING_DIR)) else {
             return;
         };
-        let used: HashSet<PathBuf> =
+        let mut used: HashSet<PathBuf> =
             self.transfers.all().iter().flat_map(|e| e.files.iter().map(|f| f.data()).filter(|d| d.temp_source).map(|d| d.path)).collect();
+        match self.db.live_temp_sources() {
+            Ok(paths) => used.extend(paths.into_iter().map(PathBuf::from)),
+            Err(e) => {
+                // Without the list nothing can be told to be an orphan: delete nothing.
+                log::warn!("reading the temporary files in use failed ({e}): none is removed");
+                return;
+            }
+        }
         for item in read.flatten() {
             let folder = item.path();
             let in_use = std::fs::read_dir(&folder).is_ok_and(|r| r.flatten().any(|f| used.contains(&f.path())));
@@ -1603,7 +1678,7 @@ fn row_of(entry: &Entry, now_ms: u64) -> TransferRow {
         created_at: entry.created_ms as i64,
         updated_at: now_ms as i64,
         finished_at: None,
-        expires_at: (entry.expires_ms != u64::MAX).then_some(entry.expires_ms as i64),
+        expires_at: (entry.expires_ms() != u64::MAX).then_some(entry.expires_ms() as i64),
         total_bytes: entry.total_bytes() as i64,
         error_code: None,
         dest_dir: Some(entry.dest_dir.to_string_lossy().into_owned()),
@@ -1639,11 +1714,12 @@ pub fn insert_row(core: &Core, entry: &Entry) {
     }
 }
 
-fn recent_json(t: &TransferRow, files: &[TransferFileRow]) -> Value {
+fn recent_json(t: &TransferRow, files: &[TransferFileRow], peer: &str) -> Value {
     let done: i64 = files.iter().map(|f| if f.finalized { f.size } else { f.bytes_done }).sum();
     json!({
         "id": t.id,
         "direction": t.direction,
+        "peer": peer,
         "status": t.status,
         "files": files.len(),
         "bytesDone": done,
@@ -1679,5 +1755,21 @@ mod tests {
         s.add(t0 + Duration::from_secs(1), 10_000_000);
         assert!((s.bps(t0 + Duration::from_secs(1)) - 10_000_000.0).abs() < 1.0);
         assert_eq!(s.bps(t0 + Duration::from_secs(4)), 0.0, "nothing moved for 3 s");
+    }
+
+    /// protocol.md, "The 24 hour window": answered while now - done time < 24 h, `404` from exactly 24 h on. The done time is the moment
+    /// the transfer ended (the last file got its final name) and nothing moves it.
+    #[test]
+    fn a_finished_transfer_is_answered_until_exactly_24_hours_after_its_done_time() {
+        let entry = Entry::new("t", "d", Direction::In, 0, u64::MAX, PathBuf::new(), Vec::new());
+        assert!(!entry.past_keeping(u64::MAX / 2), "a transfer that is going is never past its window");
+        assert!(entry.end_if_active(Status::Done, 1_000, None));
+        assert!(!entry.past_keeping(1_000), "the moment it finished");
+        assert!(!entry.past_keeping(1_000 + KEEP_MS - 1), "one millisecond before 24 hours");
+        assert!(entry.past_keeping(1_000 + KEEP_MS), "at exactly 24 hours it is 404");
+        assert!(entry.past_keeping(1_000 + KEEP_MS + 1));
+        // Ending it again (a late cancel, a repeated last PUT) does not move the done time: `end_if_active` is once.
+        assert!(!entry.end_if_active(Status::Done, 5_000_000, None));
+        assert_eq!(lock(&entry.meta).finished_ms, Some(1_000));
     }
 }

@@ -30,7 +30,14 @@ fn drain_events(w: &mut World) -> Vec<Event> {
 }
 
 fn toast_texts(events: &[Event]) -> Vec<String> {
-    events.iter().filter_map(|e| if let Event::Toast(t) = e { Some(t.clone()) } else { None }).collect()
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Toast(t) => Some(t.clone()),
+            Event::ToastRedacted { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Makes files in a folder: `(name, pattern, size)`.
@@ -269,7 +276,7 @@ async fn an_offer_expires_after_a_day_and_the_phone_is_told() {
     let paths = make_files(src.path(), &[("a.bin", &pat, 1000)]);
     let phone = w.phone.device_id.clone();
     let entry = w.core().seed_offer(&phone, "stale", &[("f1", paths[0].as_path())], true);
-    assert!(entry.expires_ms <= kin_lib::encoding::unix_ms());
+    assert!(entry.expires_ms() <= kin_lib::encoding::unix_ms());
     assert_eq!(http(&w).await.get("stale", "f1", None, None, None).await.status, 404, "an expired offer is not served");
     // The clean-up drops it and tells the phone with a cancel message (reason expired).
     let core = w.env.core.clone();

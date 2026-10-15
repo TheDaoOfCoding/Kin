@@ -1,25 +1,51 @@
-﻿# Idle memory of the release Kin.exe, tray only, measured the same way as docs/results/phase-0-tauri.md: private working set from
+# Idle memory of the release Kin.exe, tray only, measured the same way as docs/results/phase-0-tauri.md: private working set from
 # the Win32_PerfFormattedData_PerfProc_Process counters (what Task Manager calls "active private working set"), working set and
-# private bytes from Get-Process, 60 s after launch. No window is ever opened.
+# private bytes from Get-Process, 60 s after launch. No window is ever opened, unless -OpenWindows is given.
 #
 # The app runs with the developer network settings (loopback only, no mDNS), so no Windows Firewall prompt appears. That leaves
 # out the mDNS daemon of a normal run. It runs with a throwaway profile, so nothing in %APPDATA%\Kin is touched.
 #
-#   powershell -ExecutionPolicy Bypass -File desktop\measure-idle.ps1 [-IdleSeconds 60] [-Runs 3]
+# -OpenWindows (1.4): every window (pairing, drop, history, settings, debug) is opened and closed first, and the memory is measured after that
+# (the windows are destroyed when closed, so the tray-only number must come back, and no WebView2 process may be left over).
+#
+#   powershell -ExecutionPolicy Bypass -File desktop\measure-idle.ps1 [-IdleSeconds 60] [-Runs 3] [-OpenWindows]
 param(
     [int]$IdleSeconds = 60,
-    [int]$Runs = 3
+    [int]$Runs = 3,
+    [switch]$OpenWindows
 )
 $ErrorActionPreference = 'Stop'
 $exe = Join-Path $PSScriptRoot 'src-tauri\target\release\Kin.exe'
 if (Get-Process Kin -ErrorAction SilentlyContinue) { throw 'Kin is already running; quit it first' }
+
+function Open-AndCloseEveryWindow([string]$exe) {
+    # window title -> the command that opens it
+    $windows = [ordered]@{ 'Pair new phone' = '--pair'; 'Send to phone' = '--drop'; 'History' = '--history'; 'Settings' = '--settings'; 'Debug' = '--debug-window' }
+    foreach ($title in $windows.Keys) {
+        & $exe $windows[$title]
+        $deadline = [DateTime]::Now.AddSeconds(15)
+        while ([DateTime]::Now -lt $deadline -and -not (Get-Process Kin | Where-Object { $_.MainWindowTitle -eq $title })) { Start-Sleep -Milliseconds 200 }
+        Start-Sleep -Seconds 2   # let the page load and draw
+        $w = Get-Process Kin | Where-Object { $_.MainWindowTitle -eq $title } | Select-Object -First 1
+        if (-not $w) { Write-Warning "the '$title' window did not open"; continue }
+        [void]$w.CloseMainWindow()
+        $deadline = [DateTime]::Now.AddSeconds(10)
+        while ([DateTime]::Now -lt $deadline -and (Get-Process Kin | Where-Object { $_.MainWindowTitle -eq $title })) { Start-Sleep -Milliseconds 200 }
+    }
+}
 
 foreach ($run in 1..$Runs) {
     $data = Join-Path ([IO.Path]::GetFullPath($env:TEMP)) "kin-idle-$run"
     Remove-Item $data -Recurse -Force -ErrorAction SilentlyContinue
     $sw = [Diagnostics.Stopwatch]::StartNew()
     # The path is quoted, because Start-Process doesn't quote the arguments of an array for you, and the temp folder can have a space.
-    $p = Start-Process $exe -ArgumentList '--data-dir', ('"{0}"' -f $data), '--dev-bind', '127.0.0.1', '--dev-received-dir', ('"{0}"' -f (Join-Path $data 'received')), '--dev-no-windows' -PassThru
+    $kinArgs = @('--data-dir', ('"{0}"' -f $data), '--dev-bind', '127.0.0.1', '--dev-received-dir', ('"{0}"' -f (Join-Path $data 'received')))
+    $kinArgs += $(if ($OpenWindows) { '--dev-no-toasts' } else { '--dev-no-windows' })
+    $p = Start-Process $exe -ArgumentList $kinArgs -PassThru
+    if ($OpenWindows) {
+        Start-Sleep -Seconds 3
+        Open-AndCloseEveryWindow $exe
+    }
     Start-Sleep -Seconds ([math]::Max(0, $IdleSeconds - $sw.Elapsed.TotalSeconds))
     $p.Refresh()
     $perf = Get-CimInstance Win32_PerfFormattedData_PerfProc_Process | Where-Object { $_.IDProcess -eq $p.Id }
@@ -27,6 +53,7 @@ foreach ($run in 1..$Runs) {
     [pscustomobject]@{
         Run = $run
         AfterSeconds = [math]::Round($sw.Elapsed.TotalSeconds)
+        WindowsOpenedAndClosed = $OpenWindows.IsPresent
         Processes = 1 + $children.Count
         WorkingSetMB = [math]::Round($p.WorkingSet64 / 1MB, 1)
         PrivateWorkingSetMB = [math]::Round($perf.WorkingSetPrivate / 1MB, 1)
@@ -39,4 +66,3 @@ foreach ($run in 1..$Runs) {
     if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
     Remove-Item $data -Recurse -Force -ErrorAction SilentlyContinue
 }
-

@@ -7,6 +7,7 @@
 //!     [--send-text "some text" [--send-text-after 2]] [--no-ack]
 //!     [--upload <file>]... [--upload-generated <bytes>]... [--upload-after 3] [--upload-cut <bytes>]
 //!     [--save-dir <folder>] [--download-cut <bytes>] [--no-download] [--refuse-offer <code>]
+//!     [--offline-after <s> [--offline-for <s>]] [--identity-file <path>] [--skip-pairing]
 //! ```
 //!
 //! * `--send-text <text>` sends one `text` message `--send-text-after` seconds (default 2) after the `hello`, with `isUrl` set when the
@@ -28,6 +29,15 @@
 //! dropped after that many bytes to show the resume. It prints `downloaded <name> bytes=<n> sha256=<hex> seconds=<s> mbps=<MB/s>`
 //! for each file, then sends `complete`. `--no-download` acks and leaves the offer alone (to watch it expire or be canceled). A
 //! `cancel` from the PC is acked and printed. A file that can't be downloaded (404, 409) cancels the whole offer with reason `error`.
+//!
+//! **Going away and coming back (1.4, the queue).** `--offline-after <s>` closes the WebSocket that many seconds after the `hello`, stays away
+//! for `--offline-for <s>` (default 5) and then connects again with the same key and a new `hello`. It prints `going offline at=<unix ms>` and
+//! `reconnected at=<unix ms>`, and **one line for every message the PC sends**, `arrival type=<type> id=<id> at=<unix ms>
+//! ms_since_hello=<n>`: what a script reads to see that what the PC queued while the phone was away arrives, in order, within seconds
+//! of the reconnect.
+//!
+//! `--identity-file <path>` keeps the phone's key in that file (made on the first run), so a later run is the same phone, and `--skip-pairing`
+//! connects without pairing (the phone is paired already): together they test what happens across a restart of the PC.
 //!
 //! `--host` replaces the host of the first address in the URL (in developer mode that is `10.0.2.2`, the emulator's alias for
 //! the PC, which the PC itself can't reach). The port is the one in the URL. The phone's key is made fresh on every run.
@@ -435,7 +445,11 @@ async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let url = args.first().expect("usage: fake_phone <pairing URL> [--host H] [--name N] [--seconds S] [--ping-every S]");
     let query = url.split_once('?').expect("not a pairing URL").1;
-    let (token, pc_id) = (param(query, "tk").expect("no tk"), param(query, "id").expect("no id"));
+    let skip_pairing = args.iter().any(|a| a == "--skip-pairing");
+    let (token, pc_id) = (param(query, "tk").unwrap_or(""), param(query, "id").expect("no id"));
+    if token.is_empty() && !skip_pairing {
+        panic!("no tk in the URL (use --skip-pairing for a phone that is paired already)");
+    }
     let first = param(query, "a").expect("no a").split(',').next().unwrap();
     let port: u16 = first.rsplit_once(':').unwrap().1.parse().unwrap();
     let host = arg(&args, "--host").unwrap_or_else(|| first.rsplit_once(':').unwrap().0.to_string());
@@ -466,8 +480,28 @@ async fn main() {
     let download_cut: Option<u64> = arg(&args, "--download-cut").map(|s| s.parse().unwrap());
     let no_download = args.iter().any(|a| a == "--no-download");
     let refuse_offer = arg(&args, "--refuse-offer");
+    let offline_after: Option<u64> = arg(&args, "--offline-after").map(|s| s.parse().unwrap());
+    let offline_for: u64 = arg(&args, "--offline-for").map_or(5, |s| s.parse().unwrap());
 
-    let me = Identity::generate().unwrap();
+    let me = match arg(&args, "--identity-file") {
+        Some(path) => match std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
+            Some(v) => {
+                let hex = |k: &str| -> Vec<u8> {
+                    let s = v[k].as_str().expect("the identity file has the key and the certificate");
+                    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+                };
+                Identity::from_der(hex("key"), hex("cert")).expect("the identity file is valid")
+            }
+            None => {
+                let me = Identity::generate().unwrap();
+                let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+                std::fs::write(&path, json!({ "key": hex(&me.key_der), "cert": hex(&me.cert_der) }).to_string())
+                    .expect("write the identity file");
+                me
+            }
+        },
+        None => Identity::generate().unwrap(),
+    };
     say(&format!("my device ID is {}", me.device_id));
     let provider = crypto_provider();
     let verifier = Pinned { device_id: pc_id.to_string(), algs: provider.signature_verification_algorithms };
@@ -485,19 +519,21 @@ async fn main() {
     let net = Net { connector: TlsConnector::from(Arc::new(config)), host: host.clone(), port };
 
     // Pair.
-    let mut tls = net.connect().await;
-    let body =
-        json!({ "token": token, "name": name, "platform": "android", "model": "Fake", "appVersion": "0.0.0", "protocol": 1 }).to_string();
-    let request = format!(
-        "POST /v1/pair HTTP/1.1\r\nHost: kin\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    tls.write_all(request.as_bytes()).await.unwrap();
-    let mut response = String::new();
-    let _ = tls.read_to_string(&mut response).await;
-    let status = response.lines().next().unwrap_or("");
-    say(&format!("pair: {status} {}", response.rsplit("\r\n\r\n").next().unwrap_or("")));
-    assert!(status.contains(" 200"), "pairing failed");
+    if !skip_pairing {
+        let mut tls = net.connect().await;
+        let body = json!({ "token": token, "name": name, "platform": "android", "model": "Fake", "appVersion": "0.0.0", "protocol": 1 })
+            .to_string();
+        let request = format!(
+            "POST /v1/pair HTTP/1.1\r\nHost: kin\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        tls.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        let _ = tls.read_to_string(&mut response).await;
+        let status = response.lines().next().unwrap_or("");
+        say(&format!("pair: {status} {}", response.rsplit("\r\n\r\n").next().unwrap_or("")));
+        assert!(status.contains(" 200"), "pairing failed");
+    }
 
     // WebSocket.
     let (mut ws, _) =
@@ -505,6 +541,9 @@ async fn main() {
     let hello = json!({ "type": "hello", "id": "fake-hello", "protocol": 1, "name": name, "platform": "android", "appVersion": "0.0.0" });
     ws.send(Message::Text(hello.to_string().into())).await.unwrap();
     say("connected, hello sent");
+    let mut hello_sent_at = Instant::now();
+    let mut offline_at = offline_after.map(|s| Instant::now() + Duration::from_secs(s));
+    let mut hellos = 1;
 
     // Messages from the download tasks (a `complete` or `cancel`) go out on the WebSocket from here.
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
@@ -525,9 +564,27 @@ async fn main() {
         if let Some(at) = upload_at {
             wake = wake.min(at);
         }
+        if let Some(at) = offline_at {
+            wake = wake.min(at);
+        }
         tokio::select! {
             () = tokio::time::sleep_until(wake.into()) => {
                 if Instant::now() >= deadline { break; }
+                if offline_at.is_some_and(|at| Instant::now() >= at) {
+                    // The phone goes away (Wi-Fi off) and comes back.
+                    offline_at = None;
+                    say(&format!("going offline at={}", unix_ms()));
+                    let _ = ws.close(None).await;
+                    tokio::time::sleep(Duration::from_secs(offline_for)).await;
+                    let (new_ws, _) = tokio_tungstenite::client_async(format!("ws://{host}:{port}/v1/ws"), net.connect().await).await.expect("WebSocket upgrade after the reconnect");
+                    ws = new_ws;
+                    hellos += 1;
+                    let hello = json!({ "type": "hello", "id": format!("fake-hello-{hellos}"), "protocol": 1, "name": name, "platform": "android", "appVersion": "0.0.0" });
+                    ws.send(Message::Text(hello.to_string().into())).await.unwrap();
+                    hello_sent_at = Instant::now();
+                    say(&format!("reconnected at={} (hello sent)", unix_ms()));
+                    continue;
+                }
                 if upload_at.is_some_and(|at| Instant::now() >= at) {
                     upload_at = None;
                     let (net, uploads) = (net.clone(), std::mem::take(&mut uploads));
@@ -558,6 +615,9 @@ async fn main() {
             msg = ws.next() => match msg {
                 Some(Ok(Message::Text(t))) => {
                     let v: Value = serde_json::from_str(t.as_str()).unwrap();
+                    if v["type"] != "ack" && v["type"] != "hello" {
+                        say(&format!("arrival type={} id={} at={} ms_since_hello={}", v["type"].as_str().unwrap_or("?"), v["id"].as_str().unwrap_or("-"), unix_ms(), hello_sent_at.elapsed().as_millis()));
+                    }
                     match v["type"].as_str() {
                         Some("ping") => {
                             say(&format!("ping from the PC ({}): acking", v["id"]));

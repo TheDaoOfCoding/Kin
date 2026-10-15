@@ -28,7 +28,7 @@ impl Core {
         lock(&self.settings).images_to_clipboard
     }
 
-    /// The choice "images also go to the clipboard" (a settings window comes in 1.4; `imagesToClipboard` in settings.json is it for now).
+    /// The choice "images also go to the clipboard" (the settings window, or `imagesToClipboard` in settings.json).
     pub fn set_images_to_clipboard(&self, on: bool) {
         let settings = {
             let mut s = lock(&self.settings);
@@ -42,6 +42,7 @@ impl Core {
         if let Err(e) = settings.save(&self.config.data_dir) {
             log::warn!("saving settings.json failed: {e}");
         }
+        self.emit(crate::core::Event::StateChanged);
     }
 
     /// The last file of a transfer has its final name: toast, and the image to the clipboard. **This runs in a task of its own**, never

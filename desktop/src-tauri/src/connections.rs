@@ -19,7 +19,11 @@ pub enum SendOutcome {
     NoReply,
     /// The phone answered with an `error` instead of an `ack`.
     Failed(String),
+    /// The message was never written to the connection (no connection, or it was not open yet).
     NotConnected,
+    /// The message was written, and the connection ended before the `ack` came: the phone may have it (the queue needs to know the
+    /// difference: an offer that may have reached the phone must stay served).
+    Lost,
 }
 
 pub enum ConnCommand {
@@ -34,6 +38,8 @@ pub enum ConnCommand {
         frame: serde_json::Value,
         reply: oneshot::Sender<SendOutcome>,
     },
+    /// Send a new `hello` (the name of this PC changed).
+    Hello,
     /// Tell the phone it was removed: an `unpair` message, then close after the `ack` (or 5 seconds).
     Unpair,
 }
@@ -101,6 +107,12 @@ impl Connections {
             .map(|(_, id, e)| (id.clone(), e.tx.clone()))
     }
 
+    /// A way to send commands to this device, if its `hello` was accepted (the queue sends to the device an item is for, never to
+    /// whichever phone happens to be the newest).
+    pub fn open_sender(&self, device_id: &str) -> Option<UnboundedSender<ConnCommand>> {
+        self.map().get(device_id).filter(|e| e.open_since.is_some()).map(|e| e.tx.clone())
+    }
+
     /// The device was removed: an open connection gets an `unpair`, one that hasn't said `hello` yet is closed with 4003.
     pub fn revoke(&self, device_id: &str) {
         if let Some(e) = self.map().get(device_id) {
@@ -109,6 +121,13 @@ impl Connections {
             } else {
                 ConnCommand::Close { code: CLOSE_UNAUTHORIZED, reason: "device removed" }
             });
+        }
+    }
+
+    /// Every open connection gets a new `hello` (the PC's name changed).
+    pub fn send_hello_to_all(&self) {
+        for e in self.map().values().filter(|e| e.open_since.is_some()) {
+            let _ = e.tx.send(ConnCommand::Hello);
         }
     }
 

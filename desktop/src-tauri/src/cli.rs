@@ -19,11 +19,18 @@ pub struct Config {
     pub dev_print_pair_url: bool,
     /// Don't create windows or show toasts. A toast is logged instead.
     pub dev_no_windows: bool,
+    /// Developer setting (1.4): windows are shown, but toasts are only logged (for screenshots of the windows without a stream of toasts).
+    pub dev_no_toasts: bool,
     /// Developer setting: received files go here instead of `Downloads\Kin` (and instead of `receivedFolder` of settings.json), so
     /// a test never writes to the real Downloads folder.
     pub dev_received_dir: Option<PathBuf>,
     /// Developer hook: pretend the disk has this many free bytes (the check for `507 disk_full` uses it).
     pub dev_free_bytes: Option<u64>,
+    /// Developer hook (1.4): the app's wall clock runs this many seconds ahead, so a text that is 7 days old or an offer that is a day old
+    /// can be tested in a running app (`--dev-clock-offset 604801` makes a queued text expire).
+    pub dev_clock_offset_secs: Option<i64>,
+    /// `--data-dir` (or `KIN_DATA_DIR`) was given: this is not the user's own profile, so "Start with Windows" never touches the registry.
+    pub data_dir_overridden: bool,
 }
 
 impl Config {
@@ -35,9 +42,20 @@ impl Config {
             dev_port: None,
             dev_print_pair_url: false,
             dev_no_windows: false,
+            dev_no_toasts: false,
             dev_received_dir: None,
             dev_free_bytes: None,
+            dev_clock_offset_secs: None,
+            data_dir_overridden: false,
         }
+    }
+
+    /// Whether "Start with Windows" may use the real Run key: **only a release build** that runs the way a user runs it. A debug build (what
+    /// `cargo run` and `cargo test` make) never writes the registry, even with no flag at all: it used to, and a developer who opened the
+    /// settings window and clicked the switch got Kin in their real Run key. Any developer setting, and a data directory of its own (a
+    /// script's throwaway profile), get the file stand-in of `autostart.rs` instead.
+    pub fn autostart_is_real(&self) -> bool {
+        !cfg!(debug_assertions) && !self.dev_hooks_enabled() && !self.data_dir_overridden
     }
 
     /// Whether the app was started with any developer setting. The developer clipboard commands (`--dev-set-clipboard`,
@@ -48,8 +66,15 @@ impl Config {
             || self.dev_port.is_some()
             || self.dev_print_pair_url
             || self.dev_no_windows
+            || self.dev_no_toasts
             || self.dev_received_dir.is_some()
             || self.dev_free_bytes.is_some()
+            || self.dev_clock_offset_secs.is_some()
+    }
+
+    /// Whether toasts are only written to the log (`--dev-no-windows` or `--dev-no-toasts`).
+    pub fn toasts_are_logged_only(&self) -> bool {
+        self.dev_no_windows || self.dev_no_toasts
     }
 
     /// Any developer address setting means loopback only.
@@ -90,6 +115,25 @@ pub enum Command {
     Drop,
     /// Cancel every transfer that is going, in both directions: what the Cancel button of the drop window does for each row.
     CancelTransfers,
+    /// Open the history window (1.4), like the tray's "History".
+    History,
+    /// Open the settings window (1.4), like the tray's "Settings".
+    Settings,
+    /// Open the debug window (1.4), like Shift-click on the tray icon.
+    DebugWindow,
+    /// Developer hook (1.4): write what a window would show (`history`, `settings`, `debug` or `queue`) to `view-<name>.json` in the data
+    /// directory, so a script can look at it without a window. Refused unless the app was started with a developer setting.
+    DevDumpView(String),
+    /// Developer hook (1.4): what a click in the history window does, without a window: `cancel`, `retry` or `open` on an item (its ID is in
+    /// `view-history.json`). The outcome goes to `dev-history-result.json`. Refused unless the app was started with a developer setting.
+    DevHistory { action: String, id: String },
+    /// Developer hook (1.4): change a setting the way the settings window does (`deviceName`, `autoClipboardSync`, `imagesToClipboard`,
+    /// `receivedFolder`, `hotkey`, `startWithWindows`) and write the outcome to `dev-set-result.json`. Refused unless the app was started with
+    /// a developer setting.
+    DevSet { key: String, value: String },
+    /// Developer hook (1.4): the "Export logs" button without a dialog: write the zip to this path. Refused unless the app was started with a
+    /// developer setting.
+    DevExportLogs(PathBuf),
     /// Quit.
     Quit,
 }
@@ -107,6 +151,13 @@ impl Command {
             Command::Send(_) => "send files",
             Command::Drop => "drop window",
             Command::CancelTransfers => "cancel transfers",
+            Command::History => "history window",
+            Command::Settings => "settings window",
+            Command::DebugWindow => "debug window",
+            Command::DevDumpView(_) => "dev dump view",
+            Command::DevExportLogs(_) => "dev export logs",
+            Command::DevSet { .. } => "dev set",
+            Command::DevHistory { .. } => "dev history",
             Command::Quit => "quit",
         }
     }
@@ -147,8 +198,10 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
     let mut dev_port = env("KIN_DEV_PORT");
     let mut print_url = truthy(env("KIN_DEV_PRINT_PAIR_URL"));
     let mut no_windows = truthy(env("KIN_DEV_NO_WINDOWS"));
+    let mut no_toasts = truthy(env("KIN_DEV_NO_TOASTS"));
     let mut received_dir = env("KIN_DEV_RECEIVED_DIR").map(PathBuf::from);
     let mut free_bytes = env("KIN_DEV_FREE_BYTES");
+    let mut clock_offset = env("KIN_DEV_CLOCK_OFFSET");
     let (mut commands, mut unknown) = (Vec::new(), Vec::new());
     let mut mark: Option<Exclusion> = None;
 
@@ -168,8 +221,25 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
             "--dev-port" => dev_port = Some(value(name)?),
             "--dev-print-pair-url" => print_url = true,
             "--dev-no-windows" => no_windows = true,
+            "--dev-no-toasts" => no_toasts = true,
             "--dev-received-dir" => received_dir = Some(PathBuf::from(value(name)?)),
             "--dev-free-bytes" => free_bytes = Some(value(name)?),
+            "--dev-clock-offset" => clock_offset = Some(value(name)?),
+            "--history" => commands.push(Command::History),
+            "--settings" => commands.push(Command::Settings),
+            "--debug-window" => commands.push(Command::DebugWindow),
+            "--dev-dump-view" => commands.push(Command::DevDumpView(value(name)?)),
+            "--dev-history" => {
+                let action = value(name)?;
+                let id = it.next().cloned().ok_or_else(|| "--dev-history needs an action and an item ID".to_string())?;
+                commands.push(Command::DevHistory { action, id });
+            }
+            "--dev-set" => {
+                let key = value(name)?;
+                let val = it.next().cloned().ok_or_else(|| "--dev-set needs a setting and a value".to_string())?;
+                commands.push(Command::DevSet { key, value: val });
+            }
+            "--dev-export-logs" => commands.push(Command::DevExportLogs(PathBuf::from(value(name)?))),
             "--drop" => commands.push(Command::Drop),
             "--cancel-transfers" => commands.push(Command::CancelTransfers),
             // Every argument up to the next flag is a path: Explorer's "Send to" appends the selected files to the shortcut.
@@ -211,11 +281,16 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
         }
     }
 
+    let data_dir_overridden = data_dir.is_some();
     let data_dir = match data_dir {
         Some(d) => d,
         None => default_data_dir(env)?,
     };
     let mut config = Config::new(data_dir);
+    config.data_dir_overridden = data_dir_overridden;
+    if let Some(v) = clock_offset {
+        config.dev_clock_offset_secs = Some(v.parse().map_err(|_| format!("--dev-clock-offset: {v:?} is not a number of seconds"))?);
+    }
     if let Some(v) = dev_bind {
         let ip: IpAddr = v.parse().map_err(|_| format!("--dev-bind: {v:?} is not an IP address"))?;
         if !ip.is_loopback() {
@@ -235,6 +310,7 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
     }
     config.dev_print_pair_url = print_url;
     config.dev_no_windows = no_windows;
+    config.dev_no_toasts = no_toasts;
     config.dev_received_dir = received_dir;
     if let Some(v) = free_bytes {
         config.dev_free_bytes = Some(v.parse().map_err(|_| format!("--dev-free-bytes: {v:?} is not a number of bytes"))?);
@@ -384,6 +460,32 @@ mod tests {
         ] {
             assert!(parse(&args(&format!("--data-dir x {flag}")), &no_env).unwrap().config.dev_hooks_enabled(), "{flag}");
         }
+    }
+
+    #[test]
+    fn the_1_4_commands_and_the_clock_offset() {
+        let p = parse(&args("--data-dir x --history --settings --debug-window --dev-dump-view queue --dev-clock-offset 604801"), &no_env)
+            .unwrap();
+        assert_eq!(p.commands, [Command::History, Command::Settings, Command::DebugWindow, Command::DevDumpView("queue".into())]);
+        assert_eq!(p.config.dev_clock_offset_secs, Some(604_801));
+        assert!(p.config.dev_hooks_enabled(), "the offset is a developer setting");
+        assert!(parse(&args("--data-dir x --dev-clock-offset soon"), &no_env).is_err());
+        let p = parse(&args("--data-dir x --dev-export-logs C:\\out\\logs.zip"), &no_env).unwrap();
+        assert_eq!(p.commands, [Command::DevExportLogs("C:\\out\\logs.zip".into())]);
+    }
+
+    #[test]
+    fn autostart_touches_the_registry_only_in_a_normal_run() {
+        // The user's own profile and no developer flag: the real Run key, **in a release build only**. This test runs in a debug build, where a run
+        // with no flags at all must never write the registry.
+        assert_eq!(parse(&[], &appdata).unwrap().config.autostart_is_real(), !cfg!(debug_assertions));
+        #[cfg(debug_assertions)]
+        assert!(!parse(&[], &appdata).unwrap().config.autostart_is_real(), "a debug build with no flag never writes the Run key");
+        // A throwaway profile, or any developer flag: the stand-in file, never the registry.
+        assert!(!parse(&args("--data-dir x"), &no_env).unwrap().config.autostart_is_real());
+        assert!(!parse(&args("--dev-no-windows"), &appdata).unwrap().config.autostart_is_real());
+        let env = |k: &str| (k == "KIN_DATA_DIR").then(|| "C:\\tmp\\kin".to_string());
+        assert!(!parse(&[], &env).unwrap().config.autostart_is_real(), "KIN_DATA_DIR counts too");
     }
 
     #[test]

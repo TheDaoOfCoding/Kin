@@ -107,8 +107,18 @@ pub fn uuid_v7(unix_ms: u64) -> String {
     format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..])
 }
 
+/// Developer hook (`--dev-clock-offset <seconds>`): the app's wall clock runs this many milliseconds ahead of the real one, so expiry
+/// (a text that is 7 days old, an offer that is 24 hours old) can be tested in a running app without waiting. Zero in a normal run.
+static CLOCK_OFFSET_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub fn set_clock_offset_ms(offset: i64) {
+    CLOCK_OFFSET_MS.store(offset, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The wall clock, in Unix milliseconds (plus the developer offset, which is zero unless asked for).
 pub fn unix_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    let real = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+    (real + CLOCK_OFFSET_MS.load(std::sync::atomic::Ordering::Relaxed)).max(0) as u64
 }
 
 /// Percent-encodes UTF-8 bytes, leaving only `A-Z a-z 0-9 - . _ ~`, with uppercase hex.

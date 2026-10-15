@@ -77,6 +77,13 @@ pub enum Action {
     },
     RemovePeerAndClose,
     IgnoreDuplicate,
+    /// A repeated `offer` from the same PC (changelog 52): acked with the first response, nothing is downloaded again. The app carries on with
+    /// an unfinished download, re-sends the `complete` of a finished one that was not acked, or the `cancel` of a canceled or failed one.
+    /// (`ignore_duplicate` in the vectors.)
+    RepeatedOffer {
+        id: String,
+        progress: Progress,
+    },
     CloseOnly,
 }
 
@@ -96,7 +103,7 @@ impl Action {
             Action::MarkTransferDone { .. } => "mark_transfer_done",
             Action::CancelTransfer { .. } => "cancel_transfer",
             Action::RemovePeerAndClose => "remove_peer_and_close",
-            Action::IgnoreDuplicate => "ignore_duplicate",
+            Action::IgnoreDuplicate | Action::RepeatedOffer { .. } => "ignore_duplicate",
             Action::CloseOnly => "close_only",
         })
     }
@@ -146,6 +153,37 @@ pub fn error_message(code: &str, message: &str, reference: Option<&str>) -> Valu
 pub trait Dedup {
     fn lookup(&mut self, id: &str) -> Option<String>;
     fn remember(&mut self, id: &str, response: &str);
+    /// What the receiver knows of an `offer`'s ID, for the one type with a rule of its own for a repeat (protocol.md, changelog 52). `files`
+    /// are the files of the offer that just arrived. Only a phone receives offers, so the PC's database memory keeps the default (it never
+    /// sees a repeated offer).
+    fn offer_state(&mut self, _id: &str, _files: &[OfferedFile]) -> OfferState {
+        OfferState::NotAnOffer
+    }
+    /// Called when an `offer` is processed for the first time: its ID is now an offer of this PC, with these files, not over.
+    fn remember_offer(&mut self, _id: &str, _files: &[OfferedFile]) {}
+}
+
+/// How the download of an offer stands (what the receiving app has done with it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Progress {
+    /// Not over: running, or waiting to resume.
+    Unfinished,
+    Done,
+    Canceled,
+    Failed,
+}
+
+/// What the receiver knows about the ID of an arriving `offer`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OfferState {
+    /// No offer has this ID. (If the ID is remembered at all it was another message, a `text` say: that is a reuse, `bad_request`.)
+    NotAnOffer,
+    /// The ID is an offer of another paired PC: a reuse, `bad_request`.
+    OtherDevice,
+    /// The ID is an offer this same paired PC made before: a **repeat**, whatever the state of its download. The phone answers with the first
+    /// response and downloads nothing again; the state says what it re-sends (a `complete` that was not acked, the `cancel`). `same_files`:
+    /// the offer lists the same `fileId`s with the same sizes as the first one; if not it is `bad_request`.
+    Own { progress: Progress, same_files: bool },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -312,12 +350,35 @@ impl Receiver {
             _ => return bad_fields(reference),
         };
         let is_unpair = ty == "unpair";
-        if let Some(first) = dedup.lookup(id) {
+        let first = dedup.lookup(id);
+        if let Action::StartDownload { files, .. } = &new_action {
+            // An offer whose ID is known (changelog 52). **The same paired PC repeating its own offer is a repeat, whatever the state of the
+            // download:** the phone answers with the first response (the stored ack), downloads nothing again, and the app re-sends what the
+            // state calls for. **Any other reuse is `bad_request`** with `ref` = the offer's `id`: the ID of a `text`, a `clipboard` or any other
+            // message, the ID of another PC's offer, and a repeat that lists other files than the first one.
+            match dedup.offer_state(id, files) {
+                OfferState::OtherDevice => return Outcome::error("bad_request", "That ID belongs to another device.", reference, None),
+                OfferState::Own { same_files: false, .. } => {
+                    return Outcome::error("bad_request", "That ID was used for other files.", reference, None);
+                }
+                OfferState::Own { progress, .. } => {
+                    let reply = first.and_then(|f| serde_json::from_str(&f).ok()).unwrap_or_else(|| ack_message(id));
+                    return Outcome { reply: Some(reply), action: Action::RepeatedOffer { id: id.to_string(), progress }, close: None };
+                }
+                OfferState::NotAnOffer if first.is_some() => {
+                    return Outcome::error("bad_request", "That ID was used before.", reference, None);
+                }
+                OfferState::NotAnOffer => {}
+            }
+        } else if let Some(first) = first {
             let reply = serde_json::from_str(&first).unwrap_or_else(|_| ack_message(id));
             return Outcome { reply: Some(reply), action: Action::IgnoreDuplicate, close: is_unpair.then_some(CLOSE_NORMAL) };
         }
         let reply = ack_message(id);
         dedup.remember(id, &reply.to_string());
+        if let Action::StartDownload { files, .. } = &new_action {
+            dedup.remember_offer(id, files);
+        }
         Outcome { reply: Some(reply), action: new_action, close: is_unpair.then_some(CLOSE_NORMAL) }
     }
 }

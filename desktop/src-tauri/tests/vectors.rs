@@ -11,7 +11,7 @@ use axum::body::Body;
 use axum::http::Request;
 use common::*;
 use kin_lib::encoding::*;
-use kin_lib::messages::{self, Dedup, Frame, Receiver, Role};
+use kin_lib::messages::{self, Dedup, Frame, OfferState, OfferedFile, Progress, Receiver, Role};
 use kin_lib::pairing::{SeedState, pair_url};
 use kin_lib::server::{self, ApiError, Peer};
 use kin_lib::tls::certificate_profile_violations;
@@ -141,17 +141,55 @@ fn http_error_table() {
 
 // ----- messages.json ----------------------------------------------------------------------------------------------
 
-/// Dedup memory in RAM, for the receiver tests.
-#[derive(Default)]
-struct MemoryDedup(HashMap<String, String>);
+/// An offer as the receiver remembers it: which paired PC made it, how its download stands, and its files (`fileId`, size).
+struct OfferRecord {
+    device: String,
+    progress: Progress,
+    files: Vec<(String, u64)>,
+}
+
+fn file_key(files: &[OfferedFile]) -> Vec<(String, u64)> {
+    let mut key: Vec<(String, u64)> = files.iter().map(|f| (f.file_id.clone(), f.size)).collect();
+    key.sort();
+    key
+}
+
+/// Dedup memory in RAM, for the receiver tests. Message IDs are remembered per paired PC (as the database does); an offer's ID is
+/// remembered for all of them, with the PC that made it.
+struct MemoryDedup {
+    seen: HashMap<(String, String), String>,
+    /// The offers by transfer ID (the `transfer_over` event of a sequence changes `progress`).
+    offers: HashMap<String, OfferRecord>,
+    /// The paired PC on the connection now (`{ "event": "reconnect", "device": "second" }` changes it).
+    device: String,
+}
+
+impl Default for MemoryDedup {
+    fn default() -> Self {
+        MemoryDedup { seen: HashMap::new(), offers: HashMap::new(), device: "first".to_string() }
+    }
+}
 
 impl Dedup for MemoryDedup {
     fn lookup(&mut self, id: &str) -> Option<String> {
-        self.0.get(id).cloned()
+        self.seen.get(&(self.device.clone(), id.to_string())).cloned()
     }
 
     fn remember(&mut self, id: &str, response: &str) {
-        self.0.insert(id.to_string(), response.to_string());
+        self.seen.insert((self.device.clone(), id.to_string()), response.to_string());
+    }
+
+    fn offer_state(&mut self, id: &str, files: &[OfferedFile]) -> OfferState {
+        match self.offers.get(id) {
+            None => OfferState::NotAnOffer,
+            Some(o) if o.device != self.device => OfferState::OtherDevice,
+            Some(o) => OfferState::Own { progress: o.progress, same_files: o.files == file_key(files) },
+        }
+    }
+
+    fn remember_offer(&mut self, id: &str, files: &[OfferedFile]) {
+        self.offers
+            .insert(id.to_string(), OfferRecord { device: self.device.clone(), progress: Progress::Unfinished, files: file_key(files) });
     }
 }
 
@@ -289,6 +327,16 @@ const MESSAGES_VALID_SCOPE_1_2: &[&str] = &["text-*", "clipboard-*", "duplicate-
 const MESSAGES_VALID_SCOPE_1_3: &[&str] = &["offer-*", "complete-*", "cancel-*"];
 const MESSAGES_INVALID_SCOPE_1_3: &[&str] = &["offer-*", "complete-*", "cancel-*"];
 const MESSAGES_SEQUENCE_SCOPE_1_3: &[&str] = &["duplicate-offer-is-acked-not-restarted"];
+/// 1.4: the offer-reuse rule and the queue's re-sends (the sequences have `reconnect` and `transfer_over` events).
+const MESSAGES_SEQUENCE_SCOPE_1_4: &[&str] = &[
+    "offer-reusing-*",
+    "offer-from-another-device-is-bad-request",
+    "offer-repeated-while-unfinished-is-acked-after-a-reconnect",
+    "same-pc-repeat-*",
+    "complete-re-sent-*",
+    "cancel-re-sent-*",
+    "queue-*",
+];
 const MESSAGES_INVALID_SCOPE_1_2: &[&str] = &["text-*", "clipboard-*"];
 const MESSAGES_SEQUENCE_SCOPE_1_2: &[&str] =
     &["handshake-then-text-then-duplicate", "invalid-message-keeps-connection-open", "rejected-message-id-is-not-remembered"];
@@ -368,8 +416,10 @@ fn messages_1_2_scope_is_what_the_readme_says() {
 #[test]
 fn messages_sequences() {
     let root = load("messages.json");
-    let scope = with(&with(MESSAGES_SEQUENCE_SCOPE, MESSAGES_SEQUENCE_SCOPE_1_2), MESSAGES_SEQUENCE_SCOPE_1_3);
+    let scope =
+        with(&with(&with(MESSAGES_SEQUENCE_SCOPE, MESSAGES_SEQUENCE_SCOPE_1_2), MESSAGES_SEQUENCE_SCOPE_1_3), MESSAGES_SEQUENCE_SCOPE_1_4);
     assert_patterns_match("sequences", &scope, &names(&root["sequences"]));
+    let mut with_events = 0;
     for seq in root["sequences"].as_array().unwrap() {
         let seq_name = seq["name"].as_str().unwrap();
         if !matches(seq_name, &scope) {
@@ -378,6 +428,34 @@ fn messages_sequences() {
         // Each role has its own receiver, with its own state and memory of IDs. `from` is the sender.
         let mut receivers: HashMap<&str, (Receiver, MemoryDedup)> = HashMap::new();
         for (i, step) in seq["steps"].as_array().unwrap().iter().enumerate() {
+            // An event is something that happens to the receiving app, not a frame. A new connection starts every receiver again (before
+            // the hello) and keeps the memory of IDs, which is in the database. The end of a transfer uses its ID up.
+            if let Some(event) = step.get("event").and_then(Value::as_str) {
+                with_events += 1;
+                for (role, (rx, dedup)) in receivers.iter_mut() {
+                    match event {
+                        "reconnect" => {
+                            *rx = Receiver::new(role_of(&json!(*role)));
+                            // `"device": "second"`: the new connection is from another paired PC.
+                            dedup.device = step.get("device").and_then(Value::as_str).unwrap_or("first").to_string();
+                        }
+                        "transfer_over" => {
+                            let id = step["transferId"].as_str().expect("transfer_over names a transfer");
+                            let how = match step["how"].as_str().expect("transfer_over says how") {
+                                "done" => Progress::Done,
+                                "canceled" => Progress::Canceled,
+                                "failed" => Progress::Failed,
+                                other => panic!("{seq_name} step {}: unknown way to end a transfer: {other}", i + 1),
+                            };
+                            if let Some(o) = dedup.offers.get_mut(id) {
+                                o.progress = how;
+                            }
+                        }
+                        other => panic!("{seq_name} step {}: unknown event {other}", i + 1),
+                    }
+                }
+                continue;
+            }
             let receiver_role = if step["from"] == "phone" { "pc" } else { "phone" };
             let (rx, dedup) =
                 receivers.entry(receiver_role).or_insert_with(|| (Receiver::new(role_of(&json!(receiver_role))), MemoryDedup::default()));
@@ -389,6 +467,7 @@ fn messages_sequences() {
             check_outcome(&format!("{seq_name} step {}", i + 1), &out, &step["expect"], id.as_deref());
         }
     }
+    assert!(with_events >= 8, "the 1.4 sequences have events: {with_events}");
 }
 
 #[test]

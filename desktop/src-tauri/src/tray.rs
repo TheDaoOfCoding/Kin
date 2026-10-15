@@ -1,21 +1,22 @@
-//! The tray icon: its icon and tooltip show the state (not paired, phone connected, phone offline, and the progress of a transfer),
-//! a left click opens the drop window, and the menu has the status line, "Send files...", "Send clipboard to phone", "Pair new
-//! phone", "Open received folder", "Ping phone", the clipboard sync check item, "Open log folder" and "Quit".
+//! The tray icon: its icon and tooltip show the state (not paired, phone connected, phone offline with the time it was last seen, and the
+//! progress of a transfer), a left click opens the drop window (a Shift-click opens the debug window), and the menu is the one of
+//! docs/windows.md: the status line, "Send files...", "Send clipboard to phone", "Pair new phone", "Open received folder", "History",
+//! "Settings" and "Quit". (Pinging the phone, the clipboard sync switch and the log folder are in the windows or on the command line.)
 use tauri::image::Image;
-use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{App, AppHandle, Wry};
 
 use crate::core::{LinkState, Snapshot};
+use crate::encoding::unix_ms;
 
 pub const TRAY_ID: &str = "kin";
 pub const MENU_PAIR: &str = "pair";
-pub const MENU_PING: &str = "ping";
 pub const MENU_SEND_CLIPBOARD: &str = "send_clipboard";
 pub const MENU_SEND_FILES: &str = "send_files";
 pub const MENU_OPEN_FOLDER: &str = "open_folder";
-pub const MENU_AUTO_SYNC: &str = "auto_sync";
-pub const MENU_LOGS: &str = "logs";
+pub const MENU_HISTORY: &str = "history";
+pub const MENU_SETTINGS: &str = "settings";
 pub const MENU_QUIT: &str = "quit";
 
 /// The tray icon is drawn at this size. The shell scales it to 16 to 32 px, and a small image keeps the memory use low.
@@ -23,8 +24,6 @@ const ICON_SIZE: usize = 64;
 
 pub struct Tray {
     status: MenuItem<Wry>,
-    /// "Sync clipboard automatically". Windows flips the check by itself when it is clicked.
-    pub auto_sync: CheckMenuItem<Wry>,
     /// The icon without a state dot, at `ICON_SIZE`.
     base: (Vec<u8>, usize),
 }
@@ -87,36 +86,70 @@ fn icon(base: &(Vec<u8>, usize), state: &LinkState) -> Image<'static> {
     Image::new_owned(with_dot(&base.0, base.1, state), base.1 as u32, base.1 as u32)
 }
 
-pub fn tooltip(snapshot: &Snapshot) -> String {
-    let base = match (&snapshot.state, snapshot.headline_device()) {
-        (LinkState::NotPaired, _) | (_, None) => "Kin: not paired".to_string(),
-        (LinkState::PhoneConnected, Some(d)) => format!("Kin: {} connected", d.name),
-        (LinkState::PhoneOffline, Some(d)) => format!("Kin: {} offline", d.name),
-    };
-    match &snapshot.transfers {
-        Some(progress) => format!("{base}, {progress}"),
-        None => base,
+/// "last seen 14:32" for the phone the tray talks about, from Windows' local time. `None` if the phone was never seen.
+fn last_seen(snapshot: &Snapshot) -> Option<String> {
+    let seen = snapshot.headline_device()?.last_seen?;
+    crate::localtime::last_seen_for(seen, unix_ms() as i64)
+}
+
+fn queued_note(snapshot: &Snapshot) -> String {
+    match snapshot.queued {
+        0 => String::new(),
+        n => format!(" \u{b7} {n} queued"),
     }
 }
 
-fn status_line(snapshot: &Snapshot) -> String {
+/// The tooltip, at most 127 characters (what Windows shows). `seen` is the "last seen" time of an offline phone.
+pub fn tooltip_with(snapshot: &Snapshot, seen: Option<&str>) -> String {
+    let base = match (&snapshot.state, snapshot.headline_device()) {
+        (LinkState::NotPaired, _) | (_, None) => "Kin: not paired".to_string(),
+        (LinkState::PhoneConnected, Some(d)) => format!("Kin: {} connected", d.name),
+        (LinkState::PhoneOffline, Some(d)) => match seen {
+            Some(t) => format!("Kin: {} offline, last seen {t}", d.name),
+            None => format!("Kin: {} offline", d.name),
+        },
+    };
+    let text = match &snapshot.transfers {
+        Some(progress) => format!("{base}, {progress}"),
+        None => base,
+    };
+    let text = format!("{text}{}", queued_note(snapshot));
+    text.chars().take(127).collect()
+}
+
+pub fn tooltip(snapshot: &Snapshot) -> String {
+    tooltip_with(snapshot, last_seen(snapshot).as_deref())
+}
+
+/// The status line of the menu: "Phone offline – last seen 14:32" when the phone is away.
+pub fn status_line_with(snapshot: &Snapshot, seen: Option<&str>) -> String {
     match (&snapshot.state, snapshot.headline_device()) {
         (LinkState::NotPaired, _) | (_, None) => "Not paired".to_string(),
-        (LinkState::PhoneConnected, Some(d)) => format!("Phone connected: {}", d.name),
-        (LinkState::PhoneOffline, Some(d)) => format!("Phone offline: {}", d.name),
+        (LinkState::PhoneConnected, Some(d)) => format!("Phone connected: {}{}", d.name, queued_note(snapshot)),
+        (LinkState::PhoneOffline, Some(d)) => match seen {
+            Some(t) => format!("Phone offline \u{2013} last seen {t}{}", queued_note(snapshot)),
+            None => format!("Phone offline: {}{}", d.name, queued_note(snapshot)),
+        },
     }
+}
+
+/// The status line as the tray menu shows it right now (also in `status.json`, for scripts).
+pub fn status_text(snapshot: &Snapshot) -> String {
+    status_line(snapshot)
+}
+
+fn status_line(snapshot: &Snapshot) -> String {
+    status_line_with(snapshot, last_seen(snapshot).as_deref())
 }
 
 pub fn build(app: &App, snapshot: &Snapshot) -> tauri::Result<Tray> {
     let status = MenuItem::with_id(app, "status", status_line(snapshot), false, None::<&str>)?;
     let send_files = MenuItem::with_id(app, MENU_SEND_FILES, "Send files\u{2026}", true, None::<&str>)?;
     let send = MenuItem::with_id(app, MENU_SEND_CLIPBOARD, "Send clipboard to phone", true, None::<&str>)?;
-    let open_folder = MenuItem::with_id(app, MENU_OPEN_FOLDER, "Open received folder", true, None::<&str>)?;
     let pair = MenuItem::with_id(app, MENU_PAIR, "Pair new phone", true, None::<&str>)?;
-    let ping = MenuItem::with_id(app, MENU_PING, "Ping phone", true, None::<&str>)?;
-    let auto_sync =
-        CheckMenuItem::with_id(app, MENU_AUTO_SYNC, "Sync clipboard automatically", true, snapshot.auto_clipboard_sync, None::<&str>)?;
-    let logs = MenuItem::with_id(app, MENU_LOGS, "Open log folder", true, None::<&str>)?;
+    let open_folder = MenuItem::with_id(app, MENU_OPEN_FOLDER, "Open received folder", true, None::<&str>)?;
+    let history = MenuItem::with_id(app, MENU_HISTORY, "History", true, None::<&str>)?;
+    let settings = MenuItem::with_id(app, MENU_SETTINGS, "Settings", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, MENU_QUIT, "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
@@ -127,9 +160,8 @@ pub fn build(app: &App, snapshot: &Snapshot) -> tauri::Result<Tray> {
             &send,
             &pair,
             &open_folder,
-            &ping,
-            &auto_sync,
-            &logs,
+            &history,
+            &settings,
             &PredefinedMenuItem::separator(app)?,
             &quit,
         ],
@@ -143,14 +175,26 @@ pub fn build(app: &App, snapshot: &Snapshot) -> tauri::Result<Tray> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| crate::app::on_menu(app, event.id().as_ref()))
-        // A left click opens the drop window: Windows doesn't support dropping files on a tray icon, so this window is the target.
+        // A left click opens the drop window: Windows doesn't support dropping files on a tray icon, so this window is the target. With
+        // Shift held it opens the debug window instead (it is also reachable from the Settings window).
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
-                crate::ui::open_drop_window(tray.app_handle());
+                if shift_is_down() {
+                    crate::ui::open_debug_window(tray.app_handle());
+                } else {
+                    crate::ui::open_drop_window(tray.app_handle());
+                }
             }
         })
         .build(app)?;
-    Ok(Tray { status, auto_sync, base })
+    Ok(Tray { status, base })
+}
+
+/// Whether Shift is held down right now (the tray click that opens the debug window).
+fn shift_is_down() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_SHIFT};
+    // SAFETY: `GetKeyState` only reads the state of a key; a negative value means it is down.
+    unsafe { GetKeyState(VK_SHIFT.0 as i32) < 0 }
 }
 
 impl Tray {
@@ -162,7 +206,6 @@ impl Tray {
         let _ = tray.set_tooltip(Some(tooltip(snapshot)));
         let _ = tray.set_icon(Some(icon(&self.base, &snapshot.state)));
         let _ = self.status.set_text(status_line(snapshot));
-        let _ = self.auto_sync.set_checked(snapshot.auto_clipboard_sync);
     }
 }
 
@@ -175,15 +218,38 @@ mod tests {
         DeviceRow { device_id: "x".into(), name: name.into(), platform: "android".into(), connected, paired_at: 1, last_seen: None }
     }
 
+    fn s(state: LinkState, devices: Vec<DeviceRow>) -> Snapshot {
+        Snapshot { state, devices, auto_clipboard_sync: true, transfers: None, queued: 0 }
+    }
+
     #[test]
     fn text_follows_the_state() {
-        let s = |state, devices| Snapshot { state, devices, auto_clipboard_sync: true, transfers: None };
-        assert_eq!(tooltip(&s(LinkState::NotPaired, vec![])), "Kin: not paired");
-        assert_eq!(tooltip(&s(LinkState::PhoneConnected, vec![device("Pixel 8", true)])), "Kin: Pixel 8 connected");
-        assert_eq!(status_line(&s(LinkState::PhoneOffline, vec![device("Pixel 8", false)])), "Phone offline: Pixel 8");
-        assert_eq!(status_line(&s(LinkState::NotPaired, vec![])), "Not paired");
+        assert_eq!(tooltip_with(&s(LinkState::NotPaired, vec![]), None), "Kin: not paired");
+        assert_eq!(tooltip_with(&s(LinkState::PhoneConnected, vec![device("Pixel 8", true)]), None), "Kin: Pixel 8 connected");
+        assert_eq!(status_line_with(&s(LinkState::PhoneOffline, vec![device("Pixel 8", false)]), None), "Phone offline: Pixel 8");
+        assert_eq!(status_line_with(&s(LinkState::NotPaired, vec![]), None), "Not paired");
         let sending = Snapshot { transfers: Some("sending 45%".into()), ..s(LinkState::PhoneConnected, vec![device("Pixel 8", true)]) };
-        assert_eq!(tooltip(&sending), "Kin: Pixel 8 connected, sending 45%");
+        assert_eq!(tooltip_with(&sending, None), "Kin: Pixel 8 connected, sending 45%");
+    }
+
+    #[test]
+    fn an_offline_phone_shows_when_it_was_last_seen() {
+        let offline = s(LinkState::PhoneOffline, vec![device("Pixel 8", false)]);
+        assert_eq!(status_line_with(&offline, Some("14:32")), "Phone offline \u{2013} last seen 14:32");
+        assert_eq!(tooltip_with(&offline, Some("yesterday 09:10")), "Kin: Pixel 8 offline, last seen yesterday 09:10");
+        // A connected phone never shows it.
+        let online = s(LinkState::PhoneConnected, vec![device("Pixel 8", true)]);
+        assert_eq!(status_line_with(&online, Some("14:32")), "Phone connected: Pixel 8");
+    }
+
+    #[test]
+    fn queued_sends_are_counted_in_the_status_and_the_tooltip() {
+        let mut offline = s(LinkState::PhoneOffline, vec![device("Pixel 8", false)]);
+        offline.queued = 2;
+        assert_eq!(status_line_with(&offline, Some("14:32")), "Phone offline \u{2013} last seen 14:32 \u{b7} 2 queued");
+        assert!(tooltip_with(&offline, Some("14:32")).ends_with("\u{b7} 2 queued"));
+        let long = Snapshot { queued: 99, ..s(LinkState::PhoneOffline, vec![device(&"N".repeat(200), false)]) };
+        assert!(tooltip_with(&long, Some("14:32")).chars().count() <= 127, "Windows shows at most 127 characters");
     }
 
     #[test]

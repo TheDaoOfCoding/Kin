@@ -96,7 +96,12 @@ pub fn test_core(identity: Identity, pc_name: &str) -> TestEnv {
 /// [`test_core`] with a chance to change the configuration first. Received files go to `received` inside the test's temporary
 /// directory, so **no test ever writes to the real Downloads folder**.
 pub fn test_core_with(identity: Identity, pc_name: &str, configure: impl FnOnce(&mut Config)) -> TestEnv {
-    let dir = tempfile::tempdir().unwrap();
+    test_core_in(tempfile::tempdir().unwrap(), identity, pc_name, Db::open_in_memory().unwrap(), configure)
+}
+
+/// [`test_core_with`] on a data directory and a database that the caller made, so a test can stop the app and start it again over the same
+/// files (a restart of `Kin.exe`).
+pub fn test_core_in(dir: tempfile::TempDir, identity: Identity, pc_name: &str, db: Db, configure: impl FnOnce(&mut Config)) -> TestEnv {
     let mut config = Config::new(dir.path().to_path_buf());
     config.dev_bind = Some("127.0.0.1".parse().unwrap());
     config.dev_qr_address = Some("10.0.2.2".parse().unwrap());
@@ -108,7 +113,7 @@ pub fn test_core_with(identity: Identity, pc_name: &str, configure: impl FnOnce(
     let clipboard = Arc::new(MemoryClipboard::default());
     let opener = Arc::new(RecordingOpener::default());
     let services = Services { clipboard: clipboard.clone(), opener: opener.clone(), clock: Arc::new(MonotonicClock::new()) };
-    let core = Arc::new(Core::new(config, identity, Db::open_in_memory().unwrap(), pc_name.to_string(), tx, services));
+    let core = Arc::new(Core::new(config, identity, db, pc_name.to_string(), tx, services));
     TestEnv { core, events, dir, clipboard, opener }
 }
 
@@ -416,6 +421,43 @@ impl World {
         World { env, server, pc, phone }
     }
 
+    /// Stops the app (the server and every connection) and starts it again over the same data directory and database, with the same
+    /// keys: what a restart of `Kin.exe` is. The phone stays paired (its record is in the database) and has to connect again.
+    pub async fn restart(self) -> World {
+        let World { env, server, pc, phone } = self;
+        server.stop().await;
+        let TestEnv { core, events: _, dir, clipboard: _, opener: _ } = env;
+        drop(core);
+        let identity = Identity::from_der(pc.pkcs8.clone(), pc.cert.clone()).unwrap();
+        let db = Db::open(&dir.path().join("kin.db")).unwrap();
+        let env = test_core_in(dir, identity, "Desk PC", db, |_| {});
+        let server = start(&env.core).await;
+        World { env, server, pc, phone }
+    }
+
+    /// Like [`World::new`], but the database is a file in the data directory, so `restart` can find it again.
+    pub async fn new_on_disk() -> World {
+        let pc_identity = Identity::generate().unwrap();
+        let pc = TestKey {
+            pkcs8: pc_identity.key_der.clone(),
+            cert: pc_identity.cert_der.clone(),
+            device_id: pc_identity.device_id.clone(),
+            short_id: pc_identity.short_id.clone(),
+        };
+        let phone_identity = Identity::generate().unwrap();
+        let phone = TestKey {
+            pkcs8: phone_identity.key_der,
+            cert: phone_identity.cert_der,
+            device_id: phone_identity.device_id,
+            short_id: phone_identity.short_id,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("kin.db")).unwrap();
+        let env = test_core_in(dir, pc_identity, "Desk PC", db, |_| {});
+        let server = start(&env.core).await;
+        World { env, server, pc, phone }
+    }
+
     pub fn core(&self) -> &Core {
         &self.env.core
     }
@@ -514,5 +556,12 @@ pub fn drain(events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>) -> Vec<Ev
 }
 
 pub fn toasts(events: &[Event]) -> Vec<String> {
-    events.iter().filter_map(|e| if let Event::Toast(t) = e { Some(t.clone()) } else { None }).collect()
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Toast(t) => Some(t.clone()),
+            Event::ToastRedacted { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
 }

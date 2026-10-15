@@ -277,7 +277,7 @@ async fn pair(
     }
     match core.pair(&peer.device_id, &request, peer.remote) {
         Ok(()) => {
-            json_response(StatusCode::OK, &json!({ "name": core.pc_name, "deviceId": core.identity.device_id, "protocol": PROTOCOL }))
+            json_response(StatusCode::OK, &json!({ "name": core.pc_name(), "deviceId": core.identity.device_id, "protocol": PROTOCOL }))
         }
         Err(PairFailure::Rejected(e)) => ApiError::from(e).response(pair_error_message(e)),
         Err(PairFailure::Internal) => ApiError::Internal.response("Internal error. Check the logs."),

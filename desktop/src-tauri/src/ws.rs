@@ -24,6 +24,18 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long to wait for the peer's close frame after sending ours.
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
 
+/// The `hello` of this PC: its name (the `deviceName` setting, else the computer's), and the version.
+fn hello_frame(core: &Core) -> serde_json::Value {
+    json!({
+        "type": "hello",
+        "id": uuid_v7(unix_ms()),
+        "protocol": messages::PROTOCOL,
+        "name": core.pc_name(),
+        "platform": "windows",
+        "appVersion": APP_VERSION,
+    })
+}
+
 /// Remembers message IDs in the database, so a repeat gets the same answer even after a restart.
 struct DbDedup<'a> {
     core: &'a Core,
@@ -112,15 +124,7 @@ pub async fn run(core: Arc<Core>, socket: WebSocket, device_id: String, remote: 
 
 impl Conn {
     async fn drive(&mut self, commands: &mut tokio::sync::mpsc::UnboundedReceiver<ConnCommand>) -> End {
-        let hello = json!({
-            "type": "hello",
-            "id": uuid_v7(unix_ms()),
-            "protocol": messages::PROTOCOL,
-            "name": self.core.pc_name,
-            "platform": "windows",
-            "appVersion": APP_VERSION,
-        });
-        if let Err(e) = self.send(&hello).await {
+        if let Err(e) = self.send(&hello_frame(&self.core)).await {
             return End::Error(e);
         }
         loop {
@@ -248,6 +252,7 @@ impl Conn {
             }
             Action::RemovePeerAndClose => {
                 self.unpaired = true;
+                let _ = self.core.db.delete_pending_cancels_of(&self.device_id);
                 match self.core.db.remove_device(&self.device_id) {
                     Ok(_) => log::info!("device {} unpaired itself", short(&self.device_id)),
                     Err(e) => log::error!("removing the unpaired device failed: {e}"),
@@ -258,6 +263,7 @@ impl Conn {
             Action::None
             | Action::ShowErrorOnly
             | Action::IgnoreDuplicate
+            | Action::RepeatedOffer { .. }
             | Action::CloseOnly
             | Action::SetClipboard { .. }
             | Action::StartDownload { .. } => {}
@@ -287,7 +293,10 @@ impl Conn {
             short(&self.device_id),
             self.remote
         );
+        self.core.log_connection("connected", &format!("{:?} from {}", peer.name, self.remote));
         self.core.emit(Event::StateChanged);
+        // The queue goes out now that both `hello`s are accepted (protocol.md, "Queue").
+        self.core.phone_connected_flush(&self.device_id);
     }
 
     async fn on_command(&mut self, cmd: ConnCommand) -> Option<End> {
@@ -304,6 +313,12 @@ impl Conn {
                     let _ = reply.send(SendOutcome::Failed("internal".into()));
                     None
                 }
+            },
+            // The device name was changed in the settings: the phone learns it from a later `hello` (protocol.md, "Opening handshake":
+            // a `hello` after the first one is handled the same way and is not acked).
+            ConnCommand::Hello => match self.send(&hello_frame(&self.core)).await {
+                Ok(()) => None,
+                Err(e) => Some(End::Error(e)),
             },
             ConnCommand::Unpair => {
                 let id = uuid_v7(unix_ms());
@@ -358,11 +373,12 @@ impl Conn {
             End::Error(text) => (text, None),
         };
         for (_, p) in self.pending.drain() {
-            let _ = p.reply.send(SendOutcome::NotConnected);
+            let _ = p.reply.send(SendOutcome::Lost);
         }
         let current = self.core.connections.remove(&self.device_id, self.conn_id);
         if self.hello_accepted {
             let _ = self.core.db.touch(&self.device_id, unix_ms() as i64, None);
+            self.core.log_connection("disconnected", &format!("after {} s: {why}", self.opened.elapsed().as_secs()));
         }
         // What the phone will do next is the other half of the story; it makes a log easier to read.
         let phone_next = if self.unpaired { "forget this PC (unpaired)" } else { messages::client_action(code, None).vector_name() };

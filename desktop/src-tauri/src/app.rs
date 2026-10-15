@@ -7,6 +7,7 @@ use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tauri_plugin_notification::NotificationExt;
 
+use crate::autostart::{AutostartStore, FileAutostart, RegistryAutostart};
 use crate::cli::{self, Command, Parsed};
 use crate::clipboard::{MonotonicClock, WinClipboard};
 use crate::core::{Core, Event, Services, computer_name, short};
@@ -21,6 +22,8 @@ use crate::{Result, filelog, ui};
 
 pub struct AppState {
     pub core: Arc<Core>,
+    /// "Start with Windows": the Run key in a normal run, a file in the data directory in any developer run (see `autostart.rs`).
+    pub autostart: Arc<dyn AutostartStore>,
     tray: Tray,
     server: Mutex<Option<ServerHandle>>,
     advertiser: Mutex<Option<Advertiser>>,
@@ -60,7 +63,23 @@ pub fn run(parsed: Parsed) {
             ui::drop_view,
             ui::send_files,
             ui::pick_files,
-            ui::cancel_transfer
+            ui::cancel_transfer,
+            ui::open_window,
+            ui::history_view,
+            ui::history_open,
+            ui::history_cancel,
+            ui::history_retry,
+            ui::settings_view,
+            ui::set_device_name,
+            ui::set_auto_clipboard_sync,
+            ui::set_images_to_clipboard,
+            ui::choose_received_folder,
+            ui::reset_received_folder,
+            ui::set_hotkey,
+            ui::set_start_with_windows,
+            ui::debug_view,
+            ui::debug_ping,
+            ui::export_logs
         ])
         .setup(move |app| setup(app, parsed).map_err(|e| -> Box<dyn std::error::Error> { e }))
         .on_window_event(|window, event| {
@@ -123,6 +142,10 @@ fn setup(app: &mut tauri::App, parsed: Parsed) -> Result<()> {
         short(&loaded.identity.device_id),
         loaded.identity.short_id
     );
+    if let Some(secs) = config.dev_clock_offset_secs {
+        crate::encoding::set_clock_offset_ms(secs.saturating_mul(1000));
+        log::warn!("developer clock offset: the app's clock is {secs} s ahead");
+    }
     let db = Db::open(&config.data_dir.join("kin.db"))?;
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
     // A message-only window listens for clipboard changes (`AddClipboardFormatListener`). It also owns the clipboard when the app
@@ -141,7 +164,23 @@ fn setup(app: &mut tauri::App, parsed: Parsed) -> Result<()> {
     };
 
     let tray = tray::build(app, &core.snapshot())?;
-    app.manage(AppState { core: core.clone(), tray, server: Mutex::new(Some(server)), advertiser: Mutex::new(advertiser) });
+    // The Run key of the current user is written only by a release build that runs the way a user runs it (`Config::autostart_is_real`);
+    // a debug build, a script or a developer setting gets the stand-in file.
+    let real_autostart = if core.config.autostart_is_real() {
+        RegistryAutostart::run_key()
+            .map_err(|e| log::warn!("start with Windows: the path of Kin.exe is not known ({e}); the stand-in file is used"))
+            .ok()
+    } else {
+        None
+    };
+    let autostart: Arc<dyn AutostartStore> = match real_autostart {
+        Some(real) => Arc::new(real),
+        None => {
+            log::info!("start with Windows: not a normal release run, the registry is never touched (autostart-mock.json stands in)");
+            Arc::new(FileAutostart::new(&core.config.data_dir))
+        }
+    };
+    app.manage(AppState { core: core.clone(), autostart, tray, server: Mutex::new(Some(server)), advertiser: Mutex::new(advertiser) });
 
     let handle = app.handle().clone();
     tauri::async_runtime::spawn(event_loop(handle.clone(), core.clone(), events_rx));
@@ -157,6 +196,10 @@ fn setup(app: &mut tauri::App, parsed: Parsed) -> Result<()> {
             loop {
                 hourly.tick().await;
                 core.clean_up().await;
+                // Queued items that waited too long fail with "expired" (at start and every hour).
+                core.expire_queue(crate::encoding::unix_ms() as i64).await;
+                // The send log and the old text bodies are trimmed every hour, not only at start (an app that runs for weeks grows otherwise).
+                core.prune_storage(crate::encoding::unix_ms() as i64);
             }
         });
     }
@@ -209,17 +252,19 @@ async fn event_loop(app: AppHandle, core: Arc<Core>, mut events: tokio::sync::mp
                 ui::open_pairing_window(&app, false);
             }
             Event::Toast(text) => toast(&app, &core, &text),
+            Event::ToastRedacted { text, log_text } => toast_logged(&app, &core, &text, &log_text),
             Event::TextToast { id, from, preview, has_link } => text_toast(&app, &core, id, &from, &preview, has_link),
             Event::FilesToast { id, title, body, single, openable } => files_toast(&app, &core, id, &title, &body, single, openable),
         }
     }
 }
 
-/// Updates the tray and `status.json` after a change of state.
+/// Updates the tray, the open windows and `status.json` after a change of state.
 fn refresh(app: &AppHandle, core: &Arc<Core>) {
     if let Some(state) = app.try_state::<AppState>() {
         state.tray.update(app, &core.snapshot());
     }
+    ui::lists_changed(app);
     write_status_in_background(core);
 }
 
@@ -270,7 +315,7 @@ fn write_status(core: &Core, stopped: bool) {
 fn text_toast(app: &AppHandle, core: &Core, id: u32, from: &str, preview: &str, has_link: bool) {
     let title = format!("Text from {from}");
     log::info!("toast: {title} ({} characters shown{})", preview.chars().count(), if has_link { ", click opens the link" } else { "" });
-    if core.config.dev_no_windows {
+    if core.config.toasts_are_logged_only() {
         return;
     }
     if let Err(e) = app.notification().builder().id(id as i32).title(title).body(preview).show() {
@@ -282,7 +327,7 @@ fn text_toast(app: &AppHandle, core: &Core, id: u32, from: &str, preview: &str, 
 /// own (the names were cleaned when the files were saved).
 fn files_toast(app: &AppHandle, core: &Core, id: u32, title: &str, body: &str, single: bool, openable: bool) {
     log::info!("toast: {title} ({} characters of names shown)", body.chars().count());
-    if core.config.dev_no_windows {
+    if core.config.toasts_are_logged_only() {
         return;
     }
     let kind = match (single, openable) {
@@ -378,8 +423,13 @@ fn send_clipboard(app: &AppHandle, trigger: &'static str) {
 }
 
 fn toast(app: &AppHandle, core: &Core, text: &str) {
-    log::info!("toast: {text}");
-    if core.config.dev_no_windows {
+    toast_logged(app, core, text, text);
+}
+
+/// A toast whose text has something in it that stays out of the log (a file name): `log_text` is what the log gets.
+fn toast_logged(app: &AppHandle, core: &Core, text: &str, log_text: &str) {
+    log::info!("toast: {log_text}");
+    if core.config.toasts_are_logged_only() {
         return;
     }
     if let Err(e) = app.notification().builder().title("Kin").body(text).show() {
@@ -396,28 +446,12 @@ pub fn on_menu(app: &AppHandle, id: &str) {
             }
         }
         tray::MENU_OPEN_FOLDER => open_received_folder(app),
-        tray::MENU_AUTO_SYNC => {
-            // Windows has already flipped the check by the time the click arrives.
-            if let Some(state) = app.try_state::<AppState>() {
-                let on = state.tray.auto_sync.is_checked().unwrap_or(true);
-                state.core.set_auto_clipboard_sync(on);
-            }
-        }
         tray::MENU_PAIR => handle_commands(app, &[Command::Pair]),
-        tray::MENU_PING => handle_commands(app, &[Command::Ping]),
-        tray::MENU_LOGS => open_log_folder(app),
+        tray::MENU_HISTORY => handle_commands(app, &[Command::History]),
+        tray::MENU_SETTINGS => handle_commands(app, &[Command::Settings]),
         tray::MENU_QUIT => handle_commands(app, &[Command::Quit]),
         _ => {}
     }
-}
-
-fn open_log_folder(app: &AppHandle) {
-    let Some(state) = app.try_state::<AppState>() else {
-        return;
-    };
-    let dir = state.core.config.data_dir.join("logs");
-    let _ = std::fs::create_dir_all(&dir);
-    open_in_explorer(&dir);
 }
 
 fn open_received_folder(app: &AppHandle) {
@@ -462,6 +496,25 @@ pub fn handle_commands(app: &AppHandle, commands: &[Command]) {
                 });
             }
             Command::Drop => ui::open_drop_window(app),
+            Command::History => ui::open_history_window(app),
+            Command::Settings => ui::open_settings_window(app),
+            Command::DebugWindow => ui::open_debug_window(app),
+            Command::DevDumpView(name) => {
+                let (app, name) = (app.clone(), name.clone());
+                tauri::async_runtime::spawn(async move { dev_dump_view(&app, &core, &name).await });
+            }
+            Command::DevExportLogs(path) => {
+                let path = path.clone();
+                tauri::async_runtime::spawn(async move { dev_export_logs(&core, &path).await });
+            }
+            Command::DevHistory { action, id } => {
+                let (action, id) = (action.clone(), id.clone());
+                tauri::async_runtime::spawn(async move { dev_history(&core, &action, &id).await });
+            }
+            Command::DevSet { key, value } => {
+                let (app, key, value) = (app.clone(), key.clone(), value.clone());
+                tauri::async_runtime::spawn_blocking(move || dev_set(&app, &core, &key, &value));
+            }
             Command::CancelTransfers => {
                 tauri::async_runtime::spawn(async move { core.cancel_all_transfers().await });
             }
@@ -495,4 +548,159 @@ fn quit(app: &AppHandle) {
         let _ = app.remove_tray_by_id(tray::TRAY_ID);
         app.exit(0);
     });
+}
+
+/// The hotkey of the settings window. The new one is registered first; if that fails (another program has it, or the text isn't a hotkey)
+/// the old one is put back and the error says why. An empty text turns the hotkey off. Returns the new state of the hotkey.
+pub fn change_hotkey(app: &AppHandle, core: &Core, accelerator: &str) -> std::result::Result<serde_json::Value, String> {
+    let old = core.hotkey_accelerator();
+    let was_registered = lock_hotkey(core).registered;
+    let old_shortcut = if was_registered { crate::settings::parse_hotkey(&old).ok() } else { None };
+    let shortcuts = app.global_shortcut();
+    if accelerator.is_empty() {
+        if let Some(o) = old_shortcut {
+            let _ = shortcuts.unregister(o);
+        }
+        core.store_hotkey("");
+        core.set_hotkey_status(HotkeyStatus { accelerator: String::new(), registered: false, error: None });
+        log::info!("hotkey: turned off in the settings window");
+        return Ok(serde_json::json!({ "accelerator": "", "registered": false }));
+    }
+    let shortcut = crate::settings::parse_hotkey(accelerator)?;
+    // The old one goes first, so that choosing the same key again (or a key that only differs in spelling) is not a conflict with itself.
+    if let Some(o) = old_shortcut {
+        let _ = shortcuts.unregister(o);
+    }
+    match shortcuts.register(shortcut) {
+        Ok(()) => {
+            core.store_hotkey(accelerator);
+            core.set_hotkey_status(HotkeyStatus { accelerator: accelerator.to_string(), registered: true, error: None });
+            log::info!("hotkey {accelerator} registered from the settings window");
+            Ok(serde_json::json!({ "accelerator": accelerator, "registered": true }))
+        }
+        Err(e) => {
+            if let Some(o) = old_shortcut {
+                let _ = shortcuts.register(o);
+            }
+            log::warn!("hotkey {accelerator} could not be registered from the settings window: {e}");
+            Err(format!(
+                "{accelerator} can't be used: another program already has it ({e}). The hotkey stays {}.",
+                if old.is_empty() { "off".to_string() } else { old }
+            ))
+        }
+    }
+}
+
+fn lock_hotkey(core: &Core) -> HotkeyStatus {
+    core.hotkey_status()
+}
+
+/// What a window would show, written to `view-<name>.json` in the data directory (the developer hook `--dev-dump-view`).
+async fn dev_dump_view(app: &AppHandle, core: &Arc<Core>, name: &str) {
+    if !core.config.dev_hooks_enabled() {
+        log::warn!("refused --dev-dump-view: it works only when the app was started with a developer setting");
+        return;
+    }
+    let state = app.state::<AppState>();
+    let value = match name {
+        "history" => core.history_view(),
+        "queue" => core.queue_status(),
+        "settings" => {
+            let mut v = core.settings_view(state.autostart.is_enabled().ok());
+            v["startWithWindowsIsReal"] = serde_json::json!(state.autostart.is_real());
+            v
+        }
+        "debug" => ui::debug_json(core).await,
+        other => {
+            log::warn!("--dev-dump-view: no view called {other:?} (history, queue, settings, debug)");
+            return;
+        }
+    };
+    let path = core.config.data_dir.join(format!("view-{name}.json"));
+    match std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap_or_default()) {
+        Ok(()) => log::info!("view {name} written for a script"),
+        Err(e) => log::warn!("writing view-{name}.json failed: {e}"),
+    }
+}
+
+/// The developer hook `--dev-export-logs <path>`: "Export logs" without the dialog.
+async fn dev_export_logs(core: &Arc<Core>, path: &Path) {
+    if !core.config.dev_hooks_enabled() {
+        log::warn!("refused --dev-export-logs: it works only when the app was started with a developer setting");
+        return;
+    }
+    let network = match tauri::async_runtime::spawn_blocking(crate::netprofile::connected_networks).await {
+        Ok(Ok(list)) => serde_json::json!({ "networks": list }),
+        _ => serde_json::json!({ "networks": [] }),
+    };
+    let (core, path) = (core.clone(), path.to_path_buf());
+    let result = tauri::async_runtime::spawn_blocking(move || core.export_logs(&path, network)).await;
+    match result {
+        Ok(Ok(report)) => log::info!("developer export: {} file(s), {} bytes", report.files, report.bytes),
+        Ok(Err(e)) => log::warn!("developer export failed: {e}"),
+        Err(e) => log::warn!("developer export failed: {e}"),
+    }
+}
+
+/// The developer hook `--dev-set <setting> <value>`: what the settings window does, without a window. The outcome goes to
+/// `dev-set-result.json` in the data directory (and the log).
+fn dev_set(app: &AppHandle, core: &Arc<Core>, key: &str, value: &str) {
+    let write = |ok: bool, message: String| {
+        log::info!("developer setting {key}: {} ({message})", if ok { "ok" } else { "refused" });
+        let text = serde_json::json!({ "key": key, "ok": ok, "message": message });
+        let _ = std::fs::write(core.config.data_dir.join("dev-set-result.json"), text.to_string());
+    };
+    if !core.config.dev_hooks_enabled() {
+        log::warn!("refused --dev-set: it works only when the app was started with a developer setting");
+        return;
+    }
+    let on = matches!(value, "true" | "1" | "on");
+    let state = app.state::<AppState>();
+    match key {
+        "deviceName" => write(true, core.set_device_name(value)),
+        "autoClipboardSync" => {
+            core.set_auto_clipboard_sync(on);
+            write(true, on.to_string());
+        }
+        "imagesToClipboard" => {
+            core.set_images_to_clipboard(on);
+            write(true, on.to_string());
+        }
+        "receivedFolder" => match core.set_received_folder(Some(value)) {
+            Ok(path) => write(true, path.to_string_lossy().into_owned()),
+            Err(e) => write(false, e),
+        },
+        "hotkey" => match change_hotkey(app, core, value.trim()) {
+            Ok(v) => write(true, v.to_string()),
+            Err(e) => write(false, e),
+        },
+        "startWithWindows" => match state.autostart.set_enabled(on) {
+            Ok(()) => write(true, format!("{} (real: {})", on, state.autostart.is_real())),
+            Err(e) => write(false, e),
+        },
+        other => write(false, format!("no setting called {other:?}")),
+    }
+}
+
+/// The developer hook `--dev-history <cancel|retry|open> <id>`: what the history window's buttons and clicks do, without a window.
+async fn dev_history(core: &Arc<Core>, action: &str, id: &str) {
+    if !core.config.dev_hooks_enabled() {
+        log::warn!("refused --dev-history: it works only when the app was started with a developer setting");
+        return;
+    }
+    let (ok, message) = match action {
+        "cancel" => (core.history_cancel(id).await, "canceled".to_string()),
+        "retry" => match core.retry_item(id).await {
+            Ok(new_id) => (true, new_id),
+            Err(e) => (false, e),
+        },
+        "open" => match core.history_open(id).await {
+            Ok(m) => (true, m),
+            Err(e) => (false, e),
+        },
+        other => (false, format!("no action called {other:?} (cancel, retry, open)")),
+    };
+    log::info!("developer history action {action}: {}", if ok { "ok" } else { "refused" });
+    let text = serde_json::json!({ "action": action, "id": id, "ok": ok, "message": message });
+    let _ = std::fs::write(core.config.data_dir.join("dev-history-result.json"), text.to_string());
 }

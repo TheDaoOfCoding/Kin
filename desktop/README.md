@@ -1,12 +1,12 @@
 # Kin Relay for Windows (desktop)
 
-The Windows app: Tauri v2, a Rust backend and a small TypeScript UI (plain DOM, no component library). **This is milestone 1.3.** Milestone 1.1 was identity, the HTTPS server with mutual TLS, pairing by QR code, mDNS, the WebSocket with `hello`, `ack`, `error`, `ping` and `unpair`, a tray, and the logs. 1.2 added text, links and the clipboard (automatic sync, the hotkey, receiving `text`). **1.3 adds files in both directions:** the phone uploads to the PC (`POST /v1/transfers`, `PUT`, `DELETE`, streamed to a `.part` file and moved to its final name without ever overwriting anything, with resume), the PC offers files and the phone downloads them (`offer`, `GET` with `Range`, `complete`, `cancel`), a drop window (the tray's left click), Explorer's "Send to" (`--send`), toasts that open the file, images that also go to the clipboard, the `sensitive` flag, a 128 KiB threshold above which text goes as a `.txt` file, and LF line ends on the wire. The contract is [docs/protocol.md](../docs/protocol.md), the plan is [docs/phases/phase-1-mvp.md](../docs/phases/phase-1-mvp.md), and what was measured is in [docs/results/phase-1-1-desktop.md](../docs/results/phase-1-1-desktop.md), [phase-1-2-desktop.md](../docs/results/phase-1-2-desktop.md) and [phase-1-3-desktop.md](../docs/results/phase-1-3-desktop.md).
+The Windows app: Tauri v2, a Rust backend and a small TypeScript UI (plain DOM, no component library). **This is milestone 1.4.** Milestone 1.1 was identity, the HTTPS server with mutual TLS, pairing by QR code, mDNS, the WebSocket with `hello`, `ack`, `error`, `ping` and `unpair`, a tray, and the logs. 1.2 added text, links and the clipboard. 1.3 added files in both directions. **1.4 adds the queue, the history, the settings and the debug window:** every explicit send (a `text`, files) is stored as `queued` before it is tried and goes out in order when the phone is back (nothing is queued for the automatic clipboard or for a `sensitive` text); a history window lists the recent transfers both ways (click to open or copy, Retry, Cancel); a settings window (device name, clipboard sync, images, received folder, the hotkey with conflict detection, start with Windows, unpair); a debug window (the first-try success rate of sends, recent errors, latency, the connection history, the network profile of this PC, and Export logs); and the tray menu of docs/windows.md, with "Phone offline – last seen <time>". The contract is [docs/protocol.md](../docs/protocol.md) (see its [Queue](../docs/protocol.md#queue) section), the plan is [docs/phases/phase-1-mvp.md](../docs/phases/phase-1-mvp.md), and what was measured is in [docs/results/phase-1-1-desktop.md](../docs/results/phase-1-1-desktop.md), [phase-1-2-desktop.md](../docs/results/phase-1-2-desktop.md), [phase-1-3-desktop.md](../docs/results/phase-1-3-desktop.md) and [phase-1-4-desktop.md](../docs/results/phase-1-4-desktop.md).
 
 ## Layout
 
 ```
 desktop/
-  index.html, src/          the UI: the pairing window (src/pairing.ts) and the drop window (src/drop.ts), told apart by `?w=` in the URL
+  index.html, src/          the UI: the pairing window (src/pairing.ts), the drop window (src/drop.ts) and, since 1.4, the history (src/history.ts), settings (src/settings.ts) and debug (src/debug.ts) windows, told apart by `?w=` in the URL (src/main.ts); src/dom.ts has the small helpers they share
   src-tauri/
     src/
       main.rs, lib.rs      entry point, module list, `run()`
@@ -35,14 +35,27 @@ desktop/
       images.rs            1.3: decoding an image (WIC, row by row, EXIF rotation done by our own code) into the clipboard formats; telling an image by its content
       motw.rs              1.3 review: the Mark of the Web (`Zone.Identifier`) written on every received file
       paths.rs             1.3: the Downloads folder, free disk space
-      app.rs, tray.rs, ui.rs   the Tauri side: start-up, single instance, tray, global hotkey, toasts and clicks on them, windows, UI commands
-    tests/                 vectors.rs, transfer_vectors.rs, tls_vectors.rs, fake_phone.rs, transfers_e2e.rs, offers_e2e.rs, review_1_3.rs, server_limits.rs (+ common/)
+      queue.rs             1.4: the queue (protocol.md "Queue"): items stored as `queued` first, the flush in creation order after the `hello`, the 5 s ack timeout that re-queues, expiry with an explicit `now`, cancel, retry
+      queuedb.rs           1.4: the database side: `transfer_texts`, `sends`, `connection_log`, the queue and history queries
+      history.rs           1.4: the history window's list, what a click does (the allow-list rule, copy a text), Cancel
+      prefs.rs             1.4: what the settings window changes (device name, received folder, ...) and its view
+      autostart.rs         1.4: "Start with Windows" behind a trait: the current user's Run key (quoted path, HKCU only, release builds only) and the file stand-in that debug builds, developer runs and tests use instead of the registry
+      privacy.rs           1.4 review: the keyed (HMAC-SHA256, per-installation DPAPI key) tags that log lines use for texts and file names
+      metrics.rs           1.4: the first-try success rate, latency numbers, the debug window's view
+      export.rs            1.4: "Export logs": a stored-method zip written by hand, and the redaction of paths (long and 8.3 short profile path, any C:\Users\<name>, the received folder wherever it is), IPv4 and IPv6 addresses, names (any letter case) and Wi-Fi network names
+      netprofile.rs        1.4: the network profile (Private / Public) from the Network List Manager (COM)
+      localtime.rs         1.4: local time for "last seen" (Windows converts, the wording is plain code)
+      app.rs, tray.rs, ui.rs   the Tauri side: start-up, single instance, tray (the menu of windows.md), global hotkey (changed from the settings window), toasts and clicks on them, windows, UI commands
+    tests/                 vectors.rs, transfer_vectors.rs, tls_vectors.rs, fake_phone.rs, transfers_e2e.rs, offers_e2e.rs, review_1_3.rs, server_limits.rs, queue_1_4.rs, review_1_4.rs (+ common/)
     examples/fake_phone.rs a fake phone for manual checks and for the scripts
   clipboard-backup.ps1     save and restore every format of the real clipboard (used by check-1-3.ps1)
   check-1-3.ps1            the 1.3 checks against the real Kin.exe
   check-rotation.ps1       a 12 MP photo with EXIF rotation (orientations 6, 3 and 8) uploaded to the real Kin.exe: how long the `PUT` and the clipboard take, and the corners of the picture
   check-dragdrop.ps1       a real drag and drop onto the drop window
   make-sendto-shortcut.ps1 creates (or removes) the "Send to" shortcut by hand
+  check-1-4.ps1            the 1.4 checks against the real Kin.exe: the queue (arrival after the phone's hello, order, a restart, cancel, expiry), the tray's "last seen", the settings (a hotkey conflict, the stand-in for start with Windows), the debug numbers, Export logs
+  capture-windows.ps1      screenshots of the history, settings, debug, drop and pairing windows from the real Kin.exe (and the memory before and after they were opened and closed)
+  measure-idle.ps1         idle memory of the tray-only app; `-OpenWindows` opens and closes every window first
 ```
 
 ## Build, test, run
@@ -55,12 +68,14 @@ cd desktop
 bun install
 bun run build                       # the UI into dist/. cargo needs dist/ to exist (tauri embeds it)
 cd src-tauri
-cargo test                          # 238 tests (and 5 ignored): unit tests, the protocol vectors, and a fake phone over real TLS on loopback (the real clipboard and Downloads folder are never touched)
+cargo test                          # 323 tests (and 5 ignored): unit tests, the protocol vectors, and a fake phone over real TLS on loopback (the real clipboard and Downloads folder are never touched)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cd ..
 powershell -ExecutionPolicy Bypass -File build.ps1    # release build + NSIS installer (bun tauri build --bundles nsis)
 ```
+
+**`cargo test --release` (and any `cargo build --release`) overwrites `target\release\Kin.exe` with a dev-server build** (a plain cargo build does not embed the pages: the window would load `http://localhost:1420`). After one, run `build.ps1` again before a script that starts the real app. `check-1-4.ps1` and `tools\e2e-1-*.ps1` refuse an exe that is newer than the installer in `bundle\nsis` (which `tauri build` writes just after the exe); `-Build` rebuilds it.
 
 Outputs: `src-tauri\target\release\Kin.exe` and `src-tauri\target\release\bundle\nsis\Kin_0.1.0_x64-setup.exe`. If the bundler's own NSIS download times out, stage NSIS by hand as described in [phase-0-tauri.md](../docs/results/phase-0-tauri.md#snag-the-nsis-download-timed-out).
 
@@ -72,11 +87,14 @@ Outputs: `src-tauri\target\release\Kin.exe` and `src-tauri\target\release\bundle
 cd desktop
 cd src-tauri; cargo build --example fake_phone; cd ..                       # the fake phone (the scripts use the release build if there is one)
 powershell -ExecutionPolicy Bypass -File check-1-3.ps1                       # 39 checks: uploads (cut and resumed), the Mark of the Web, `--send`, the sensitive flag, a long text, images on the real clipboard, a full disk
+powershell -ExecutionPolicy Bypass -File check-1-4.ps1                       # 57 checks: the queue, a restart, cancel, expiry, the tray line, the settings, the debug numbers, Export logs (uses the real clipboard: saved and restored)
+powershell -STA -ExecutionPolicy Bypass -File capture-windows.ps1            # PNGs of the windows in %LOCALAPPDATA%\Temp\kin-capture-windows (moves windows to the front for a minute); -UpdateScreens writes the tracked docs\results\phase-1-4-desktop-screens instead
+powershell -ExecutionPolicy Bypass -File measure-idle.ps1 -OpenWindows       # idle memory after every window was opened and closed
 powershell -ExecutionPolicy Bypass -File check-rotation.ps1                  # 12 MP JPEGs with EXIF orientation 6, 3 and 8: times and upright check on the real clipboard (-Exe <path> to try another build)
 powershell -STA -ExecutionPolicy Bypass -File check-dragdrop.ps1             # a real drag and drop onto the drop window (moves the mouse for a second)
 ```
 
-`check-1-3.ps1` and `check-rotation.ps1` use the **real clipboard**: `clipboard-backup.ps1` saves every format of it first and puts them back at the end (also after a failure), and `-SkipClipboard` leaves those checks out.
+`check-1-3.ps1`, `check-1-4.ps1`, `capture-windows.ps1` and `check-rotation.ps1` use the **real clipboard**: `clipboard-backup.ps1` saves every format of it first and puts them back at the end (also after a failure), and `-SkipClipboard` leaves those checks out.
 
 `bun tauri dev` works too (Vite on `localhost:1420`), but the developer settings below are what you want for anything that listens.
 
@@ -97,6 +115,8 @@ A flag wins over its environment variable.
 | `--dev-print-pair-url` | `KIN_DEV_PRINT_PAIR_URL=1` | Whenever a pairing starts (tray menu, `--pair` or `--dev-start-pairing`), write the URL to `pair-url.txt` in the data directory and to stdout |
 | `--dev-no-windows` | `KIN_DEV_NO_WINDOWS=1` | Don't create windows and don't show toasts. A toast is written to the log as `toast: ...` instead (for "Text from <phone>" the log has the title and the length of the preview, never the text; for files, the title and the length of the names) |
 | `--dev-received-dir <path>` | `KIN_DEV_RECEIVED_DIR` | **1.3.** Received files go here instead of `Downloads\Kin` (and instead of `receivedFolder` in `settings.json`), so a test never writes to the real Downloads folder. `status.json` has the folder in `transfers.receivedFolder` |
+| `--dev-no-toasts` | `KIN_DEV_NO_TOASTS=1` | **1.4.** Windows are created as usual, but toasts are only written to the log. For screenshots of the windows and for `measure-idle.ps1 -OpenWindows` |
+| `--dev-clock-offset <seconds>` | `KIN_DEV_CLOCK_OFFSET` | **1.4.** The app's wall clock runs this many seconds ahead (everything: expiry, the 24 hour windows, `last seen`). `--dev-clock-offset 604801` makes a queued text 7 days old at the next start, so expiry can be tested in a running app: the sweep at start fails it with `expired`. Zero in a normal run. **Every test of expiry in `cargo test` passes an explicit `now` to `Core::expire_queue` instead (a fake clock)** |
 | `--dev-free-bytes <n>` | `KIN_DEV_FREE_BYTES` | **1.3.** Pretend the disk has this many free bytes. The check for `507 disk_full` (only the bytes the PC doesn't have yet have to fit, with no reserve) uses it, so a full disk is easy to test: `--dev-free-bytes 1000000` refuses a 5 MB upload and takes a 900 KB one |
 
 **The developer clipboard commands (`--dev-set-clipboard`, `--dev-get-clipboard`) work only when the running instance was started with a developer setting** (any of the flags above). In a normal run they are refused and the log says so: any other program could otherwise launch `Kin.exe --dev-get-clipboard` and have the clipboard written to a file.
@@ -107,11 +127,16 @@ The single-instance plugin forwards a second launch's arguments to the running i
 
 | Command | What it does |
 |---|---|
-| `--ping` | Ping the connected phone. Same as "Ping phone" in the tray. The result is the toast, the log, and `lastPing` in `status.json` |
+| `--ping` | Ping the connected phone. Same as the Ping button of the debug window (the tray menu no longer has it). The result is the toast, the log, and `lastPing` in `status.json` |
 | `--dev-start-pairing` | Start a pairing without a window. With `--dev-print-pair-url` set at the first launch, the URL is in `pair-url.txt` |
 | `--pair` | Open the pairing window (and start a pairing), like "Pair new phone" |
-| `--send <path>...` | **1.3. Explorer's "Send to", headless.** Offer these files to the connected phone, like dropping them on the drop window. Every argument up to the next `--flag` is a path; a relative path is resolved against the folder the launch was started in. Folders are skipped with a message. Without a connected phone nothing is sent (a toast says so). Progress is in `status.json` (`transfers.active`) |
+| `--send <path>...` | **1.3. Explorer's "Send to", headless.** Offer these files to the connected phone, like dropping them on the drop window. Every argument up to the next `--flag` is a path; a relative path is resolved against the folder the launch was started in. Folders are skipped with a message. **Without a connected phone the offer is queued** (1.4) and goes out when the phone is back (a toast says so). Progress is in `status.json` (`transfers.active`) |
 | `--drop` | **1.3.** Open the drop window, like the tray's left click |
+| `--history`, `--settings`, `--debug-window` | **1.4.** Open the history, settings or debug window (the tray's History and Settings, and Shift + click on the tray icon) |
+| `--dev-dump-view <history\|queue\|settings\|debug>` | **1.4 developer hook** (refused unless the app was started with a developer setting). Writes what a window would show to `view-<name>.json` in the data directory, so a script can read it without a window. `queue` is the same as `queue` in `status.json` |
+| `--dev-history <cancel\|retry\|open> <id>` | **1.4 developer hook.** What the history window's Cancel, Retry and click do to an item (its ID is in `view-history.json`). The outcome is in `dev-history-result.json` (`{ action, id, ok, message }`) |
+| `--dev-set <setting> <value>` | **1.4 developer hook.** What the settings window does, without a window: `deviceName`, `autoClipboardSync`, `imagesToClipboard`, `receivedFolder`, `hotkey` (a conflict with another program is reported in the result) and `startWithWindows`. The outcome is in `dev-set-result.json` (`{ key, ok, message }`) |
+| `--dev-export-logs <path>` | **1.4 developer hook.** "Export logs" without the dialog |
 | `--cancel-transfers` | **1.3 (integration).** Cancel every transfer that is going, in both directions: what the Cancel button of the drop window does for each row (a `cancel` message with reason `user` goes to the phone, partial files go). Added so a script can cancel from the PC side without clicking |
 | `--send-clipboard` | Send the text on the clipboard to the phone as a `text` message: **the hotkey, headless.** The tray item "Send clipboard to phone" and the hotkey run exactly the same code. The result is `lastSent.text` in `status.json` (with `trigger` `command`, `hotkey` or `tray`) and a log line. A clipboard that carried a password-manager format goes with `sensitive`; a text over 128 KiB goes as a `Text.txt` file offer |
 | `--dev-set-clipboard <text>` | Developer hook: put this text on the PC clipboard, as if the user had copied it. It goes through the normal pipeline (change event, 300 ms debounce, automatic sync), so this is how to trigger a PC to phone `clipboard` message. Add `--dev-clipboard-mark exclude`, `no-history`, `no-cloud` or `viewer-ignore` to add the opt-out format a password manager would add (the text is then not sent automatically, and the hotkey sends it as sensitive). Refused unless the app was started with a developer setting |
@@ -142,12 +167,14 @@ Get-Clipboard -Raw                              # or: & $kin --dev-get-clipboard
 | File | What |
 |---|---|
 | `status.json` | Rewritten on every state change, and **once a second while a transfer is going**. `state` is `not_paired`, `phone_connected`, `phone_offline` or `stopped` (written on exit). Also `port`, `bind`, `deviceId`, `shortId`, `pcName`, `pairing` (`null`, or `{ active, expiresAtMs }`: it is `null` as soon as the code expires or five wrong guesses shut it down), `devices[]` (`deviceId`, `name`, `platform`, `connected`, `pairedAt`, `lastSeen`), `lastPing` (`{ at, result, rttMs? }`) and `pid`, the 1.2 objects under [status.json in 1.2](#statusjson-in-12), and **`transfers`** under [status.json in 1.3](#statusjson-in-13). (A script that has the file open at the very moment it is replaced makes Windows say "access denied" to the app, which then tries again a few times) |
-| `settings.json` | The settings: `{ "autoClipboardSync": true, "hotkey": "Ctrl+Alt+Shift+K", "receivedFolder": null, "imagesToClipboard": true }`. Written when the tray check item is toggled. Edit it to change the hotkey or the received folder (read at start). Missing keys are the defaults |
+| `settings.json` | The settings: `{ "autoClipboardSync": true, "hotkey": "Ctrl+Alt+Shift+K", "receivedFolder": null, "imagesToClipboard": true, "deviceName": null }`. **1.4: the Settings window writes it** (every change applies at once). Missing keys are the defaults. `deviceName` null is the computer's name |
+| `autostart-mock.json` | **1.4.** `{ "enabled": true }`: the stand-in for the Run key. **Only a release build** that runs with no `--dev-*` flag and the default data directory writes the real Run key (current user only, the quoted path of `Kin.exe`); a debug build, a developer run (any `--dev-*` flag, or a `--data-dir` of its own) switches "Start with Windows" here and **never touches the registry**; `status.json` and the settings view say which one is in use (`startWithWindowsIsReal`) |
+| `view-<name>.json`, `dev-set-result.json`, `dev-history-result.json` | **1.4.** Written by the developer hooks above |
 | `dev-clipboard.txt` | The clipboard text, after `--dev-get-clipboard` |
 | `pair-url.txt` | The current pairing URL (only with `--dev-print-pair-url`). It holds the token, so it is never written to the log |
 | `logs\kin.log` | Rotating log: `kin.log`, `kin.1.log` to `kin.4.log`, 1 MB each |
 | `identity.key`, `identity.crt` | The DPAPI-encrypted PKCS#8 key and the certificate (public) |
-| `kin.db` | SQLite: `devices`, `seen_messages`, `transfers`, `transfer_files` |
+| `kin.db` | SQLite: `devices`, `seen_messages`, `transfers` (1.4: status `queued`, kind `text` or `file`, `sent_at`, `retry_of`), `transfer_files`, `transfer_texts` (the body of an explicit, non-sensitive text), `sends` (one row per send for the success rate: kind, times, attempts, outcome; no text, no name) and `connection_log` (the last 200 connects and disconnects) |
 | `outgoing\<id>\Text.txt` | A long text on its way to the phone as a file. Removed when the phone has it, the offer is canceled, or a day has passed |
 
 ### status.json in 1.2
@@ -193,6 +220,21 @@ Get-Clipboard -Raw                              # or: & $kin --dev-get-clipboard
 - **Where to look when something doesn't arrive:** an upload is `active` with `bytesDone` growing; a received file is finished when its row is `done` and the file is in `receivedFolder` (the `.part` file is gone). An `out` transfer is `active` from the phone's `ack` of the `offer` until its `complete` (`done`), a cancel (`canceled`) or 24 hours (`failed`, `expired`).
 - The log has one line per step (`upload <id> from device <short>: n file(s), bytes, into <folder>`, `file k is complete`, `is done`, `offer <id> to device ...`, `the user canceled transfer ...`). **The contents of files and the text of the clipboard are never in the log**, and file names are not either, with one exception found by the integration run: the toast "Sending <name> to <phone>" of a one-file offer is logged like every toast, so that name is in the log (`toast: Sending dup2.txt to ...`), and so is the name in "<name> can't be read, so it was not sent". The toast for received files has only a title ("1 file from Pixel") and the length of the names. A resumed transfer logs where it carries on: `upload <id>: file 1 continues from byte N of M` (phone to PC) and `offer <id>: file 1 is served from byte N of M` (a ranged `GET`).
 
+### status.json in 1.4
+
+```json
+{
+  "pcName": "Desk PC",
+  "queue": { "count": 2, "items": [ { "id": "7a8b9c0d", "kind": "text", "createdMs": 1760443200000, "expiresMs": 1761048000000, "sentMs": null, "bytes": 27 } ] },
+  "tray": { "status": "Phone offline – last seen 14:32 · 2 queued", "tooltip": "Kin: Pixel 8 offline, last seen 14:32 · 2 queued" },
+  "lastSent": { "text": { "result": "phone_offline", "queued": true } }
+}
+```
+
+- **`queue`** is what waits for the phone: how many, and for each item its (short) ID, its kind (`text` or `file`), when it was made, when it expires (a text 7 days after it was made; an offer 24 hours after it was sent, or 7 days after it was made if it never was) and when it was first sent. **No text and no file name.** (`--dev-dump-view queue` gives the same.)
+- **`tray.status`** is the status line of the tray menu as it is right now (what a script can't read from the menu itself).
+- **`lastSent.text.queued`** is `true` when the send did not get its `ack` at once and is waiting in the queue; `result` says why (`phone_offline`, or `no_reply` for a connection that gave no `ack` in 5 s).
+
 ### Running against the Android emulator
 
 ```powershell
@@ -224,6 +266,8 @@ Get-Content $data\logs\kin.log -Tail 20
 |---|---|
 | `--upload <file>` (repeat), `--upload-generated <bytes>` (repeat), `--upload-after <s>` | Upload these files (a generated file is a fixed pattern that is never written to disk) as one transfer, `--upload-after` seconds (default 3) after the `hello`. Prints `uploaded <name> bytes=<n> sha256=<hex> seconds=<s> mbps=<MB/s>` per file (the hash is of the whole file) and `upload done: <id>` |
 | `--upload-cut <bytes>` | Drop the connection of the first file bigger than this after that many bytes, then resume (a new connection, a new `POST`, a `PUT` from the offset the PC reports) |
+| `--offline-after <s>`, `--offline-for <s>` | **1.4.** Closes the WebSocket that many seconds after the `hello`, stays away for `--offline-for` seconds (default 5) and connects again with a new `hello`. Prints `going offline at=<unix ms>`, `reconnected at=<unix ms>`, and **one `arrival type=<type> id=<id> at=<unix ms> ms_since_hello=<n>` line for every message the PC sends**: that is how `check-1-4.ps1` sees what the PC queued arrive, in order |
+| `--identity-file <path>`, `--skip-pairing` | **1.4.** The phone's key is kept in that file, so a later run is the same phone; `--skip-pairing` connects without pairing (it is paired already). Together they test a restart of the PC |
 | `--save-dir <folder>`, `--download-cut <bytes>`, `--no-download`, `--refuse-offer <code>` | For an `offer` from the PC: where to save (default `fake-phone-downloads` in the temp folder), drop the first download after that many bytes and resume with `Range`, ack but don't download, or answer with an `error` of that code (such as `disk_full`) instead of an ack. Prints `downloaded <name> bytes=<n> sha256=<hex> ...` and sends `complete` |
 
 ## How it behaves
@@ -234,7 +278,7 @@ Get-Content $data\logs\kin.log -Tail 20
 - **The WebSocket never waits for a file.** Everything about files runs in the HTTP handlers and in tasks of its own. A ping during a 300 MiB upload comes back in single-digit milliseconds.
 - **Names and folders.** Received names follow protocol.md ("File names": UTF-8 byte limits, bidi controls, reserved names, the cut rules). A folder dropped for sending is skipped with a message (decision for 1.3, see windows.md).
 - **After a restart** a transfer that was going is still there with what was stored (the smaller of the database and the disk), `.part` files are kept 24 hours after the last progress, and offers survive too. The clean-up (at start and hourly) drops transfers with no progress for a day and expired offers, and deletes only `.part` files that a database record names (a `.part` file nobody recorded is the user's), never a finished file, even one named `*.part`.
-- **Automatic clipboard sync (PC to phone).** On by default, switched in the tray ("Sync clipboard automatically") or with `autoClipboardSync` in `settings.json`. A hidden message-only window listens with `AddClipboardFormatListener`. Every change restarts a 300 ms timer. When it runs out the text on the clipboard goes to the phone as a `clipboard` message (LF line ends) and the PC waits for the `ack` (5 s). Text only. Not sent: content marked by a password manager (`ExcludeClipboardContentFromMonitorProcessing`, or `CanIncludeInClipboardHistory` or `CanUploadToCloudClipboard` with a value of 0, and the older `Clipboard Viewer Ignore`), the text the phone just sent (loop prevention: a hash of the wire form is remembered for 10 s and the change event it causes is ignored), anything that isn't text, and a text over 128 KiB (recorded as `too_large`). Never stored in a history (D10), never logged as text. While the phone is offline an automatic send fails quietly (the persistent queue is 1.4); an explicit one shows a toast.
+- **Automatic clipboard sync (PC to phone).** On by default, switched in the Settings window (1.4; in 1.3 in the tray) or with `autoClipboardSync` in `settings.json`. A hidden message-only window listens with `AddClipboardFormatListener`. Every change restarts a 300 ms timer. When it runs out the text on the clipboard goes to the phone as a `clipboard` message (LF line ends) and the PC waits for the `ack` (5 s). Text only. Not sent: content marked by a password manager (`ExcludeClipboardContentFromMonitorProcessing`, or `CanIncludeInClipboardHistory` or `CanUploadToCloudClipboard` with a value of 0, and the older `Clipboard Viewer Ignore`), the text the phone just sent (loop prevention: a hash of the wire form is remembered for 10 s and the change event it causes is ignored), anything that isn't text, and a text over 128 KiB (recorded as `too_large`). Never stored in a history (D10), never logged as text. While the phone is offline an automatic send is **dropped** (1.4: never queued, and never in the history: only the latest clipboard matters, and a stale one would overwrite newer content); an explicit one is queued and shows a toast.
 - **The hotkey.** `Ctrl+Alt+Shift+K` by default ([why](../docs/windows.md#hotkey)), `hotkey` in `settings.json` to change it (read at start, empty turns it off). It sends the current clipboard text as a `text` message, with `isUrl` set when the trimmed text is an openable http(s) link (protocol.md's rule) and **`sensitive` set when the clipboard carried a password-manager format**. Over 128 KiB it goes as `Text.txt` (not at all if it is sensitive). The tray's "Send clipboard to phone" and `--send-clipboard` do the same. A toast says "Sent to <phone>", or why not.
 - **Receiving `text` from the phone.** Acked first (the `ack` doesn't wait for the clipboard or the toast), then put on the clipboard with `\r\n` line ends (the wire has LF) without being sent back, and a toast "Text from <phone>" shows the first 100 characters on one line. A `sensitive` text goes to the clipboard with `ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory` = 0 and `CanUploadToCloudClipboard` = 0, the toast has **no preview and no link**, and nothing about it is logged. If `isUrl` is set **and** the text really is an openable http(s) URL, clicking the toast opens it in the default browser. The rule is re-checked when the toast is made and again before `ShellExecute`, so `file:`, `javascript:`, `ms-msdt:` and the like never open, whatever the phone says. A click is only reported while the toast is on screen, and a click that doesn't say which toast it was opens nothing. A repeated message `id` gets the same `ack` and no second toast.
 - **Toasts for received files** say "<n> file(s) from <phone>" with buttons **Open** and **Show in folder** (one file) or **Open folder** (several). A file is opened by a button or a click only if its type is on the allow-list (pictures, audio, video, PDF, text, macro-free Office files); any other file shows its folder with it selected, and its toast has only "Show in folder". Every received file carries the Mark of the Web. See [windows.md](../docs/windows.md#toast-buttons-r10).
@@ -245,9 +289,10 @@ Get-Content $data\logs\kin.log -Tail 20
 - **Pairing:** "Pair new phone" opens a window with the QR code, the PC name, the short ID and a 5-minute countdown. A token is single use and compared in constant time, and five wrong guesses in 60 seconds kill it. Closing the window ends the pairing. On success the window becomes the "New device paired" notice, with a button to remove the device (and a toast).
 - **Addresses in the QR code:** private (RFC 1918) addresses of adapters that are up, without loopback, link-local, VPN or virtual adapters, except that the address on the default route is never left out. At most 3, the default route first, then physical adapters.
 - **WebSocket:** one per device, a new one replaces the old one (4001). The PC sends `hello` at once. No `hello` in 10 seconds is a 1002 close. A PC `ping` that isn't acked in 5 seconds is "No reply" and the connection is closed. 10 minutes of silence marks the phone offline (the phone's WebSocket ping every 4 minutes keeps it alive). Message IDs are remembered in SQLite, so a repeated `ping` gets the same `ack` and no second toast.
-- **Tray:** the icon (a green dot when connected, amber when offline, none when not paired) and the tooltip show the state, and **the progress of a transfer ("sending 45%")**. A left click opens the drop window. The menu has the status line, Send files…, Send clipboard to phone, Pair new phone, Open received folder, Ping phone, the sync check item, Open log folder and Quit. Windows are destroyed when closed.
-- **Logs:** every connect and disconnect with its reason or close code, every pairing attempt and its result, every ping, every transfer step, and start and stop. Never a key, a token or the pairing URL.
+- **Queue (1.4).** An explicit send is stored as `queued` before it is tried, and goes out after the phone's `hello` in creation order, one item at a time, each under its own ID. An item that gets no `ack` in 5 s stays queued (the PC sends no pings to find out: they would wake the phone's radio). Only an `error` from the phone fails it. Never queued: the automatic clipboard and a `sensitive` text. Details in [docs/windows.md](../docs/windows.md#queue); measured: [phase-1-4-desktop.md](../docs/results/phase-1-4-desktop.md).
+- **Tray:** the icon (a green dot when connected, amber when offline, none when not paired) and the tooltip show the state, **"Phone offline – last seen 14:32"** when the phone is away (and how many sends are queued), and **the progress of a transfer ("sending 45%")**. A left click opens the drop window, **Shift + left click the debug window**. The menu is the one of docs/windows.md: the status line, Send files…, Send clipboard to phone, Pair new phone, Open received folder, History, Settings and Quit. (`--ping` is on the command line and in the debug window; the clipboard sync switch is in Settings.) Windows are destroyed when closed.
+- **Logs:** every connect and disconnect with its reason or close code, every pairing attempt and its result, every ping, every transfer step, and start and stop. Never a key, a token or the pairing URL. **Never a file name (1.4):** a line that has to say which file has `<file 1a2b3c4d>`, a short **keyed** tag of the name (HMAC-SHA256 under a per-installation key that is protected with DPAPI in `log-key.dat` and never exported; the same for the tag of a text), and the name itself is written only at debug level, which is off. A `.part` path is never logged. The toasts still show the names (the log has the toast with the hash). This replaces the exception that the integration run found in 1.3 ("Sending dup2.txt to …").
 
 ## Not in this milestone
 
-The persistent queue and the history (1.4: a send while the phone is offline just fails with a toast; an explicit `text` is not stored anywhere yet), a settings window (`settings.json` instead), folders as such (they are skipped), several images on the clipboard, autostart, and the installer work (firewall rule, per-machine install, the "Send to" shortcut, a registered app ID for toasts). Those are 1.4 and 1.5.
+Folders as such (they are skipped), several images on the clipboard, and the installer work (firewall rule, per-machine install, the "Send to" shortcut, the Run key written by the installer, a registered app ID for toasts): that is 1.5. (In 1.4 "Start with Windows" in the Settings window writes the user's Run key, in a normal run, through the Tauri autostart plugin.)

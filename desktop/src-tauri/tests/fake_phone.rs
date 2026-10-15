@@ -858,11 +858,11 @@ async fn the_hotkey_says_so_when_there_is_nothing_to_send_or_nobody_to_send_to()
     assert_eq!(w.env.core.send_clipboard_text("hotkey", kin_lib::sync::Tap::now()).await, SendResult::NoPhonePaired);
     assert_eq!(toasts(&drain(&mut w.env.events)), ["No phone is paired yet."]);
 
-    // Paired but not connected: the send just fails, with a notice (the queue is 1.4).
+    // Paired but not connected: the text is queued (1.4), and the notice says so.
     w.pair().await;
     drain(&mut w.env.events);
     assert_eq!(w.env.core.send_clipboard_text("tray", kin_lib::sync::Tap::now()).await, SendResult::PhoneOffline);
-    assert_eq!(toasts(&drain(&mut w.env.events)), ["The phone isn't connected. The text was not sent."]);
+    assert_eq!(toasts(&drain(&mut w.env.events)), ["The phone isn't connected. The text is queued and will be sent when it is back."]);
     assert_eq!(w.core().status_json()["lastSent"]["text"]["result"], "phone_offline");
 
     // Connected, but the clipboard holds no text.
@@ -891,10 +891,10 @@ async fn no_ack_in_5_seconds_marks_the_phone_offline_and_the_send_fails_visibly(
     assert_eq!(sent["result"], "no_reply");
     assert!(sent["tapToAckMs"].is_null());
 
-    // An explicit send after that fails at once with a notice: the phone is offline now.
+    // An explicit send after that is queued at once, with a notice: the phone is offline now.
     drain(&mut w.env.events);
     assert_eq!(w.env.core.send_clipboard_text("hotkey", kin_lib::sync::Tap::now()).await, SendResult::PhoneOffline);
-    assert_eq!(toasts(&drain(&mut w.env.events)), ["The phone isn't connected. The text was not sent."]);
+    assert_eq!(toasts(&drain(&mut w.env.events)), ["The phone isn't connected. The text is queued and will be sent when it is back."]);
 }
 
 #[tokio::test]
@@ -908,7 +908,10 @@ async fn an_explicit_send_without_an_ack_shows_a_notice() {
     let sending = tokio::spawn(async move { core.send_clipboard_text("hotkey", kin_lib::sync::Tap::now()).await });
     assert_eq!(next_json(&mut ws).await["type"], "text");
     assert_eq!(sending.await.unwrap(), SendResult::NoReply);
-    assert_eq!(toasts(&drain(&mut w.env.events)), ["No reply from the phone. The text was not sent."]);
+    assert_eq!(
+        toasts(&drain(&mut w.env.events)),
+        ["No reply from the phone. The text is queued and will be sent again when the phone is back."]
+    );
 }
 
 #[tokio::test]

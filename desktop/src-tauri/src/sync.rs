@@ -2,8 +2,8 @@
 //! change, `text` on the hotkey), what it does with a `text` from the phone, how it waits for the `ack`, and the timings it
 //! keeps for `status.json`.
 //!
-//! **Privacy.** The text of the clipboard is never logged and never stored: not by automatic sync (D10), and in 1.2 not by
-//! explicit sends either, because the history comes in 1.4. A log line has a length and a short hash (see
+//! **Privacy.** The text of the clipboard is never logged. It is never stored by the automatic sync (D10), and it is never stored when it
+//! is `sensitive`. An explicit, non-sensitive text is stored (1.4: it is queued, and it is in the history). A log line has a length and a short hash (see
 //! `clipboard::short_hash`) and nothing else, and a *sensitive* text (protocol.md, "Sensitive text") not even that. The one place
 //! the text is shown is the toast for a `text` from the phone, which is the point of that message, and not for a sensitive one.
 //!
@@ -86,7 +86,8 @@ pub enum SendResult {
     },
     /// No `ack` in 5 s. The connection was closed, so the phone counts as offline now.
     NoReply,
-    /// A phone is paired but isn't connected. (In 1.2 the send just fails. The queue comes in 1.4.)
+    /// A phone is paired but isn't connected. An explicit send (a `text`, files) is queued and goes out when the phone is back (1.4); the
+    /// automatic clipboard is dropped.
     PhoneOffline,
     NoPhonePaired,
     /// The phone answered with an `error`.
@@ -132,6 +133,8 @@ pub struct SentRecord {
     pub sensitive: bool,
     /// The text was over 128 KiB and went as a `.txt` file (`result` is then the result of that offer).
     pub as_file: bool,
+    /// The send is in the queue (an explicit send that did not get its `ack` at once). `result` says why: `phone_offline` or `no_reply`.
+    pub queued: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -216,6 +219,10 @@ impl Core {
         lock(&self.settings).hotkey.clone()
     }
 
+    pub fn hotkey_status(&self) -> HotkeyStatus {
+        lock(&self.hotkey).clone()
+    }
+
     pub fn set_hotkey_status(&self, status: HotkeyStatus) {
         *lock(&self.hotkey) = status;
         self.emit(Event::StateChanged);
@@ -277,6 +284,7 @@ impl Core {
             _ => "sensitive text".to_string(),
         };
         let mut as_file = false;
+        let mut queued = false;
         let plan = plan_send(kind, sensitive, bytes);
         let result = match plan {
             SendPlan::TooLarge => {
@@ -292,6 +300,11 @@ impl Core {
                 as_file = true;
                 self.send_text_file(&text).await
             }
+            // An explicit, non-sensitive text is queued first (protocol.md, "Queue"): stored, then sent if the phone is connected.
+            SendPlan::Text if !sensitive => {
+                queued = true;
+                self.queue_text(&id, &text, links::is_http_url(&text), tap).await
+            }
             SendPlan::Text | SendPlan::Clipboard => {
                 let frame = match kind {
                     Kind::Text => {
@@ -303,11 +316,18 @@ impl Core {
                     }
                     Kind::Clipboard => json!({ "type": "clipboard", "id": id, "text": text }),
                 };
-                self.send_frame(kind, &id, frame, tap).await
+                let result = self.send_frame(kind, &id, frame, tap).await;
+                // The automatic clipboard (and a sensitive text) is never stored. Only the outcome is counted, with no text in it.
+                if !matches!(result, SendResult::PhoneOffline | SendResult::NoPhonePaired) {
+                    self.record_one_shot_send(&id, kind.as_str(), &result);
+                }
+                result
             }
         };
+        // A long text goes as a file, which is queued the same way.
+        queued |= as_file;
         let phone = self.snapshot().headline_device().map(|d| d.name.clone());
-        self.log_and_record(kind, &id, chars, hash.as_deref(), sensitive, as_file, trigger, &result, phone.as_deref(), explicit);
+        self.log_and_record(kind, &id, chars, hash.as_deref(), sensitive, as_file, queued, trigger, &result, phone.as_deref(), explicit);
         result
     }
 
@@ -319,7 +339,16 @@ impl Core {
 
     /// Sends one message that needs an `ack` to the connected phone and waits for it (5 s). Also says which device it went to.
     pub(crate) async fn send_to_phone(&self, frame: Value, tap: Tap) -> (SendResult, Option<String>) {
-        let Some((device_id, tx)) = self.connections.most_recent_open() else {
+        self.send_to_device(None, frame, tap).await
+    }
+
+    /// The same, to a given device (the queue sends an item to the device it was made for). `None`: the phone that connected last.
+    pub(crate) async fn send_to_device(&self, target: Option<&str>, frame: Value, tap: Tap) -> (SendResult, Option<String>) {
+        let found = match target {
+            Some(id) => self.connections.open_sender(id).map(|tx| (id.to_string(), tx)),
+            None => self.connections.most_recent_open(),
+        };
+        let Some((device_id, tx)) = found else {
             let result = if self.snapshot().devices.is_empty() { SendResult::NoPhonePaired } else { SendResult::PhoneOffline };
             return (result, None);
         };
@@ -333,9 +362,22 @@ impl Core {
             Ok(Ok(SendOutcome::Ack(rtt))) => SendResult::Acked { rtt, tap_to_ack },
             Ok(Ok(SendOutcome::Failed(code))) => SendResult::Rejected(code),
             Ok(Ok(SendOutcome::NotConnected)) => SendResult::PhoneOffline,
-            Ok(Ok(SendOutcome::NoReply)) | Ok(Err(_)) | Err(_) => SendResult::NoReply,
+            Ok(Ok(SendOutcome::NoReply | SendOutcome::Lost)) | Ok(Err(_)) | Err(_) => SendResult::NoReply,
         };
         (result, Some(device_id))
+    }
+
+    /// A send that is not queued (the automatic clipboard, a sensitive text): one row for its outcome.
+    fn record_one_shot_send(&self, id: &str, kind: &str, result: &SendResult) {
+        let (res, error, latency) = match result {
+            SendResult::Acked { tap_to_ack, .. } => ("ok", None, Some(tap_to_ack.as_secs_f64() * 1000.0)),
+            SendResult::Rejected(code) => ("failed", Some(code.clone()), None),
+            SendResult::NoReply => ("failed", Some("no_reply".to_string()), None),
+            SendResult::TooLarge { .. } => return,
+            SendResult::PhoneOffline | SendResult::NoPhonePaired => return,
+        };
+        self.record_send_start(id, kind, 1, false);
+        self.record_send_end(id, kind, unix_ms() as i64, 1, res, error.as_deref(), latency);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -347,6 +389,7 @@ impl Core {
         hash: Option<&str>,
         sensitive: bool,
         as_file: bool,
+        queued: bool,
         trigger: &'static str,
         result: &SendResult,
         phone: Option<&str>,
@@ -381,6 +424,7 @@ impl Core {
             rtt_ms,
             sensitive,
             as_file,
+            queued: queued && matches!(result, SendResult::PhoneOffline | SendResult::NoReply),
         };
         {
             let mut stats = lock(&self.stats);
@@ -397,7 +441,16 @@ impl Core {
         if explicit && !as_file {
             let toast = match result {
                 SendResult::Acked { .. } => Some(format!("Sent to {}", phone.unwrap_or("your phone"))),
+                SendResult::NoReply if queued => {
+                    Some("No reply from the phone. The text is queued and will be sent again when the phone is back.".to_string())
+                }
+                SendResult::PhoneOffline if queued => {
+                    Some("The phone isn't connected. The text is queued and will be sent when it is back.".to_string())
+                }
                 SendResult::NoReply => Some("No reply from the phone. The text was not sent.".to_string()),
+                SendResult::PhoneOffline if sensitive => {
+                    Some("The phone isn't connected. A text marked sensitive is never queued, so it was not sent.".to_string())
+                }
                 SendResult::PhoneOffline => Some("The phone isn't connected. The text was not sent.".to_string()),
                 SendResult::NoPhonePaired => Some("No phone is paired yet.".to_string()),
                 SendResult::Rejected(code) => Some(format!("The phone couldn't take the text ({code}).")),
@@ -562,6 +615,11 @@ impl Core {
                     ""
                 }
             );
+        }
+        // An explicit text is in the history (a `sensitive` one never is: nothing of it is stored). The ID is the message's, so a repeat of
+        // the message (a retry after a lost `ack`) is the same row, not a second one.
+        if !sensitive && let Err(e) = self.db.insert_text_item(id, device_id, "in", "done", unix_ms() as i64, None, &text, is_url, None) {
+            log::debug!("the text {id} is not added to the history again: {e}");
         }
         lock(&self.stats).received_text = Some(ReceivedRecord {
             id: id.to_string(),

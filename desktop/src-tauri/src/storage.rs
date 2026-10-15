@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS seen_messages (
     seen_at    INTEGER NOT NULL,
     PRIMARY KEY (device_id, message_id)
 );
--- direction: 'in' (phone to PC) or 'out' (PC to phone). status: 'active', 'done', 'failed' or 'canceled' ('queued' comes with 1.4).
+-- direction: 'in' (phone to PC) or 'out' (PC to phone). kind: 'file' or 'text' (1.4: the text is in `transfer_texts`). status: 'queued' (1.4: made
+-- and persisted, not sent yet), 'active', 'done', 'failed' or 'canceled'. 1.4 adds `sent_at` and `retry_of` (see `ensure_column`).
 CREATE TABLE IF NOT EXISTS transfers (
     id          TEXT PRIMARY KEY,
     device_id   TEXT NOT NULL,
@@ -90,6 +91,19 @@ CREATE TABLE IF NOT EXISTS transfer_files (
 );
 ";
 
+/// Adds a column to a table that was made before the column existed.
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let has = conn
+        .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{column}'"))?
+        .query_row([], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if !has {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+    }
+    Ok(())
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
         Db::init(Connection::open(path)?)
@@ -101,19 +115,29 @@ impl Db {
 
     fn init(conn: Connection) -> Result<Db> {
         conn.execute_batch(SCHEMA)?;
-        // A database made before `finalizing_name` existed gets the column.
-        let has_column = conn
-            .prepare("SELECT 1 FROM pragma_table_info('transfer_files') WHERE name = 'finalizing_name'")?
-            .query_row([], |_| Ok(()))
-            .optional()?
-            .is_some();
-        if !has_column {
-            conn.execute_batch("ALTER TABLE transfer_files ADD COLUMN finalizing_name TEXT")?;
-        }
+        conn.execute_batch(crate::queuedb::SCHEMA)?;
+        // A database made before a column existed gets it: `finalizing_name` (1.3), `sent_at` and `retry_of` (1.4).
+        ensure_column(&conn, "transfer_files", "finalizing_name", "TEXT")?;
+        ensure_column(&conn, "transfers", "sent_at", "INTEGER")?;
+        ensure_column(&conn, "transfers", "retry_of", "TEXT")?;
+        // A failed item can be retried once: the database refuses a second retry of the same item (a double click on Retry). A database that
+        // has two rows with one `retry_of` (made before this index) keeps the first link, so the index can be made.
+        conn.execute_batch(
+            "UPDATE transfers SET retry_of = NULL WHERE retry_of IS NOT NULL AND rowid NOT IN
+               (SELECT MIN(rowid) FROM transfers WHERE retry_of IS NOT NULL GROUP BY retry_of);
+             CREATE UNIQUE INDEX IF NOT EXISTS transfers_retry_of ON transfers (retry_of) WHERE retry_of IS NOT NULL;
+             -- What the queries ask for: the queue (status, direction, device, creation order), the history (newest first), the expiry sweep, the
+             -- recovery of open transfers and the `.part` clean-up (a file's path).
+             CREATE INDEX IF NOT EXISTS transfers_queue ON transfers (status, direction, device_id, created_at);
+             CREATE INDEX IF NOT EXISTS transfers_created ON transfers (created_at);
+             CREATE INDEX IF NOT EXISTS transfers_expiry ON transfers (status, expires_at);
+             CREATE INDEX IF NOT EXISTS transfers_finished ON transfers (status, finished_at);
+             CREATE INDEX IF NOT EXISTS transfer_files_path ON transfer_files (local_path);",
+        )?;
         Ok(Db(Mutex::new(conn)))
     }
 
-    fn conn(&self) -> MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
         self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
@@ -290,11 +314,17 @@ impl Db {
     /// Stores a transfer and its files. A transfer ID is never reused, so an ID that is already there is an error and nothing is
     /// changed: the old records are never replaced or wiped.
     pub fn insert_transfer(&self, t: &TransferRow, files: &[TransferFileRow]) -> Result<()> {
+        self.insert_transfer_retry(t, files, None)
+    }
+
+    /// The same, for an item made by a **retry** of `retry_of`: the link is written in the same transaction as the item (a second retry of the
+    /// same item is refused by a unique index, so a double click makes one item).
+    pub fn insert_transfer_retry(&self, t: &TransferRow, files: &[TransferFileRow], retry_of: Option<&str>) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO transfers (id, device_id, direction, status, created_at, updated_at, finished_at, expires_at, total_bytes, error_code, dest_dir)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO transfers (id, device_id, direction, status, created_at, updated_at, finished_at, expires_at, total_bytes, error_code, dest_dir, retry_of)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 t.id,
                 t.device_id,
@@ -306,7 +336,8 @@ impl Db {
                 t.expires_at,
                 t.total_bytes,
                 t.error_code,
-                t.dest_dir
+                t.dest_dir,
+                retry_of
             ],
         )?;
         for f in files {
@@ -406,13 +437,16 @@ impl Db {
         Ok(Some((t, files)))
     }
 
-    /// Transfers that are still going (`active`), and the ones that finished after `since_ms` (so a repeated request for a
-    /// transfer that just ended can still be answered).
+    /// Transfers that are still going (`active`), the ones that finished after `since_ms` (so a repeated request for a transfer that just
+    /// ended can still be answered), and **an offer that was sent but never acked** (`queued` with a `sent_at`): the phone may have it and
+    /// may be downloading it, so its files must be served after a restart too.
     pub fn load_open_transfers(&self, since_ms: i64) -> Result<Vec<(TransferRow, Vec<TransferFileRow>)>> {
         let conn = self.conn();
         let rows: Vec<TransferRow> = {
-            let mut stmt =
-                conn.prepare(&format!("{SELECT_TRANSFER} WHERE status = 'active' OR (status = 'done' AND finished_at >= ?1)"))?;
+            let mut stmt = conn.prepare(&format!(
+                "{SELECT_TRANSFER} WHERE kind = 'file' AND (status = 'active' OR (status = 'done' AND finished_at >= ?1)
+                   OR (status = 'queued' AND direction = 'out' AND sent_at IS NOT NULL))"
+            ))?;
             stmt.query_map([since_ms], read_transfer)?.collect::<std::result::Result<_, _>>()?
         };
         with_files(&conn, rows)
@@ -422,7 +456,9 @@ impl Db {
     pub fn recent_transfers(&self, limit: usize) -> Result<Vec<(TransferRow, Vec<TransferFileRow>)>> {
         let conn = self.conn();
         let rows: Vec<TransferRow> = {
-            let mut stmt = conn.prepare(&format!("{SELECT_TRANSFER} ORDER BY created_at DESC, rowid DESC LIMIT ?1"))?;
+            let mut stmt = conn.prepare(&format!(
+                "{SELECT_TRANSFER} WHERE kind = 'file' AND status != 'queued' ORDER BY created_at DESC, rowid DESC LIMIT ?1"
+            ))?;
             stmt.query_map([limit as i64], read_transfer)?.collect::<std::result::Result<_, _>>()?
         };
         with_files(&conn, rows)
@@ -487,6 +523,45 @@ mod tests {
         assert_eq!(db.get_transfer("old").unwrap().unwrap().1[0].finalizing_name.as_deref(), Some("b.bin"));
         // Opening it a second time (the column is there now) is fine too.
         assert!(db.transfer_exists("old").unwrap());
+    }
+
+    #[test]
+    fn a_database_with_two_retries_of_one_item_keeps_the_first_link_and_gets_the_unique_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE transfers (id TEXT PRIMARY KEY, device_id TEXT NOT NULL, direction TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'file',
+               status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, finished_at INTEGER, expires_at INTEGER,
+               total_bytes INTEGER NOT NULL, error_code TEXT, dest_dir TEXT, sent_at INTEGER, retry_of TEXT);
+             INSERT INTO transfers (id, device_id, direction, status, created_at, updated_at, total_bytes, retry_of) VALUES
+               ('r1', 'd', 'out', 'queued', 1, 1, 5, 'orig'), ('r2', 'd', 'out', 'queued', 2, 2, 5, 'orig'), ('x', 'd', 'out', 'done', 3, 3, 5, NULL);",
+        )
+        .unwrap();
+        let db = Db::init(conn).unwrap();
+        let links: Vec<(String, Option<String>)> = {
+            let conn = db.conn();
+            let mut stmt = conn.prepare("SELECT id, retry_of FROM transfers ORDER BY id").unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(
+            links,
+            [("r1".into(), Some("orig".into())), ("r2".into(), None), ("x".into(), None)],
+            "the first link stays, the second is dropped"
+        );
+        let second = db.conn().execute("INSERT INTO transfers (id, device_id, direction, status, created_at, updated_at, total_bytes, retry_of) VALUES ('r3', 'd', 'out', 'queued', 4, 4, 5, 'orig')", []);
+        assert!(second.is_err(), "the index refuses a third");
+        // The indexes the queries use are there.
+        let names: Vec<String> = {
+            let conn = db.conn();
+            let mut stmt = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name IN ('transfers', 'transfer_files')")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
+        };
+        for wanted in
+            ["transfers_retry_of", "transfers_queue", "transfers_created", "transfers_expiry", "transfers_finished", "transfer_files_path"]
+        {
+            assert!(names.iter().any(|n| n == wanted), "{wanted} is missing: {names:?}");
+        }
     }
 
     #[test]

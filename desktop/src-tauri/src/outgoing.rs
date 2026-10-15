@@ -2,7 +2,8 @@
 //! (with `Range` for a resume), and canceling from either side.
 //!
 //! The PC never pushes bytes. It sends the `offer` over the WebSocket, waits for the `ack` (or an `error`, such as `disk_full`),
-//! and the phone downloads each file with its own HTTPS requests. The files are read from where they are (nothing is copied, and
+//! and the phone downloads each file with its own HTTPS requests. **Since 1.4 an offer is queued first** (`queue.rs`): it is stored as
+//! `queued` before the first attempt, and sent at once if the phone is connected, or when it is back. The files are read from where they are (nothing is copied, and
 //! a file that changes after the offer makes the `GET` answer `409 source_changed`). An offer expires after 24 hours.
 //!
 //! **Folders.** A dropped folder is not sent in 1.3: it is skipped with a message ("Folders can't be sent yet"). Flattening it would
@@ -11,14 +12,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::connections::{ConnCommand, SendOutcome};
-use crate::core::{Core, Event, short, short_transfer};
+use crate::core::{Core, Event, short_transfer};
 use crate::encoding::{unix_ms, uuid_v7};
 use crate::server::ApiError;
 use crate::sync::SendResult;
-use crate::transfers::{Direction, Entry, Failure, FileData, FileShared, KEEP_MS, Status, insert_row, remove_temp_source};
+use crate::transfers::{Direction, Entry, Failure, FileShared, Status, remove_temp_source};
 
 /// How many files go in one `offer`: the limit of the protocol, which a receiver enforces (`messages::MAX_OFFER_FILES`).
 pub const FILES_PER_OFFER: usize = crate::messages::MAX_OFFER_FILES;
@@ -121,7 +122,7 @@ pub fn inspect(paths: &[PathBuf]) -> (Vec<Source>, usize, Vec<(String, String)>)
 
 impl Core {
     /// The tray's "Send files…", the drop window, Explorer's "Send to" and `Kin.exe --send <paths>`: offer these files to the
-    /// phone. A phone that isn't connected gets nothing and the user is told (the queue that sends later comes in 1.4).
+    /// phone. The offer is queued first. A phone that isn't connected gets it when it is back, and the user is told so.
     pub async fn send_paths(self: &Arc<Self>, paths: Vec<PathBuf>, trigger: &'static str) -> SendReport {
         let mut report = SendReport::default();
         let (sources, folders, unreadable) = tokio::task::spawn_blocking(move || inspect(&paths)).await.unwrap_or_default();
@@ -139,8 +140,14 @@ impl Core {
             )));
         }
         for (name, why) in &report.unreadable {
-            log::warn!("send files: {name:?} can't be read: {why}");
-            self.emit(Event::Toast(format!("{name} can't be read, so it was not sent.")));
+            // A file name is the user's own: the log has a short hash of it (and the name at debug level, which is off by default).
+            let tag = crate::core::name_tag(name);
+            log::warn!("send files: {tag} can't be read: {why}");
+            log::debug!("send files: {tag} is {name:?}");
+            self.emit(Event::ToastRedacted {
+                text: format!("{name} can't be read, so it was not sent."),
+                log_text: format!("{tag} can't be read, so it was not sent."),
+            });
         }
         if sources.is_empty() {
             if folders == 0 && report.unreadable.is_empty() {
@@ -148,14 +155,48 @@ impl Core {
             }
             return report;
         }
+        let mut waiting = Vec::new();
         for chunk in sources.chunks(FILES_PER_OFFER) {
-            let (id, result) = self.offer(chunk.to_vec()).await;
-            report.files += chunk.len();
-            report.transfers.push(id);
-            let failed = !matches!(result, SendResult::Acked { .. });
-            report.result = Some(result);
-            if failed {
-                break;
+            match self.enqueue_offer(chunk, None) {
+                Some((id, rx)) => {
+                    report.files += chunk.len();
+                    report.transfers.push(id.clone());
+                    waiting.push((id, rx));
+                }
+                None => {
+                    // No phone is paired (nothing to queue for), or the offer couldn't be saved.
+                    let result = if self.snapshot().devices.is_empty() {
+                        SendResult::NoPhonePaired
+                    } else {
+                        SendResult::Rejected("internal".into())
+                    };
+                    self.offer_failed_toast(&result, None);
+                    for s in chunk.iter().filter(|s| s.temp) {
+                        remove_temp_source(&s.path);
+                    }
+                    report.result = Some(result);
+                    break;
+                }
+            }
+        }
+        if waiting.is_empty() {
+            return report;
+        }
+        let connected = self.connections.most_recent_open().is_some();
+        if connected {
+            self.flush_queue().await;
+        } else {
+            let n: usize = report.files;
+            self.emit(Event::Toast(format!(
+                "The phone isn't connected. {} queued and will be sent when it is back.",
+                if n == 1 { "1 file is".to_string() } else { format!("{n} files are") }
+            )));
+        }
+        for (id, mut rx) in waiting {
+            self.queue.forget(&id);
+            let result = rx.try_recv().unwrap_or(SendResult::PhoneOffline);
+            if report.result.as_ref().is_none_or(|r| matches!(r, SendResult::Acked { .. })) {
+                report.result = Some(result);
             }
         }
         report
@@ -183,69 +224,23 @@ impl Core {
             return SendResult::Rejected("internal".to_string());
         };
         let source = Source { path, name: TEXT_FILE_NAME.to_string(), size: meta.len(), mtime_ms: mtime_ms(&meta), temp: true };
-        self.offer(vec![source]).await.1
-    }
-
-    /// Registers an offer and sends it. The `ack` makes it live. Returns the transfer ID and how the send went.
-    async fn offer(self: &Arc<Self>, sources: Vec<Source>) -> (String, SendResult) {
-        let id = uuid_v7(unix_ms());
-        let Some((device_id, _)) = self.connections.most_recent_open() else {
-            let result = if self.snapshot().devices.is_empty() { SendResult::NoPhonePaired } else { SendResult::PhoneOffline };
-            self.offer_failed_toast(&result, None);
-            for s in sources.iter().filter(|s| s.temp) {
-                remove_temp_source(&s.path);
-            }
-            return (id, result);
+        let Some((id, mut rx)) = self.enqueue_offer(std::slice::from_ref(&source), None) else {
+            remove_temp_source(&source.path);
+            return if self.snapshot().devices.is_empty() { SendResult::NoPhonePaired } else { SendResult::Rejected("internal".into()) };
         };
-        let now = unix_ms();
-        let files: Vec<Arc<FileShared>> = sources
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let data = FileData {
-                    name: s.name.clone(),
-                    path: s.path.clone(),
-                    finalized: false,
-                    source_mtime_ms: Some(s.mtime_ms),
-                    temp_source: s.temp,
-                };
-                crate::transfers::file_shared(&format!("f{}", i + 1), i, s.size, mime_of(&s.name), data)
-            })
-            .collect();
-        let total: u64 = sources.iter().map(|s| s.size).sum();
-        let entry = Entry::new(&id, &device_id, Direction::Out, now, now + KEEP_MS, PathBuf::new(), files);
-        insert_row(self, &entry);
-        self.transfers.insert(entry.clone());
-        let frame = json!({
-            "type": "offer",
-            "id": id,
-            "files": entry.files.iter().map(|f| json!({ "fileId": f.file_id, "name": f.data().name, "size": f.size, "mime": f.mime })).collect::<Vec<Value>>(),
-            "totalSize": total,
-        });
-        log::info!("offer {} to device {}: {} file(s), {total} bytes", short_transfer(&id), short(&device_id), sources.len());
-        let (result, _) = self.send_to_phone(frame, crate::sync::Tap::now()).await;
-        let phone = self.snapshot().headline_device().map(|d| d.name.clone());
-        match &result {
-            SendResult::Acked { .. } => {
-                let names = if sources.len() == 1 { sources[0].name.clone() } else { format!("{} files", sources.len()) };
-                self.emit(Event::Toast(format!("Sending {names} to {}", phone.as_deref().unwrap_or("your phone"))));
-            }
-            other => {
-                log::warn!("offer {} was not taken: {}", short_transfer(&id), other.word());
-                self.drop_transfer(&entry, Status::Failed, Some(&other.word())).await;
-                self.offer_failed_toast(other, phone.as_deref());
-            }
+        if self.connections.most_recent_open().is_some() {
+            self.flush_queue().await;
         }
-        self.emit(Event::StateChanged);
-        (id, result)
+        self.queue.forget(&id);
+        rx.try_recv().unwrap_or(SendResult::PhoneOffline)
     }
 
-    fn offer_failed_toast(&self, result: &SendResult, phone: Option<&str>) {
+    pub(crate) fn offer_failed_toast(&self, result: &SendResult, phone: Option<&str>) {
         let who = phone.unwrap_or("The phone");
         let text = match result {
-            SendResult::PhoneOffline => "The phone isn't connected. The files were not sent.".to_string(),
+            SendResult::PhoneOffline => "The phone isn't connected. The files are queued and will be sent when it is back.".to_string(),
             SendResult::NoPhonePaired => "No phone is paired yet.".to_string(),
-            SendResult::NoReply => "No reply from the phone. The files were not sent.".to_string(),
+            SendResult::NoReply => "No reply from the phone. The files are queued and will be sent again when it is back.".to_string(),
             SendResult::Rejected(code) if code == "disk_full" => format!("{who} doesn't have enough free space for the files."),
             SendResult::Rejected(code) => format!("{who} couldn't take the files ({code})."),
             SendResult::TooLarge { .. } | SendResult::Acked { .. } => return,
@@ -253,30 +248,60 @@ impl Core {
         self.emit(Event::Toast(text));
     }
 
-    /// Sends a `cancel` message for a transfer in the background (best effort: with no phone connected nothing is sent, and the
-    /// phone learns from the `404` of its next request).
+    /// A `cancel` message for a transfer. **It is kept until the phone acks it** (changelog 52): it is stored first, sent at once if that
+    /// phone is connected, and sent again, with the same message ID, after every `hello` (before the queue). A phone that was away when the
+    /// user canceled therefore still hears of it, and does not have to find out through a `404`.
     pub fn send_cancel_message(self: &Arc<Self>, device_id: &str, transfer_id: &str, reason: &str) {
-        let Some((connected, tx)) = self.connections.most_recent_open() else {
-            return;
+        let message_id =
+            self.db.add_pending_cancel(device_id, transfer_id, reason, &uuid_v7(unix_ms()), unix_ms() as i64).unwrap_or_else(|e| {
+                log::warn!("keeping the cancel message failed ({e}): it is sent once and not kept");
+                uuid_v7(unix_ms())
+            });
+        let core = self.clone();
+        let (device_id, transfer_id, reason) = (device_id.to_string(), transfer_id.to_string(), reason.to_string());
+        tokio::spawn(async move {
+            core.deliver_cancel(&device_id, &transfer_id, &reason, &message_id).await;
+        });
+    }
+
+    /// Sends one `cancel` to `device_id` if it is connected, and forgets it once the phone acked it (or answered with an `error`, which ends a
+    /// message's life too). Without an `ack` it stays stored for the next `hello`. `true` if it is done.
+    async fn deliver_cancel(&self, device_id: &str, transfer_id: &str, reason: &str, message_id: &str) -> bool {
+        let Some(tx) = self.connections.open_sender(device_id) else {
+            return false;
         };
-        if connected != device_id {
-            return;
-        }
-        let id = uuid_v7(unix_ms());
-        let frame = json!({ "type": "cancel", "id": id, "transferId": transfer_id, "reason": reason });
+        let frame = json!({ "type": "cancel", "id": message_id, "transferId": transfer_id, "reason": reason });
         let (reply, wait) = tokio::sync::oneshot::channel();
         if tx.send(ConnCommand::Send { frame, reply }).is_err() {
-            return;
+            return false;
         }
-        let transfer_id = transfer_id.to_string();
-        tokio::spawn(async move {
-            let outcome = tokio::time::timeout(std::time::Duration::from_secs(7), wait).await;
-            log::info!(
-                "cancel message for {}: {:?}",
-                short_transfer(&transfer_id),
-                outcome.map(|o| o.map(|o| matches!(o, SendOutcome::Ack(_))))
-            );
-        });
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(7), wait).await;
+        let done = matches!(outcome, Ok(Ok(SendOutcome::Ack(_) | SendOutcome::Failed(_))));
+        log::info!(
+            "cancel message for {}: {}",
+            short_transfer(transfer_id),
+            if done { "acked" } else { "no ack, it is kept for the next connection" }
+        );
+        if done {
+            let _ = self.db.delete_pending_cancel(message_id);
+        }
+        done
+    }
+
+    /// After a `hello`: every `cancel` the phone has not acked goes again, oldest first and one at a time. Before the queue (the phone should
+    /// not start something that was already canceled).
+    pub async fn flush_pending_cancels(self: &Arc<Self>, device_id: &str) {
+        let pending = self.db.pending_cancels(device_id).unwrap_or_default();
+        if !pending.is_empty() {
+            log::info!("{} cancel message(s) are sent again after the hello", pending.len());
+        }
+        for (message_id, transfer_id, reason) in pending {
+            if !self.deliver_cancel(device_id, &transfer_id, &reason, &message_id).await
+                && self.connections.open_sender(device_id).is_none()
+            {
+                break;
+            }
+        }
     }
 
     /// The user canceled a transfer (the drop window's button), in either direction. The phone is told with a `cancel` message
@@ -311,7 +336,7 @@ impl Core {
             .get(transfer_id)
             .filter(|e| e.device_id == device_id && e.direction == Direction::Out)
             .ok_or_else(Failure::not_found)?;
-        if entry.status() != Status::Active || entry.expires_ms <= unix_ms() {
+        if entry.status() != Status::Active || entry.expires_ms() <= unix_ms() {
             return Err(Failure::new(ApiError::NotFound, "The offer expired or was canceled."));
         }
         let file = entry.file(file_id).cloned().ok_or_else(|| Failure::new(ApiError::NotFound, "File not found."))?;
