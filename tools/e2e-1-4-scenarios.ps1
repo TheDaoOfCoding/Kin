@@ -188,7 +188,10 @@ function Scenario-Failed([string]$Name, $ErrorRecord) {
     Check "$Name finished without an error" $false ("$($ErrorRecord.Exception.Message) ($where)")
     try {
         Resume-Kin14; Phone-Resume14
-        if (-not (Get-Process Kin -ErrorAction SilentlyContinue)) { Start-Kin14 }
+        # Always a fresh Kin without a clock offset, never "start it only if it is not running": a scenario that died while Kin ran with
+        # --dev-clock-offset (S5, S7b) would leave every later scenario on a shifted clock (expiry, the 24 hour windows, "last seen").
+        Stop-Kin14
+        Start-Kin14
         Wifi $true
         Connect-Phone14
         Wait-Until { (Get-Status).state -eq 'phone_connected' } 45 | Out-Null

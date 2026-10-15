@@ -4,6 +4,7 @@
 const COMMANDS: &[&str] = &[
     "pairing_view",
     "new_pairing",
+    "copy_pairing_link",
     "remove_device",
     "close_window",
     "drop_view",

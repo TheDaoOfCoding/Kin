@@ -30,6 +30,8 @@ pub struct AppState {
 }
 
 pub fn run(parsed: Parsed) {
+    // Before any window exists: the process is "Kin" (app.kinrelay.desktop) to Windows, like the Start Menu shortcut of the installer.
+    let aumid = crate::integration::set_process_app_user_model_id();
     let built = tauri::Builder::default()
         // Must be the first plugin. A second launch (`kin.exe --ping`, later Explorer's "Send to") runs this callback in the
         // running instance with its arguments, and exits.
@@ -58,6 +60,7 @@ pub fn run(parsed: Parsed) {
         .invoke_handler(tauri::generate_handler![
             ui::pairing_view,
             ui::new_pairing,
+            ui::copy_pairing_link,
             ui::remove_device,
             ui::close_window,
             ui::drop_view,
@@ -81,7 +84,7 @@ pub fn run(parsed: Parsed) {
             ui::debug_ping,
             ui::export_logs
         ])
-        .setup(move |app| setup(app, parsed).map_err(|e| -> Box<dyn std::error::Error> { e }))
+        .setup(move |app| setup(app, parsed, aumid).map_err(|e| -> Box<dyn std::error::Error> { e }))
         .on_window_event(|window, event| {
             // The pairing window is destroyed when it closes. An unused token stops working with it.
             if let WindowEvent::Destroyed = event
@@ -116,7 +119,7 @@ fn fatal(error: &dyn std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
-fn setup(app: &mut tauri::App, parsed: Parsed) -> Result<()> {
+fn setup(app: &mut tauri::App, parsed: Parsed, aumid: std::result::Result<(), String>) -> Result<()> {
     let Parsed { config, mut commands, unknown } = parsed;
     if let Ok(cwd) = std::env::current_dir() {
         cli::resolve_paths(&mut commands, &cwd);
@@ -133,6 +136,10 @@ fn setup(app: &mut tauri::App, parsed: Parsed) -> Result<()> {
     );
     if !unknown.is_empty() {
         log::warn!("ignoring unknown arguments: {unknown:?}");
+    }
+    if let Err(e) = aumid {
+        // Toasts name the ID themselves (the notification plugin), so this only costs the grouping of windows on the taskbar.
+        log::warn!("setting the app user model ID failed: {e}");
     }
 
     let loaded = Identity::load_or_create(&config.data_dir)?;
@@ -180,7 +187,9 @@ fn setup(app: &mut tauri::App, parsed: Parsed) -> Result<()> {
             Arc::new(FileAutostart::new(&core.config.data_dir))
         }
     };
+    let for_integration = autostart.clone();
     app.manage(AppState { core: core.clone(), autostart, tray, server: Mutex::new(Some(server)), advertiser: Mutex::new(advertiser) });
+    integrate_with_windows(&core, for_integration, loaded.created);
 
     let handle = app.handle().clone();
     tauri::async_runtime::spawn(event_loop(handle.clone(), core.clone(), events_rx));
@@ -222,6 +231,46 @@ fn setup(app: &mut tauri::App, parsed: Parsed) -> Result<()> {
     refresh(&handle, &core);
     handle_commands(&handle, &commands);
     Ok(())
+}
+
+/// The part of the installation that is the user's (integration.rs): the "Send to" shortcut and "Start with Windows" are made what the person
+/// wants, at every start. Only where the Run key is real, which is a release build that runs the way a user runs it, and not from the build
+/// folder: a script or a developer never gets a shortcut in their real SendTo folder.
+fn integrate_with_windows(core: &Arc<Core>, autostart: Arc<dyn AutostartStore>, new_profile: bool) {
+    use crate::integration;
+    if !autostart.is_real() {
+        log::info!("integration: not a normal release run, the SendTo shortcut and the Run key are not touched");
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            log::warn!("integration: the path of Kin.exe is not known ({e})");
+            return;
+        }
+    };
+    if integration::is_build_folder(&exe) {
+        log::info!("integration: running from a build folder, the SendTo shortcut is not made");
+        return;
+    }
+    let Some(send_to) = integration::send_to_dir() else {
+        log::warn!("integration: the SendTo folder is not known");
+        return;
+    };
+    let data_dir = core.config.data_dir.clone();
+    // COM and the registry, on the blocking pool: start-up doesn't wait for it.
+    tauri::async_runtime::spawn_blocking(move || {
+        let report = integration::reconcile(&data_dir, &exe, &send_to, autostart.as_ref(), new_profile);
+        match &report.send_to {
+            integration::SendTo::Failed(e) => log::warn!("integration: the SendTo shortcut failed: {e}"),
+            other => log::info!("integration: the SendTo shortcut: {other:?}"),
+        }
+        match &report.autostart {
+            Ok(true) => log::info!("integration: start with Windows is on (the Run value is written)"),
+            Ok(false) => log::info!("integration: start with Windows is left as the person set it"),
+            Err(e) => log::warn!("integration: start with Windows failed: {e}"),
+        }
+    });
 }
 
 /// What the core's events do to the UI. It also wakes up when the pairing code runs out, so the window and `status.json` stop
@@ -675,7 +724,10 @@ fn dev_set(app: &AppHandle, core: &Arc<Core>, key: &str, value: &str) {
             Err(e) => write(false, e),
         },
         "startWithWindows" => match state.autostart.set_enabled(on) {
-            Ok(()) => write(true, format!("{} (real: {})", on, state.autostart.is_real())),
+            Ok(()) => {
+                crate::integration::remember_start_with_windows(&core.config.data_dir, on);
+                write(true, format!("{} (real: {})", on, state.autostart.is_real()))
+            }
             Err(e) => write(false, e),
         },
         other => write(false, format!("no setting called {other:?}")),

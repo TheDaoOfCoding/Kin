@@ -2,7 +2,7 @@
 //! at a place the user chose. The zip is for sending to the developer, so what identifies the person is taken out first.
 //!
 //! **What is redacted.** In the log lines and in every string of the JSON: the Windows user's profile path (`C:\Users\<name>` becomes
-//! `%USERPROFILE%`), IPv4 addresses (`<ip>`), this PC's name (`<pc>`) and the names of the paired phones (`<phone>`). In the JSON also the full
+//! `%USERPROFILE%`), IPv4 addresses (`<ip>`), this PC's name (`<pc>`) and the names of every phone paired now or before (`<phone>`). In the JSON also the full
 //! device IDs (cut to the first 8 characters) and the file names of the transfers (`names` becomes a count). **What is never in the logs to begin
 //! with:** keys, tokens, the pairing URL, the text of a clipboard or a message, file names (see desktop/README.md, "Logs").
 //!
@@ -145,7 +145,7 @@ pub fn read_zip(zip: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
 pub struct Redactor {
     /// `C:\Users\<name>`: replaced by `%USERPROFILE%`.
     pub home: Option<String>,
-    /// The same folder in its 8.3 short form (`C:\Users\SOL02~1`), which Windows hands out as `%TEMP%` and some tools write instead of the long one.
+    /// The same folder in its 8.3 short form (`C:\Users\ANNABE~1`), which Windows hands out as `%TEMP%` and some tools write instead of the long one.
     pub home_short: Option<String>,
     /// This PC's name as the phone sees it, and the computer's own name when that differs: replaced by `<pc>`.
     pub pc_names: Vec<String>,
@@ -206,7 +206,7 @@ impl Redactor {
 }
 
 /// `C:\Users\<anything>` and `C:/Users/<anything>` (any drive, any case) become `C:\Users\<user>`: the name is the part up to the next
-/// separator, a quote or a blank, which covers long names without spaces and the 8.3 form (`SOL02~1`). (The current user's own folder was
+/// separator, a quote or a blank, which covers long names without spaces and the 8.3 form (`ANNABE~1`). (The current user's own folder was
 /// replaced by `%USERPROFILE%` before this, spaces and all.)
 pub fn redact_user_folders(text: &str) -> String {
     let bytes = text.as_bytes();
@@ -414,7 +414,15 @@ pub struct ExportReport {
 
 impl Core {
     fn redactor(&self) -> Redactor {
-        let phone_names: Vec<String> = self.snapshot().devices.into_iter().map(|d| d.name).collect();
+        // Every phone name this PC has known, not only the phones paired now: the logs still hold the name of a phone that was unpaired (or
+        // renamed) since the line was written.
+        let mut phone_names: Vec<String> = self.snapshot().devices.into_iter().map(|d| d.name).collect();
+        match self.db.known_device_names() {
+            Ok(known) => phone_names.extend(known),
+            Err(e) => log::warn!("reading the known device names for the export failed: {e}"),
+        }
+        phone_names.sort();
+        phone_names.dedup();
         // The name this PC shows (the device name setting) and the computer's own name: both identify the person's PC.
         let mut pc_names = vec![self.pc_name()];
         if pc_names[0] != self.default_pc_name() {
@@ -472,7 +480,7 @@ impl Core {
     }
 }
 
-const README: &str = "Kin Relay: exported logs\r\n\r\nlogs\\kin*.log   the log files (the newest is kin.log)\r\nstatus.json     what the app was doing when this was exported\r\ndebug.json      the success rate, latency, recent errors and connection history of the debug window\r\n\r\nTaken out before this file was made: your Windows profile path in its long and its short (8.3) form and the folder of any other user under C:\\Users (%USERPROFILE%, the name becomes <user>), IP addresses, IPv4 and IPv6 (<ip>), the folder that received files go to (<received>), the name of this PC (<pc>) and of the paired phones (<phone>), the names of Wi-Fi networks (only Private, Public or Domain stays), device IDs (cut to 8 characters) and file names (counts only).\r\nNever in a log to begin with: keys, pairing tokens, the pairing link, the text of the clipboard or of a message, and file names.\r\n";
+const README: &str = "Kin Relay: exported logs\r\n\r\nlogs\\kin*.log   the log files (the newest is kin.log)\r\nstatus.json     what the app was doing when this was exported\r\ndebug.json      the success rate, latency, recent errors and connection history of the debug window\r\n\r\nTaken out before this file was made: your Windows profile path in its long and its short (8.3) form and the folder of any other user under C:\\Users (%USERPROFILE%, the name becomes <user>), IP addresses, IPv4 and IPv6 (<ip>), the folder that received files go to (<received>), the name of this PC (<pc>) and of every phone paired now or before (<phone>), the names of Wi-Fi networks (only Private, Public or Domain stays), device IDs (cut to 8 characters) and file names (counts only).\r\nNever in a log to begin with: keys, pairing tokens, the pairing link, the text of the clipboard or of a message, and file names.\r\n";
 
 #[cfg(test)]
 mod tests {
@@ -531,15 +539,15 @@ mod tests {
     #[test]
     fn the_short_8_3_profile_path_and_any_other_user_folder_lose_the_name_too() {
         let r = Redactor {
-            home: Some("C:\\Users\\SOL 02".into()),
-            home_short: Some("C:\\Users\\SOL02~1".into()),
+            home: Some("C:\\Users\\Maria Lindqvist".into()),
+            home_short: Some("C:\\Users\\MARIAL~1".into()),
             pc_names: vec![],
             phone_names: vec![],
             received: None,
         };
-        assert_eq!(r.apply("temp C:\\Users\\SOL02~1\\AppData\\Local\\Temp\\x"), "temp %USERPROFILE%\\AppData\\Local\\Temp\\x");
-        assert_eq!(r.apply("temp c:/users/sol02~1/AppData"), "temp %USERPROFILE%/AppData");
-        assert_eq!(r.apply("C:\\Users\\SOL 02\\Downloads\\Kin"), "%USERPROFILE%\\Downloads\\Kin");
+        assert_eq!(r.apply("temp C:\\Users\\MARIAL~1\\AppData\\Local\\Temp\\x"), "temp %USERPROFILE%\\AppData\\Local\\Temp\\x");
+        assert_eq!(r.apply("temp c:/users/marial~1/AppData"), "temp %USERPROFILE%/AppData");
+        assert_eq!(r.apply("C:\\Users\\Maria Lindqvist\\Downloads\\Kin"), "%USERPROFILE%\\Downloads\\Kin");
         // Not predicted: another user, another drive, a form the redactor was not given.
         assert_eq!(r.apply("opened D:\\Users\\Bob\\Documents\\a.txt"), "opened D:\\Users\\<user>\\Documents\\a.txt");
         assert_eq!(r.apply("C:\\USERS\\ANNABE~1\\x and \"C:\\Users\\Eve\" ok"), "C:\\USERS\\<user>\\x and \"C:\\Users\\<user>\" ok");

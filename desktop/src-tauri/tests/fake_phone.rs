@@ -432,6 +432,59 @@ async fn a_pairing_code_that_runs_out_clears_pairing_active_and_the_window() {
     assert_eq!((view.status, view.svg), ("expired", None));
 }
 
+// ----- 1.5: "Copy pairing link" in the pairing window ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn copy_pairing_link_puts_the_qr_link_on_the_clipboard_as_sensitive_text() {
+    use kin_lib::clipboard::{Clipboard, exclusion};
+    let w = World::new().await;
+    let token = start_pairing_and_read_token(&w.env);
+    let url = std::fs::read_to_string(w.env.dir.path().join("pair-url.txt")).unwrap().trim().to_string();
+    assert!(url.starts_with("kinrelay://pair?") && url.contains(&format!("tk={token}")));
+
+    w.core().copy_pairing_link().await.unwrap();
+
+    let snapshot = w.env.clipboard.read().unwrap();
+    assert_eq!(snapshot.text.as_deref(), Some(url.as_str()), "the clipboard holds the same link the QR code encodes");
+    assert_eq!(w.env.clipboard.app_sensitive_writes(), vec![url], "written as sensitive, not as a plain write");
+    assert!(w.env.clipboard.app_writes().is_empty());
+    for format in [
+        ClipFormat::named(EXCLUDE_FROM_MONITOR),
+        ClipFormat::with_dword(CAN_INCLUDE_IN_HISTORY, 0),
+        ClipFormat::with_dword(CAN_UPLOAD_TO_CLOUD, 0),
+    ] {
+        assert!(snapshot.formats.contains(&format), "{format:?} is missing: {:?}", snapshot.formats);
+    }
+    assert!(exclusion(&snapshot.formats).is_some(), "Kin's own clipboard sync skips it");
+}
+
+#[tokio::test]
+async fn copy_pairing_link_is_refused_when_the_code_is_locked_expired_or_used() {
+    let mut w = World::new().await;
+    // no code at all
+    assert!(w.core().copy_pairing_link().await.is_err());
+
+    let _token = start_pairing_and_read_token(&w.env);
+    let mut stream = w.tls().await;
+    for i in 0..5 {
+        let body = pair_body(&format!("ZZZZZZZZZZZZZZZZZZZZZ{i}"), PHONE_NAME);
+        request(&mut stream, "POST", "/v1/pair", &[("Content-Type", "application/json")], &body).await.unwrap();
+    }
+    assert_eq!(w.core().pairing_view().unwrap().status, "locked");
+    assert!(w.core().copy_pairing_link().await.is_err(), "locked");
+
+    w.core().start_pairing();
+    w.core().seed_pairing_token("AAAAAAAAAAAAAAAAAAAAAA", kin_lib::pairing::SeedState::Expired);
+    assert_eq!(w.core().pairing_view().unwrap().status, "expired");
+    assert!(w.core().copy_pairing_link().await.is_err(), "expired");
+
+    w.pair().await;
+    assert_eq!(w.core().pairing_view().unwrap().status, "paired");
+    assert!(w.core().copy_pairing_link().await.is_err(), "used");
+    assert!(w.env.clipboard.app_sensitive_writes().is_empty(), "nothing was written to the clipboard");
+    drain(&mut w.env.events);
+}
+
 // ----- 1.2: PC clipboard -> phone ---------------------------------------------------------------------------------------
 
 /// Reads frames for `ms` milliseconds and fails if one is a message (WebSocket pings and pongs don't count).

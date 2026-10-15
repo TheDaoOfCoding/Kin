@@ -6,6 +6,8 @@
 # few transfers so the windows have something to show (a text each way, a file each way, one failed send, one text waiting in the queue), opens
 # each window, and captures its visible frame (the screen is used: the window is brought to the front, so don't touch the mouse for a minute).
 # The real clipboard is saved first and put back at the end (clipboard-backup.ps1). Everything it started is stopped and deleted.
+# The QR code of the pairing window holds the address of the PC, so Kin gets --dev-qr-address 10.0.2.2 (the emulator's name for the PC, not a real
+# address): without it the picture would carry the LAN address of the PC it was taken on.
 # The windows are destroyed again after each picture, and the memory of Kin.exe is measured before and after (the idle-memory claim of 1.4).
 # Without -Out and -UpdateScreens the pictures go to an ignored folder in the temp area: a run never overwrites the tracked pictures of
 # docs\results (and an -Out that points there is redirected the same way) unless -UpdateScreens says so.
@@ -104,7 +106,7 @@ try {
     Make-File (Join-Path $src 'Quarterly report.pdf') 800000
     Make-File (Join-Path $src 'notes.txt') 4200
     Make-File (Join-Path $src 'Holiday video.mp4') 5200000
-    Start-Process $kin -ArgumentList '--data-dir', ('"{0}"' -f $data), '--dev-bind', '127.0.0.1', '--dev-received-dir', ('"{0}"' -f $recv), '--dev-print-pair-url', '--dev-no-toasts' | Out-Null
+    Start-Process $kin -ArgumentList '--data-dir', ('"{0}"' -f $data), '--dev-bind', '127.0.0.1', '--dev-qr-address', '10.0.2.2', '--dev-received-dir', ('"{0}"' -f $recv), '--dev-print-pair-url', '--dev-no-toasts' | Out-Null
     if (-not (Wait-Until { Test-Path -LiteralPath (Join-Path $data 'status.json') } 15)) { throw 'Kin did not start' }
     Start-Sleep -Seconds 2
     $before = Mem

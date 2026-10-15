@@ -1,6 +1,7 @@
-# Creates (or removes) the Explorer "Send to" shortcut by hand. The installer of milestone 1.5 does this for real; until then this is
-# the way to try "Send to" on a development PC. **Nothing here runs by itself and nothing creates the shortcut on its own**: the folder
-# `%APPDATA%\Microsoft\Windows\SendTo` is the user's, so the default is only used when you ask for it.
+# Creates (or removes) the Explorer "Send to" shortcut by hand: the same file (Kin.lnk) that an installed Kin makes for itself at every start
+# (src-tauri\src\integration.rs). This is the way to try "Send to" on a development PC, whose Kin never makes it (a developer run, or a run
+# from the build folder, doesn't). **Nothing here runs by itself**: the folder `%APPDATA%\Microsoft\Windows\SendTo` is the user's, so the
+# default is only used when you ask for it.
 #
 #   powershell -File make-sendto-shortcut.ps1 -Folder "$env:TEMP\sendto-test"      # a test folder: look at the shortcut, then delete the folder
 #   powershell -File make-sendto-shortcut.ps1                                      # the real SendTo folder of the current user
@@ -12,7 +13,7 @@
 param(
     [string]$Kin = (Join-Path $PSScriptRoot 'src-tauri\target\release\Kin.exe'),
     [string]$Folder = (Join-Path $env:APPDATA 'Microsoft\Windows\SendTo'),
-    [string]$Name = 'Kin Relay (phone).lnk',
+    [string]$Name = 'Kin.lnk',
     [switch]$Remove
 )
 $ErrorActionPreference = 'Stop'

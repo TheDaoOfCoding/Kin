@@ -53,7 +53,8 @@ impl Config {
     /// Whether "Start with Windows" may use the real Run key: **only a release build** that runs the way a user runs it. A debug build (what
     /// `cargo run` and `cargo test` make) never writes the registry, even with no flag at all: it used to, and a developer who opened the
     /// settings window and clicked the switch got Kin in their real Run key. Any developer setting, and a data directory of its own (a
-    /// script's throwaway profile), get the file stand-in of `autostart.rs` instead.
+    /// script's throwaway profile), get the file stand-in of `autostart.rs` instead. The same rule decides whether the app makes its "Send to"
+    /// shortcut (`integration.rs`): only where the Run key is real.
     pub fn autostart_is_real(&self) -> bool {
         !cfg!(debug_assertions) && !self.dev_hooks_enabled() && !self.data_dir_overridden
     }

@@ -809,6 +809,22 @@ async fn the_log_export_is_a_zip_with_the_logs_and_a_status_file_with_nothing_pe
 }
 
 #[tokio::test]
+async fn the_export_takes_out_the_name_of_a_phone_that_was_unpaired_too() {
+    let w = World::new().await;
+    w.pair().await;
+    let logs = w.env.dir.path().join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(logs.join("kin.log"), "2026 INFO kin: phone connected: \"Test Phone\"\n").unwrap();
+    // The phone is unpaired: its row is gone from the device list, and the log line that names it is still in the log.
+    assert!(w.core().remove_device(&w.phone.device_id).unwrap());
+    assert!(w.core().snapshot().devices.is_empty());
+    let files = w.core().export_files(json!({ "networks": [] }));
+    let log = files.iter().find(|(n, _)| n == "logs/kin.log").map(|(_, d)| String::from_utf8_lossy(d).to_string()).unwrap();
+    assert!(!log.contains("Test Phone"), "the name of an unpaired phone is taken out: {log}");
+    assert!(log.contains("<phone>"));
+}
+
+#[tokio::test]
 async fn a_name_in_a_toast_is_not_in_the_log() {
     capture_logs();
     let mut w = World::new().await;

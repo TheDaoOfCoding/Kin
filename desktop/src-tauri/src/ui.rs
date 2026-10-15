@@ -51,7 +51,7 @@ pub fn open_pairing_window(app: &AppHandle, fresh: bool) {
     tauri::async_runtime::spawn_blocking(move || {
         let built = WebviewWindowBuilder::new(&app, PAIRING_WINDOW, WebviewUrl::App("index.html".into()))
             .title("Pair new phone")
-            .inner_size(380.0, 560.0)
+            .inner_size(380.0, 620.0)
             .resizable(false)
             .center()
             .build();
@@ -109,6 +109,13 @@ pub fn pairing_view(window: WebviewWindow, state: State<'_, AppState>) -> Result
 pub fn new_pairing(window: WebviewWindow, state: State<'_, AppState>) -> Result<PairingView, String> {
     only(&window, &[PAIRING_WINDOW], "new_pairing")?;
     Ok(state.core.start_pairing())
+}
+
+/// "Copy pairing link": the link of the QR code on the clipboard, marked sensitive (see `Core::copy_pairing_link`). Pairing window only.
+#[tauri::command]
+pub async fn copy_pairing_link(window: WebviewWindow, state: State<'_, AppState>) -> Result<(), String> {
+    only(&window, &[PAIRING_WINDOW], "copy_pairing_link")?;
+    state.core.copy_pairing_link().await
 }
 
 /// The "Remove this device" button of the "New device paired" notice.
@@ -368,6 +375,8 @@ pub fn set_hotkey(
 pub fn set_start_with_windows(window: WebviewWindow, state: State<'_, AppState>, on: bool) -> Result<bool, String> {
     only(&window, &[SETTINGS_WINDOW], "set_start_with_windows")?;
     state.autostart.set_enabled(on)?;
+    // What the person chose, so that the repair at the next start (integration.rs) does not turn it back on.
+    crate::integration::remember_start_with_windows(&state.core.config.data_dir, on);
     log::info!(
         "start with Windows turned {} ({})",
         if on { "on" } else { "off" },

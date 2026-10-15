@@ -86,6 +86,13 @@ export function startPairingWindow(root: HTMLElement): void {
       el("div", { className: "qr" }, view.svg ? svgNode(view.svg) : ""),
       el("p", { className: "id" }, el("strong", {}, view.pcName), ` · ${view.shortId}`),
     );
+    // For a phone whose camera can't scan the code (or may not use it): the link of the QR code, to paste in Kin on the phone.
+    const copied = el("p", { className: "hint" });
+    root.append(
+      el("div", { className: "row" }, button("Copy pairing link", () => void copyLink(copied), true)),
+      el("p", { className: "hint" }, "No camera? Copy the link, send it to your phone and paste it in Kin. It works once, for 5 minutes."),
+      copied,
+    );
     const left = el("p", { className: "hint" });
     root.append(left);
     const tick = () => {
@@ -95,6 +102,18 @@ export function startPairingWindow(root: HTMLElement): void {
     };
     tick();
     timer = window.setInterval(tick, 1000);
+  };
+
+  // The link never comes to this page: the backend puts it on the clipboard itself, marked sensitive.
+  const copyLink = async (note: HTMLElement) => {
+    try {
+      await invoke("copy_pairing_link");
+      note.className = "hint";
+      note.textContent = "Copied – paste it in Kin on your phone (e.g. send it to yourself).";
+    } catch (e) {
+      note.className = "hint bad";
+      note.textContent = typeof e === "string" ? e : "Could not copy the link.";
+    }
   };
 
   const refresh = async () => draw(await invoke<View>("pairing_view"));

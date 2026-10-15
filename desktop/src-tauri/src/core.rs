@@ -130,6 +130,8 @@ struct Session {
     expires_ms: u64,
     /// Holds the token: kept in memory only, written to a file only when a developer flag asks for it.
     svg: Option<String>,
+    /// The `kinrelay://pair?...` link the QR code encodes, for the "Copy pairing link" button. It holds the token: memory only, never logged.
+    url: Option<String>,
     paired: Option<DeviceRow>,
 }
 
@@ -392,13 +394,18 @@ impl Core {
         let session = if addresses.is_empty() {
             lock(&self.pairing).end(now);
             log::warn!("pairing: no private network address found, no QR code");
-            Session { expires_ms: 0, svg: None, paired: None }
+            Session { expires_ms: 0, svg: None, url: None, paired: None }
         } else {
             let token = lock(&self.pairing).begin(now);
             let url = pairing::pair_url(&addresses, &self.identity.device_id, &token, Some(&self.pc_name()));
             self.dev_publish_pair_url(&url);
             log::info!("pairing started: {} address(es), valid for {} s", addresses.len(), pairing::TOKEN_TTL.as_secs());
-            Session { expires_ms: unix_ms() + pairing::TOKEN_TTL.as_millis() as u64, svg: Some(pairing::qr_svg(&url)), paired: None }
+            Session {
+                expires_ms: unix_ms() + pairing::TOKEN_TTL.as_millis() as u64,
+                svg: Some(pairing::qr_svg(&url)),
+                url: Some(url),
+                paired: None,
+            }
         };
         *lock(&self.session) = Some(session);
         self.emit(Event::PairingChanged);
@@ -466,6 +473,33 @@ impl Core {
             expires_at_ms: s.expires_ms,
             device: s.paired.clone(),
         })
+    }
+
+    /// "Copy pairing link": puts the link the QR code encodes on the clipboard, for a phone whose camera can't scan it. Only while the code
+    /// on screen can still be used (not locked, expired or already used). The link holds the one-time token, so it is written as sensitive
+    /// (`write_text_sensitive`): out of the Windows clipboard history and cloud clipboard and out of Kin's own clipboard sync. Neither
+    /// the link nor the token goes into the log.
+    pub async fn copy_pairing_link(&self) -> std::result::Result<(), String> {
+        let usable = self.pairing_view().is_some_and(|v| v.status == "waiting");
+        let url = lock(&self.session).as_ref().and_then(|s| s.url.clone()).filter(|_| usable);
+        let Some(url) = url else {
+            return Err("There is no pairing code to copy. Show a new code first.".to_string());
+        };
+        let clipboard = self.clipboard.clone();
+        match tokio::task::spawn_blocking(move || clipboard.write_text_sensitive(&url)).await {
+            Ok(Ok(())) => {
+                log::info!("pairing link copied to the clipboard (kept out of the history and the sync)");
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                log::warn!("copying the pairing link failed: {e}");
+                Err("Could not use the clipboard. Try again.".to_string())
+            }
+            Err(e) => {
+                log::error!("copying the pairing link: {e}");
+                Err("Could not use the clipboard. Try again.".to_string())
+            }
+        }
     }
 
     /// `POST /v1/pair` after the request itself has been validated: check the token and save the device, as one step.

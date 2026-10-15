@@ -46,6 +46,13 @@ CREATE TABLE IF NOT EXISTS devices (
     last_seen      INTEGER,
     last_addresses TEXT NOT NULL DEFAULT '[]'
 );
+-- Every name a phone has had here, kept when the phone is unpaired or renamed: the logs still hold those names, and the export
+-- (export.rs) must take them out of the logs too. Not part of any view.
+CREATE TABLE IF NOT EXISTS device_names (
+    device_id TEXT NOT NULL,
+    name      TEXT NOT NULL,
+    PRIMARY KEY (device_id, name)
+);
 CREATE TABLE IF NOT EXISTS seen_messages (
     device_id  TEXT NOT NULL,
     message_id TEXT NOT NULL,
@@ -120,6 +127,8 @@ impl Db {
         ensure_column(&conn, "transfer_files", "finalizing_name", "TEXT")?;
         ensure_column(&conn, "transfers", "sent_at", "INTEGER")?;
         ensure_column(&conn, "transfers", "retry_of", "TEXT")?;
+        // The names of the phones that are paired now are remembered too, for a database that was made before `device_names` existed.
+        conn.execute_batch("INSERT OR IGNORE INTO device_names (device_id, name) SELECT device_id, name FROM devices")?;
         // A failed item can be retried once: the database refuses a second retry of the same item (a double click on Retry). A database that
         // has two rows with one `retry_of` (made before this index) keeps the first link, so the index can be made.
         conn.execute_batch(
@@ -143,12 +152,23 @@ impl Db {
 
     /// Adds a device, or updates the record of one that pairs again.
     pub fn upsert_device(&self, d: &NewDevice<'_>, now_ms: i64) -> Result<()> {
-        self.conn().execute(
+        let conn = self.conn();
+        conn.execute(
             "INSERT INTO devices (device_id, name, platform, model, app_version, paired_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(device_id) DO UPDATE SET name = ?2, platform = ?3, model = ?4, app_version = ?5, paired_at = ?6",
             params![d.device_id, d.name, d.platform, d.model, d.app_version, now_ms],
         )?;
+        conn.execute("INSERT OR IGNORE INTO device_names (device_id, name) VALUES (?1, ?2)", params![d.device_id, d.name])?;
         Ok(())
+    }
+
+    /// Every phone name this PC has known, paired now or not, and every earlier name of a phone that was renamed: what the log export
+    /// takes out of the logs. Longest first is up to the caller.
+    pub fn known_device_names(&self) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT DISTINCT name FROM device_names UNION SELECT name FROM devices")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     pub fn is_paired(&self, device_id: &str) -> Result<bool> {
@@ -175,7 +195,11 @@ impl Db {
     }
 
     pub fn update_name(&self, device_id: &str, name: &str) -> Result<()> {
-        self.conn().execute("UPDATE devices SET name = ?2 WHERE device_id = ?1", params![device_id, name])?;
+        let conn = self.conn();
+        let changed = conn.execute("UPDATE devices SET name = ?2 WHERE device_id = ?1", params![device_id, name])?;
+        if changed > 0 {
+            conn.execute("INSERT OR IGNORE INTO device_names (device_id, name) VALUES (?1, ?2)", params![device_id, name])?;
+        }
         Ok(())
     }
 
@@ -596,6 +620,40 @@ mod tests {
         assert!(db.remove_device("a").unwrap());
         assert!(db.seen_response("a", "m1").unwrap().is_none());
         assert!(!db.remove_device("a").unwrap());
+    }
+
+    #[test]
+    fn a_name_is_remembered_after_the_phone_is_unpaired_or_renamed() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_device(&device("a", "Anna's Pixel 8"), 1).unwrap();
+        db.upsert_device(&device("b", "Berg tablet"), 2).unwrap();
+        db.update_name("b", "Berg tablet 2").unwrap();
+        assert!(db.remove_device("a").unwrap());
+        let mut names = db.known_device_names().unwrap();
+        names.sort();
+        assert_eq!(
+            names,
+            ["Anna's Pixel 8", "Berg tablet", "Berg tablet 2"],
+            "the unpaired phone and the old name of the renamed one stay"
+        );
+        assert_eq!(db.list_devices().unwrap().len(), 1, "the device list itself is only the paired phone");
+        // A rename of a phone that isn't paired adds nothing.
+        db.update_name("nobody", "Ghost").unwrap();
+        assert!(!db.known_device_names().unwrap().contains(&"Ghost".to_string()));
+    }
+
+    #[test]
+    fn a_database_made_before_the_names_table_gets_the_names_of_the_paired_phones() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE devices (device_id TEXT PRIMARY KEY, name TEXT NOT NULL, platform TEXT NOT NULL, model TEXT, app_version TEXT,
+               paired_at INTEGER NOT NULL, last_seen INTEGER, last_addresses TEXT NOT NULL DEFAULT '[]');
+             INSERT INTO devices (device_id, name, platform, paired_at) VALUES ('a', 'Old Pixel', 'android', 1);",
+        )
+        .unwrap();
+        let db = Db::init(conn).unwrap();
+        assert!(db.remove_device("a").unwrap());
+        assert_eq!(db.known_device_names().unwrap(), ["Old Pixel"], "remembered although it was removed after the upgrade");
     }
 
     #[test]
