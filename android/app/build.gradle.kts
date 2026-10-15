@@ -1,8 +1,27 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.ksp)
 }
+
+// Release signing. The keystore and its passwords are never in the repo: they come from the environment
+// (KIN_KEYSTORE_FILE, KIN_KEYSTORE_PASSWORD, KIN_KEY_ALIAS, KIN_KEY_PASSWORD) or from
+// %USERPROFILE%\.kinrelay\signing.properties (storeFile, storePassword, keyAlias, keyPassword; a relative
+// storeFile is relative to that folder). With neither, the release APK is built unsigned.
+val kinHome = File(System.getProperty("user.home"), ".kinrelay")
+val signingFile = File(kinHome, "signing.properties")
+val signingFromFile = Properties().apply { if (signingFile.isFile) signingFile.inputStream().use { load(it) } }
+fun signingValue(env: String, key: String): String? =
+    System.getenv(env)?.takeIf { it.isNotBlank() } ?: signingFromFile.getProperty(key)?.takeIf { it.isNotBlank() }
+val signingStore = signingValue("KIN_KEYSTORE_FILE", "storeFile")?.let { path ->
+    File(path).let { if (it.isAbsolute) it else File(kinHome, path) }
+}
+val signingStorePassword = signingValue("KIN_KEYSTORE_PASSWORD", "storePassword")
+val signingAlias = signingValue("KIN_KEY_ALIAS", "keyAlias")
+val signingKeyPassword = signingValue("KIN_KEY_PASSWORD", "keyPassword") ?: signingStorePassword
+val releaseSigningReady = signingStore != null && signingStore.isFile && signingStorePassword != null && signingAlias != null && signingKeyPassword != null
 
 android {
     namespace = "app.kinrelay.android"
@@ -20,8 +39,20 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        if (releaseSigningReady) {
+            create("release") {
+                storeFile = signingStore
+                storePassword = signingStorePassword
+                keyAlias = signingAlias
+                keyPassword = signingKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
+            signingConfig = if (releaseSigningReady) signingConfigs.getByName("release") else null
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
@@ -59,9 +90,12 @@ dependencies {
     implementation(libs.room.runtime)
     ksp(libs.room.compiler)
     implementation(libs.androidx.datastore.preferences)
-    implementation(libs.play.services.code.scanner)
-    // The code scanner brings in androidx.fragment 1.0.0, too old for the Activity Result API.
-    implementation(libs.androidx.fragment)
+    // QR scanning without Google services: CameraX for the preview and the frames, ZXing (Apache-2.0, local only) to decode.
+    implementation(libs.zxing.core)
+    implementation(libs.androidx.camera.core)
+    implementation(libs.androidx.camera.camera2)
+    implementation(libs.androidx.camera.lifecycle)
+    implementation(libs.androidx.camera.view)
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
@@ -80,4 +114,13 @@ dependencies {
 ksp {
     // Every database version is exported and checked in: the migration tests read the old schemas from here.
     arg("room.schemaLocation", "$projectDir/schemas")
+}
+
+// Said once when a release is built without a signing setup (so nobody ships an unsigned APK by accident).
+if (!releaseSigningReady && gradle.startParameter.taskNames.any { it.contains("release", ignoreCase = true) }) {
+    logger.lifecycle(
+        "NOTE: no release signing setup found, so the release APK is built UNSIGNED and cannot be installed.\n" +
+            "      Create $signingFile (storeFile, storePassword, keyAlias, keyPassword) or set KIN_KEYSTORE_FILE,\n" +
+            "      KIN_KEYSTORE_PASSWORD, KIN_KEY_ALIAS and KIN_KEY_PASSWORD. See android/README.md, \"Release build\"."
+    )
 }

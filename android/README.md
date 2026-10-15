@@ -1,6 +1,6 @@
 # Kin Android app
 
-Milestone 1.1 (connection spike): identity, pairing, a foreground service that holds one WebSocket to the PC, ping, local log. Milestone 1.2: text, links and the clipboard in both directions. Milestone 1.3: files in both directions (share sheet and direct-share shortcut, upload with progress, receive into MediaStore, resume, cancel). Milestone 1.4: the persistent queue, history, notifications rework, setup (onboarding), settings and debug screens. The contract is [docs/protocol.md](../docs/protocol.md); the design is [docs/android.md](../docs/android.md). Details of what was built and measured: [phase-1-1-android.md](../docs/results/phase-1-1-android.md), [phase-1-2-android.md](../docs/results/phase-1-2-android.md), [phase-1-3-android.md](../docs/results/phase-1-3-android.md).
+Milestone 1.1 (connection spike): identity, pairing, a foreground service that holds one WebSocket to the PC, ping, local log. Milestone 1.2: text, links and the clipboard in both directions. Milestone 1.3: files in both directions (share sheet and direct-share shortcut, upload with progress, receive into MediaStore, resume, cancel). Milestone 1.4: the persistent queue, history, notifications rework, setup (onboarding), settings and debug screens. Milestone 1.5: the signed release APK, and the QR scanner without Google services (ZXing on CameraX, D16). The contract is [docs/protocol.md](../docs/protocol.md); the design is [docs/android.md](../docs/android.md). Details of what was built and measured: [phase-1-1-android.md](../docs/results/phase-1-1-android.md), [phase-1-2-android.md](../docs/results/phase-1-2-android.md), [phase-1-3-android.md](../docs/results/phase-1-3-android.md).
 
 ## Build and test
 
@@ -11,9 +11,19 @@ gradlew.bat lintDebug testDebugUnitTest assembleDebug assembleRelease
 gradlew.bat --stop
 ```
 
-- Debug APK: `app/build/outputs/apk/debug/app-debug.apk`. Release (R8): `app/build/outputs/apk/release/app-release-unsigned.apk`.
+- Debug APK: `app/build/outputs/apk/debug/app-debug.apk`. Release (R8, signed): `app/build/outputs/apk/release/app-release.apk` (`app-release-unsigned.apk` when no signing is set up, see "Release build").
 - The unit tests load the shared vectors from `../protocol/` as test resources (`app/build.gradle.kts`).
 
+## Release build
+
+The release APK is minified (R8) and signed with a key that is **not in the repo**. Gradle reads it from `%USERPROFILE%\.kinrelay\signing.properties` (`storeFile`, `storePassword`, `keyAlias`, `keyPassword`; a relative `storeFile` is relative to that folder), or from the environment: `KIN_KEYSTORE_FILE`, `KIN_KEYSTORE_PASSWORD`, `KIN_KEY_ALIAS`, `KIN_KEY_PASSWORD`. With neither, `assembleRelease` still works but says so and builds `app-release-unsigned.apk`, which can't be installed.
+
+- **Make the key once:** `android\tools\make-keystore.ps1` (RSA 4096, valid 27 years, a random password written only to `signing.properties`; it never overwrites an existing key).
+- **Back up the whole `%USERPROFILE%\.kinrelay` folder now.** **If this key is lost, no update can ever install over an existing install** (Android refuses an APK with another signature; the only way out is to uninstall, which deletes the pairing and the queue). Keep the backup private: whoever has the key can publish updates that install over Kin.
+- **Check a build:** `android\tools\check-release.ps1` (signature and certificate SHA-256, size, and a scan of the manifest and dex for Google telemetry parts: `gms`, `firebase`, `datatransport`, `mlkit`). `apksigner verify --print-certs app-release.apk` gives the certificate.
+- **Smoke test the signed APK** on an emulator against the real Windows app: `android\tools\release-smoke.ps1 [-Avd kin_api29]` (camera permission flow of "Scan code", pairing, ping, text and a file both ways, no crash in logcat).
+- `versionCode` / `versionName` are in `app/build.gradle.kts` (1 / 0.1.0). The app reports `BuildConfig.VERSION_NAME` as `appVersion` in `hello` and in the pairing request. Raise `versionCode` for every build that anybody installs, or an update can't replace the older one.
+- **QR scanner (D16):** `scan/ScanActivity` (CameraX preview and frames) and `scan/QrDecoder` (ZXing core, plain Kotlin, unit-tested on generated codes). The camera permission is asked for only when the user taps "Scan code".
 ## Code layout (`app/src/main/java/app/kinrelay/android/`)
 
 | Package | What |
@@ -28,6 +38,7 @@ gradlew.bat --stop
 | `transfer` | 1.3: `TransferEngine` (jobs, cancel, retry, recovery, the `offer` gate, unpair clean-up, the start-up sweep, crash clean-up), `ProgressThrottle` (one progress update per 500 ms), `UploadRunner`, `DownloadRunner`, `TransferHttp` (the four file endpoints), `MediaStoreSink`, `AndroidSourceFiles`, `TransferNotifications`, `AndroidWakeLocks`. The runners only know the ports in `TransferPorts.kt`, so the unit tests run them with fakes |
 | `data` | Room (`devices`, `seen_messages`, 1.3 `transfers` and `transfer_files`, 1.4 `texts`): **database version 4**, `exportSchema` on. The schema of every version is in `app/schemas/` (checked in, not ignored), and `MigrationTest` runs the 2 → 3 and 3 → 4 migrations on a real SQLite; `RetentionSqlTest` runs the storage queries (`QuerySql`) on one too. DataStore holds the settings and counters (device name, latency history, setup done). `QueuePolicy`: 7-day expiry, 500 history items 
 | `log` | Rotating file log with secret redaction. Text is never logged, only its length and a short keyed hash (HMAC-SHA256, per-install key wrapped by the Keystore: `LogFingerprint`) |
+| `scan` | 1.5: `ScanActivity` (the camera screen), `ScanContract`, `QrDecoder` (ZXing) |
 | `ui` | Compose screens: confirm pairing, pairing, Home, History, Settings, the setup (onboarding), Debug |
 | `history`, `setup`, `notify`, `debuginfo` | 1.4: `HistoryBuilder`, `SuccessRate`; `OemTable` (the one table of OEM settings screens) and `SetupActions`; `NotificationLedger`, `TextArrivals`, `TrailingThrottle`, channels; `ConnectionHistory`, `StateDump`, `LogExport` |
 

@@ -1,6 +1,8 @@
 package app.kinrelay.android
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
@@ -8,16 +10,15 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.mutableStateOf
+import androidx.core.content.ContextCompat
 import androidx.core.net.toUri
 import androidx.lifecycle.lifecycleScope
 import app.kinrelay.android.pairing.PairingIntake
 import app.kinrelay.android.pairing.PairingSource
 import app.kinrelay.android.pairing.PairingTarget
+import app.kinrelay.android.scan.ScanContract
 import app.kinrelay.android.ui.KinRoot
 import app.kinrelay.android.ui.theme.KinTheme
-import com.google.mlkit.vision.barcode.common.Barcode
-import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
-import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
@@ -38,6 +39,12 @@ class MainActivity : ComponentActivity() {
             // The permission may just have been granted: try the connection now.
             graph.link.userAction()
         }
+
+    private val scanner = registerForActivityResult(ScanContract()) { text ->
+        if (text == null) graph.log.i("app", "scan canceled") else onPairingText(text, PairingSource.IN_APP)
+    }
+
+    private val cameraRequest = registerForActivityResult(ActivityResultContracts.RequestPermission(), ::onCameraResult)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -144,18 +151,28 @@ class MainActivity : ComponentActivity() {
         startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, "package:$packageName".toUri()))
     }
 
-    /** The Google code scanner (ML Kit through Play services). It needs no camera permission. */
+    /**
+     * "Scan code". The camera permission is asked for here, when the user taps, and never before. Denied: a clear message,
+     * and the pasted link below it still works. The code is read on this phone (ZXing), and what it says goes into the same
+     * in-app pairing flow as a pasted link: the tap on Scan is the confirmation, so there is no extra screen.
+     */
     private fun scan() {
-        val options = GmsBarcodeScannerOptions.Builder()
-            .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
-            .enableAutoZoom()
-            .build()
-        GmsBarcodeScanning.getClient(this, options).startScan()
-            .addOnSuccessListener { barcode -> barcode.rawValue?.let { onPairingText(it, PairingSource.IN_APP) } }
-            .addOnCanceledListener { graph.log.i("app", "scan canceled") }
-            .addOnFailureListener { e ->
-                graph.log.w("app", "code scanner unavailable: ${e.javaClass.simpleName}: ${e.message}")
-                graph.pairing.fail("The QR scanner isn't available on this phone. Paste the pairing link instead.")
-            }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            scanner.launch(Unit)
+        } else {
+            cameraRequest.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    private fun onCameraResult(granted: Boolean) {
+        graph.log.i("app", "camera permission granted=$granted")
+        if (granted) {
+            scanner.launch(Unit)
+        } else if (shouldShowRequestPermissionRationale(Manifest.permission.CAMERA)) {
+            graph.pairing.fail("Kin needs the camera only to read the code. Tap Scan code again to allow it, or paste the pairing link instead.")
+        } else {
+            // "Don't ask again" (or the system won't ask any more): only the app's settings page can turn it on.
+            graph.pairing.fail("Camera access is off for Kin. Turn it on in the phone's settings, or paste the pairing link instead.")
+        }
     }
 }

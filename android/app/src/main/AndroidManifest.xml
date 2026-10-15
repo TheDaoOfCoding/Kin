@@ -11,6 +11,10 @@
     <!-- Android 17 (API 37) asks for this before an app may reach devices on the local network, including the PC. -->
     <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Asked for only when the user taps "Scan code" (see MainActivity.scan). The camera is optional: without one, the pairing link can be pasted. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- Held only while file bytes move, and let go at once (architecture.md, "Battery rules for the phone"). -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -86,6 +90,12 @@
                 <data android:mimeType="*/*" />
             </intent-filter>
         </activity>
+
+        <!-- The QR scanner. Not exported: only MainActivity starts it, after the camera permission was granted. -->
+        <activity
+            android:name=".scan.ScanActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Kin" />
 
         <!-- "Send to PC" in the text selection menu. -->
         <activity
