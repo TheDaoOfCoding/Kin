@@ -362,7 +362,15 @@ function isReservedName(s: string): boolean {
   return RESERVED.has(asciiUpper((dot < 0 ? s : s.slice(0, dot)).replace(/ +$/, "")));
 }
 
+// The collision loop tries at most this many candidates (the plain name and " (1)" to " (99)"); then the file fails with internal.
+const MAX_CANDIDATES = 100;
+
 function cleanFileName(input: string, existing: string[]): string {
+  return cleanFileNameWithin(input, existing, Infinity)!;
+}
+
+// The first free candidate among the first `limit` ones, or null if every one of them is taken.
+function cleanFileNameWithin(input: string, existing: string[], limit: number): string | null {
   // 1. path
   let s = input;
   const cut = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
@@ -386,7 +394,7 @@ function cleanFileName(input: string, existing: string[]): string {
   const ext = lastDot > 0 && utf8Len(chars.slice(lastDot).join("")) <= MAX_EXT ? chars.slice(lastDot).join("") : "";
   const stem = ext ? chars.slice(0, lastDot) : chars;
   const taken = new Set(existing.map((n) => n.toLowerCase()));
-  for (let n = 0; ; n++) {
+  for (let n = 0; n < limit; n++) {
     const suffix = n === 0 ? "" : ` (${n})`;
     const budget = MAX_NAME - utf8Len(suffix) - utf8Len(ext);
     // the longest prefix of whole code points that fits
@@ -408,6 +416,7 @@ function cleanFileName(input: string, existing: string[]): string {
     const candidate = head + suffix + ext;
     if (!taken.has(candidate.toLowerCase())) return candidate;
   }
+  return null;
 }
 
 // Create-new semantics: the create call is the real collision check. "already exists" -> next suffix; any other failure -> internal.
@@ -415,7 +424,8 @@ function createNewModel(input: string, existing: string[], onDisk: string[], cre
   const known = [...existing];
   const disk = new Set(onDisk.map((n) => n.toLowerCase()));
   for (;;) {
-    const name = cleanFileName(input, known);
+    const name = cleanFileNameWithin(input, known, MAX_CANDIDATES);
+    if (name === null) return { fails: "internal" }; // all 100 candidates are taken
     if (disk.has(name.toLowerCase())) {
       known.push(name);
       continue;
@@ -428,6 +438,7 @@ function createNewModel(input: string, existing: string[], onDisk: string[], cre
 // ------------------------------------------------------------------ WebSocket messages
 type Role = "phone" | "pc";
 const MAX_FRAME = 1048576;
+const MAX_OFFER_FILES = 800; // more files in one offer: the receiver answers error too_large
 const TRANSFER_ID = /^[A-Za-z0-9_-]{1,64}$/;
 const INT_FIELDS = ["protocol", "size", "totalSize", "offset", "received", "sentAt"];
 const DIRECTION: Record<string, Role | "both"> = {
@@ -439,7 +450,7 @@ const ACTION: Record<string, string> = {
   hello: "handshake_ok", ack: "mark_delivered", error: "mark_failed", text: "deliver_text", clipboard: "set_clipboard",
   offer: "start_download", complete: "mark_transfer_done", cancel: "cancel_transfer", unpair: "remove_peer_and_close", ping: "show_ping_toast",
 };
-type Outcome = { reply: "ack" | "error" | "none"; action?: string; code?: string; ref?: string | null; close: number | null };
+type Outcome = { reply: "ack" | "error" | "none"; action?: string; code?: string; ref?: string | null; close: number | null; sensitive?: boolean };
 const isObj = (x: any) => x !== null && typeof x === "object" && !Array.isArray(x);
 const isStr = (x: any) => typeof x === "string";
 const isNonEmptyStr = (x: any) => typeof x === "string" && x.length > 0;
@@ -502,7 +513,8 @@ function validateFields(type: string, o: any, badInts: Set<string>): boolean {
     case "hello": return id() && int("protocol") && isNonEmptyStr(o.name) && isNonEmptyStr(o.platform) && isStr(o.appVersion);
     case "ack": return validMsgId(o.ref);
     case "error": return isStr(o.code) && isStr(o.message) && (o.ref === undefined || o.ref === null || validMsgId(o.ref));
-    case "text": return id() && isNonEmptyStr(o.text) && typeof o.isUrl === "boolean";
+    // sensitive is an optional strict boolean (null counts as absent; "true", 1 and 0 are invalid)
+    case "text": return id() && isNonEmptyStr(o.text) && typeof o.isUrl === "boolean" && (o.sensitive === undefined || o.sensitive === null || typeof o.sensitive === "boolean");
     case "clipboard": return id() && isNonEmptyStr(o.text);
     case "offer": {
       if (!id() || !TRANSFER_ID.test(o.id) || !int("totalSize") || !Array.isArray(o.files) || o.files.length < 1) return false;
@@ -565,6 +577,8 @@ class Receiver {
       return bad(ref, "unsupported_version", 4002);
     // step 7
     if (!validateFields(type, o, badInts)) return bad(ref);
+    // a valid offer with more than 800 files is rejected (an error, no ack, nothing remembered)
+    if (type === "offer" && o.files.length > MAX_OFFER_FILES) return bad(ref, "too_large");
     if (type === "hello") {
       this.state = "open";
       return { reply: "none", action: ACTION.hello, close: null };
@@ -575,7 +589,7 @@ class Receiver {
     // step 8
     if (this.seen.has(o.id)) return { reply: "ack", ref: o.id, action: "ignore_duplicate", close: null };
     this.seen.add(o.id);
-    return { reply: "ack", ref: o.id, action: ACTION[type], close: type === "unpair" ? 1000 : null };
+    return { reply: "ack", ref: o.id, action: ACTION[type], close: type === "unpair" ? 1000 : null, ...(type === "text" ? { sensitive: o.sensitive === true } : {}) };
   }
 }
 
@@ -611,6 +625,8 @@ function sameOutcome(actual: Outcome, expect: any): boolean {
   }
   // an ack carries the id of the message it answers; a case may pin it (the duplicate-key case does)
   if (actual.reply === "ack" && expect.ref !== undefined && actual.ref !== expect.ref) return false;
+  // a deliver_text case says whether the text is sensitive; absent means false
+  if (actual.action === "deliver_text" && (expect.sensitive ?? false) !== (actual.sensitive ?? false)) return false;
   return true;
 }
 
@@ -639,6 +655,8 @@ function serve(ctx: any, req: any): Reply {
   const owns = (x: any) => x.owner === undefined || x.owner === client.deviceId;
   const jsonType = isJsonContentType(headers["Content-Type"]);
   const body = req.body;
+  // Free space on the PC: diskFull is freeBytes 0. The check counts only the bytes the PC does not have yet, with no reserve.
+  const freeBytes: number = ctx.server?.diskFull ? 0 : ctx.server?.freeBytes ?? Number.POSITIVE_INFINITY;
 
   if (method === "POST" && path === "/v1/pair") {
     // POST /v1/pair never answers 401 unauthorized: any certificate is fine. Order: 413, then body invalid (400), then 426, then the token.
@@ -675,6 +693,9 @@ function serve(ctx: any, req: any): Reply {
     }
     const stored = ctx.transfer && ctx.transfer.id === body.id ? ctx.transfer : undefined;
     if (stored && !owns(stored)) return err(404, "not_found"); // belongs to another device
+    // a transfer ID is never used twice: one that was used and is over (canceled, or finished more than 24 hours ago) is 404, not a new transfer
+    if (!stored && ctx.usedIds?.includes(body.id)) return err(404, "not_found");
+    if (!stored && ctx.offer && ctx.offer.id === body.id) return err(404, "not_found"); // the ID is a PC -> phone offer: it can't be created as an upload
     if (stored) {
       // a repeated POST resumes only with the same fileIds (as a set); anything else is bad_request and the stored list stays
       const have = Object.keys(stored.files);
@@ -682,7 +703,8 @@ function serve(ctx: any, req: any): Reply {
     }
     // too large and disk full are checked again for a resumed POST; only a new transfer creates files
     if (ctx.server?.tooLarge) return err(413, "too_large");
-    if (ctx.server?.diskFull) return err(507, "disk_full");
+    const missing = body.files.reduce((sum: number, f: any) => sum + (f.size - (stored?.files[f.fileId]?.stored ?? 0)), 0);
+    if (!stored ? body.files.reduce((a: number, f: any) => a + f.size, 0) > freeBytes : missing > freeBytes) return err(507, "disk_full");
     if (!stored && ctx.server?.createFails) return err(500, "internal");
     return { status: 200, body: { id: body.id, files: body.files.map((f: any) => ({ fileId: f.fileId, offset: stored?.files[f.fileId]?.stored ?? 0 })) } };
   }
@@ -694,13 +716,15 @@ function serve(ctx: any, req: any): Reply {
     const file = ctx.transfer && ctx.transfer.id === m[1] && owns(ctx.transfer) ? ctx.transfer.files[m[2]] : undefined;
     if (!file) return err(404, "not_found");
     // offset: ASCII digits, no sign, no leading zeros, at most 2^53-1
-    const om = /(?:^|&)offset=([^&]*)/.exec(query);
+    // (given twice is 400, whatever the values)
+    const offs = [...query.matchAll(/(?:^|&)offset=([^&]*)/g)];
+    const om = offs.length === 1 ? offs[0] : null;
     if (!om || !/^(0|[1-9][0-9]*)$/.test(om[1]) || BigInt(om[1]) > 9007199254740991n) return err(400, "bad_request");
     if (headers["Content-Length"] === undefined) return err(400, "bad_request");
     const n = Number(om[1]);
     if (n !== file.stored) return err(409, "offset_mismatch", { offset: file.stored });
     if (Number(headers["Content-Length"]) !== file.size - n) return err(400, "bad_request");
-    if (ctx.server?.diskFull) return err(507, "disk_full");
+    if (file.size - n > freeBytes) return err(507, "disk_full"); // this file's remaining bytes
     if (ctx.server?.createFails) return err(500, "internal"); // the .part file can't be created or written
     return { status: 200, body: { received: file.size } };
   }
@@ -857,7 +881,8 @@ function checkResponse(group: string, name: string, expected: any, actual: Reply
     const got = createNewModel(c.input, c.existing, c.onDisk, c.createFails);
     check(g, `create-new ${c.name}`, eq(got, c.expected), () => `expected ${j(c.expected)}, model says ${j(got)}`);
     check(g, `create-new ${c.name}: operation is create or move_part`, c.operation === undefined || ["create", "move_part"].includes(c.operation), () => String(c.operation));
-    if (c.operation === "move_part" && !c.createFails) check(g, `create-new ${c.name}: a move never fails on "already exists"`, typeof c.expected === "string");
+    // a move never fails on "already exists" alone: only the limit of 100 candidates (all of them taken) fails it
+    if (c.operation === "move_part" && !c.createFails) check(g, `create-new ${c.name}: a move fails on "already exists" only after all ${MAX_CANDIDATES} candidates are taken`, typeof c.expected === "string" || new Set([...c.onDisk, ...c.existing].map((n: string) => n.toLowerCase())).size >= MAX_CANDIDATES);
   }
   check(g, "create-new has cases for both operations", d.createNew.some((c: any) => c.operation === "move_part") && d.createNew.some((c: any) => c.operation !== "move_part"));
 }
@@ -955,6 +980,18 @@ function checkResponse(group: string, name: string, expected: any, actual: Reply
     ctx.pcDeviceId = PC;
     s.steps.forEach((st: any, i: number) => {
       const label = `${s.name} step ${i + 1}`;
+      if (st.clock) {
+        // time passes on the PC. A finished upload is answered for 24 hours after its last file arrived, then its ID is gone for good.
+        check(g, `${label}: a clock step has hours and no request`, Number.isSafeInteger(st.clock.advanceHours) && st.clock.advanceHours > 0 && st.request === undefined);
+        if (ctx.transfer?.finishedHoursAgo !== undefined) {
+          ctx.transfer.finishedHoursAgo += st.clock.advanceHours;
+          if (ctx.transfer.finishedHoursAgo >= 24) {
+            (ctx.usedIds ??= []).push(ctx.transfer.id);
+            ctx.transfer = null;
+          }
+        }
+        return;
+      }
       if (st.response === null) {
         // interrupted request: the PC keeps what arrived
         const pm = /^\/v1\/transfers\/([^/]+)\/files\/([^/?]+)\?offset=(\d+)$/.exec(st.request.path);
@@ -971,9 +1008,16 @@ function checkResponse(group: string, name: string, expected: any, actual: Reply
           ctx.transfer = { id: st.request.body.id, files: Object.fromEntries(st.request.body.files.map((f: any) => [f.fileId, { size: f.size, stored: 0 }])) };
       }
       const pm = /^\/v1\/transfers\/([^/]+)\/files\/([^/?]+)/.exec(st.request.path);
-      if (st.request.method === "PUT" && reply.status === 200 && pm) ctx.transfer.files[pm[2]].stored = ctx.transfer.files[pm[2]].size;
-      // a DELETE that answers 204 drops the transfer: a retried DELETE then finds nothing (404)
-      if (st.request.method === "DELETE" && reply.status === 204) ctx.transfer = null;
+      if (st.request.method === "PUT" && reply.status === 200 && pm) {
+        ctx.transfer.files[pm[2]].stored = ctx.transfer.files[pm[2]].size;
+        // the last file is in: the upload is finished, and its clock starts
+        if (Object.values<any>(ctx.transfer.files).every((f) => f.stored === f.size)) ctx.transfer.finishedHoursAgo ??= 0;
+      }
+      // a DELETE that answers 204 drops the transfer: a retried DELETE then finds nothing (404), and the ID is never used again
+      if (st.request.method === "DELETE" && reply.status === 204) {
+        (ctx.usedIds ??= []).push(ctx.transfer.id);
+        ctx.transfer = null;
+      }
     });
   }
   for (const e of d.errors) {
@@ -1071,6 +1115,191 @@ function checkResponse(group: string, name: string, expected: any, actual: Reply
   // a text or clipboard case goes to the role that can receive it: `clipboard` only to the phone, `text` to either
   for (const c of messages.valid.filter((c: any) => c.name.startsWith("clipboard-"))) check(g, `${c.name}: a valid clipboard goes to the phone`, c.to === "phone");
   console.log(`milestone 1.2 scope: ${inScope} cases in messages.json (text and clipboard)`);
+}
+
+// ---- urls.json: the openable-URL rule (docs/protocol.md, "Text messages", "Links")
+// Whitespace is the Unicode White_Space set, written out so no platform's isWhitespace() decides. Control characters: U+0000-U+001F, U+007F-U+009F.
+const isWhiteSpaceCp = (cp: number) =>
+  (cp >= 0x09 && cp <= 0x0d) || cp === 0x20 || cp === 0x85 || cp === 0xa0 || cp === 0x1680 || (cp >= 0x2000 && cp <= 0x200a) ||
+  cp === 0x2028 || cp === 0x2029 || cp === 0x202f || cp === 0x205f || cp === 0x3000;
+const isControlCp = (cp: number) => cp <= 0x1f || (cp >= 0x7f && cp <= 0x9f);
+const MAX_URL_BYTES = 8192;
+const sha256Hex = (b: Uint8Array) => hex(sha256(b));
+
+function trimWhiteSpace(s: string): string {
+  const chars = Array.from(s);
+  let a = 0;
+  let b = chars.length;
+  while (a < b && isWhiteSpaceCp(chars[a].codePointAt(0)!)) a++;
+  while (b > a && isWhiteSpaceCp(chars[b - 1].codePointAt(0)!)) b--;
+  return chars.slice(a, b).join("");
+}
+
+function isOpenableUrl(text: string): boolean {
+  const t = trimWhiteSpace(text);
+  if (utf8Len(t) > MAX_URL_BYTES) return false;
+  const scheme = /^https?:\/\//i.exec(t);
+  if (!scheme) return false;
+  if (Array.from(t).some((ch) => isWhiteSpaceCp(ch.codePointAt(0)!) || isControlCp(ch.codePointAt(0)!))) return false;
+  const rest = t.slice(scheme[0].length);
+  const cut = rest.search(/[/?#]/);
+  const authority = cut < 0 ? rest : rest.slice(0, cut);
+  const at = authority.lastIndexOf("@");
+  const hostPart = at >= 0 ? authority.slice(at + 1) : authority;
+  let host: string;
+  let port: string | undefined;
+  if (hostPart.startsWith("[")) {
+    const close = hostPart.indexOf("]");
+    if (close < 2) return false; // no closing bracket, or nothing inside
+    host = hostPart.slice(1, close);
+    if (host.includes("[")) return false;
+    const after = hostPart.slice(close + 1);
+    if (after === "") port = undefined;
+    else if (after.startsWith(":")) port = after.slice(1);
+    else return false;
+  } else {
+    const colon = hostPart.indexOf(":");
+    host = colon < 0 ? hostPart : hostPart.slice(0, colon);
+    port = colon < 0 ? undefined : hostPart.slice(colon + 1);
+    if (host === "" || /^\.+$/.test(host)) return false;
+  }
+  if (port !== undefined) {
+    if (!/^[0-9]+$/.test(port)) return false;
+    const digits = port.replace(/^0+/, "");
+    if (digits === "" || digits.length > 5 || Number(digits) > 65535) return false;
+  }
+  return true;
+}
+
+{
+  const g = "urls";
+  const d = load("urls.json");
+  uniqueNames(g, d.cases);
+  check(g, "maxBytes", d.maxBytes === MAX_URL_BYTES);
+  for (const c of d.cases) {
+    let text: string;
+    if (c.synthesize) {
+      const s = c.synthesize;
+      text = s.prefix + s.fill.repeat(s.fillCount) + (s.suffix ?? "");
+      check(g, `${c.name}: synthesized size matches trimmedBytes`, utf8Len(trimWhiteSpace(text)) === s.trimmedBytes, () => `${utf8Len(trimWhiteSpace(text))} vs ${s.trimmedBytes}`);
+    } else text = c.input;
+    const got = isOpenableUrl(text);
+    check(g, c.name, got === c.isUrl, () => `input ${j(text.slice(0, 120))} expected ${c.isUrl}, model says ${got}`);
+  }
+  check(g, "has accepted and rejected cases", d.cases.some((c: any) => c.isUrl) && d.cases.some((c: any) => !c.isUrl));
+  // the rule is about the trimmed text, so trimming never changes the answer
+  for (const c of d.cases.filter((c: any) => c.input !== undefined && c.isUrl))
+    check(g, `${c.name}: an accepted URL stays accepted with whitespace around it`, isOpenableUrl(`\n \t${c.input}　 `));
+}
+
+// ---- text-rules.json: line ends, the sender's size threshold, the sensitive flag
+const toWire = (s: string) => s.replace(/\r\n/g, "\n"); // one left-to-right pass: "\r\r\n" becomes "\r\n"
+const toWindowsClipboard = (s: string) => s.replace(/(?<!\r)\n/g, "\r\n"); // an LF that follows a CR stays as it is
+const SENDER_THRESHOLD = 131072;
+function decideSend(kind: "text" | "clipboard", sensitive: boolean, wireBytes: number): string {
+  if (kind === "clipboard") return wireBytes > SENDER_THRESHOLD ? "too_large" : "clipboard";
+  if (wireBytes <= SENDER_THRESHOLD) return "text";
+  return sensitive ? "not_sent" : "file";
+}
+type Format = string | Record<string, number>;
+function excludedBy(formats: Format[]): string | null {
+  for (const f of formats) {
+    if (typeof f === "string") {
+      if (f === "ExcludeClipboardContentFromMonitorProcessing" || f === "Clipboard Viewer Ignore") return f;
+    } else {
+      for (const [name, value] of Object.entries(f)) if ((name === "CanIncludeInClipboardHistory" || name === "CanUploadToCloudClipboard") && value === 0) return name;
+    }
+  }
+  return null;
+}
+function senderModel(c: any): { send: string; sensitive?: boolean; reason?: string } {
+  if (c.side === "phone") return { send: "text", sensitive: c.extraIsSensitive === true };
+  const why = excludedBy(c.formats);
+  if (c.trigger === "automatic") return why ? { send: "none", reason: "password_manager" } : { send: "clipboard" };
+  return { send: "text", sensitive: why !== null }; // the hotkey is deliberate: it sends such content, marked sensitive
+}
+function receiverModel(frame: any) {
+  const sensitive = frame.sensitive === true;
+  return {
+    clipboard: "set",
+    clipboardMarkedSensitive: sensitive,
+    notification: "Text from <device>",
+    preview: !sensitive,
+    openAction: !sensitive && frame.isUrl === true && isOpenableUrl(frame.text),
+    storedInHistory: !sensitive,
+    logsTextLengthOrHash: !sensitive,
+  };
+}
+{
+  const g = "text-rules";
+  const d = load("text-rules.json");
+  check(g, "senderThresholdBytes", d.senderThresholdBytes === SENDER_THRESHOLD && SENDER_THRESHOLD === 128 * 1024);
+  uniqueNames(g + ".lineEndings", d.lineEndings);
+  for (const c of d.lineEndings) {
+    if (c.clipboardText !== undefined) check(g, `line ends ${c.name}: toWire`, toWire(c.clipboardText) === c.wire, () => `${j(toWire(c.clipboardText))} vs ${j(c.wire)}`);
+    check(g, `line ends ${c.name}: windows clipboard`, toWindowsClipboard(c.wire) === c.windowsClipboard, () => `${j(toWindowsClipboard(c.wire))} vs ${j(c.windowsClipboard)}`);
+    check(g, `line ends ${c.name}: hash is of the wire form`, sha256Hex(new TextEncoder().encode(c.wire)) === c.wireSha256Hex);
+    if (c.clipboardText !== undefined && c.clipboardText !== c.wire)
+      check(g, `line ends ${c.name}: the clipboard form and the wire form hash differently`, sha256Hex(new TextEncoder().encode(c.clipboardText)) !== c.wireSha256Hex);
+  }
+  uniqueNames(g + ".senderSize", d.senderSize);
+  for (const c of d.senderSize) {
+    let wireBytes = c.wireBytes;
+    if (c.synthesize) {
+      const text = c.synthesize.fill.repeat(c.synthesize.fillCount) + (c.synthesize.suffix ?? "");
+      check(g, `size ${c.name}: rawBytes`, utf8Len(text) === c.synthesize.rawBytes, () => `${utf8Len(text)} vs ${c.synthesize.rawBytes}`);
+      check(g, `size ${c.name}: wireBytes is measured after the line-end conversion`, utf8Len(toWire(text)) === c.wireBytes, () => `${utf8Len(toWire(text))} vs ${c.wireBytes}`);
+      wireBytes = utf8Len(toWire(text));
+    }
+    const got = decideSend(c.kind, c.sensitive === true, wireBytes);
+    check(g, `size ${c.name}`, got === c.expected, () => `expected ${c.expected}, model says ${got}`);
+  }
+  // the worst-case frame for a text at the threshold is still under the receivers' 1 MiB limit (every byte a control character, escaped to 6)
+  check(g, "a 128 KiB text escaped as \\u00XX stays under 1 MiB", SENDER_THRESHOLD * 6 + 1024 < MAX_FRAME);
+  uniqueNames(g + ".sensitiveSender", d.sensitiveSender);
+  for (const c of d.sensitiveSender) {
+    const got = senderModel(c);
+    check(g, `sender ${c.name}`, eq(got, c.expect), () => `expected ${j(c.expect)}, model says ${j(got)}`);
+  }
+  uniqueNames(g + ".receiver", d.receiver);
+  for (const c of d.receiver) {
+    const got = receiverModel(c.frame);
+    check(g, `receiver ${c.name}`, eq(got, c.expect), () => `expected ${j(c.expect)}, model says ${j(got)}`);
+  }
+  const names = new Set(d.windowsSensitiveFormats.formats.map((f: any) => f.name));
+  for (const n of ["ExcludeClipboardContentFromMonitorProcessing", "CanIncludeInClipboardHistory", "CanUploadToCloudClipboard"]) check(g, `the Windows receiver writes ${n} for a sensitive text`, names.has(n));
+}
+
+// ---- milestone 1.3 scope (files in both directions). Same rule as for 1.1 and 1.2: every name in protocol/README.md must match a case.
+{
+  const g = "scope-1.3";
+  const messages = load("messages.json");
+  const http = load("http.json");
+  const SCOPE: [string, any[], string[], number][] = [
+    ["messages.valid", messages.valid, ["offer-*", "complete-*", "cancel-*", "text-sensitive-*"], 15],
+    ["messages.invalid", messages.invalid, ["offer-*", "complete-*", "cancel-*", "text-sensitive-*"], 30],
+    ["messages.sequences", messages.sequences, ["duplicate-offer-is-acked-not-restarted"], 1],
+    ["http.exchanges", http.exchanges, ["transfers-*", "put-*", "get-*", "delete-*", "internal-error"], 100],
+    ["http.sequences", http.sequences, ["upload-*", "download-*", "repeat-with-different-files-keeps-the-stored-list", "delete-*", "transfer-id-*"], 8],
+  ];
+  const matches = (name: string, p: string) => (p.endsWith("*") ? name.startsWith(p.slice(0, -1)) : name === p);
+  let inScope = 0;
+  for (const [label, cases, patterns, atLeast] of SCOPE) {
+    for (const p of patterns) check(g, `${label}: "${p}" matches a case`, cases.some((c) => matches(c.name, p)));
+    const hits = cases.filter((c) => patterns.some((p) => matches(c.name, p)));
+    inScope += hits.length;
+    check(g, `${label}: at least ${atLeast} cases in scope`, hits.length >= atLeast, () => String(hits.length));
+  }
+  // 1.1 + 1.2 + 1.3 together cover every exchange and sequence of http.json and every case of messages.json (nothing is orphaned)
+  const covered11 = ["pair-*", "ws-upgrade-*", "unknown-route*", "unknown-version-path", "wrong-method-on-known-route*"];
+  const covered13 = ["transfers-*", "put-*", "get-*", "delete-*", "internal-error"];
+  for (const x of http.exchanges) check(g, `exchange ${x.name} belongs to a milestone`, [...covered11, ...covered13].some((p) => matches(x.name, p)));
+  for (const f of ["file-names.json"]) {
+    const d = load(f);
+    for (const a of ["cases", "createNew"]) check(g, `${f} ${a}[] exists`, Array.isArray(d[a]) && d[a].length > 0);
+  }
+  for (const f of ["urls.json", "text-rules.json"]) check(g, `${f} exists`, Object.keys(load(f)).length > 0);
+  console.log(`milestone 1.3 scope: ${inScope} cases in messages.json and http.json, plus file-names.json, urls.json and text-rules.json`);
 }
 
 // ---- fixtures/: DER certificates for the negative tls[] cases (made by fixtures/make-fixtures.ts)
