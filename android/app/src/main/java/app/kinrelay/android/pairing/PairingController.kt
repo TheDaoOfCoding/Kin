@@ -63,12 +63,20 @@ class PairingController(private val graph: AppGraph) {
         return decision
     }
 
-    /** The user tapped Confirm: the waiting target, to be passed to [start]. */
-    fun confirm(): PairingTarget? {
-        val waiting = mutableState.value as? PairingUiState.Confirm ?: return null
+    /**
+     * The user tapped Confirm on the screen that showed [expected]: the waiting target, to be passed to [start].
+     * If another link has replaced it since (a second deep link arrived while the screen was up), the tap was for the
+     * old PC: nothing is confirmed, and the screen now shows the new one.
+     */
+    fun confirm(expected: PairingConfirmation): PairingTarget? {
+        val target = PairingIntake.confirmable(mutableState.value, expected)
+        if (target == null) {
+            graph.log.w("pairing", "confirm ignored: the link on screen is not the one that was confirmed")
+            return null
+        }
         mutableState.value = PairingUiState.Idle
         graph.log.i("pairing", "pairing confirmed by the user")
-        return waiting.confirmation.target
+        return target
     }
 
     fun cancel() {
@@ -100,7 +108,11 @@ class PairingController(private val graph: AppGraph) {
                 val ordered = listOf(result.address) + target.addresses.filter { it != result.address }
                 val name = result.pcName ?: target.name ?: "PC"
                 val devices = graph.database.devices()
-                devices.all().filter { it.deviceId != target.id }.forEach { devices.delete(it.deviceId) }
+                devices.all().filter { it.deviceId != target.id }.forEach {
+                    devices.delete(it.deviceId)
+                    // The old PC's transfers end with its pairing: an upload must not go to the PC that replaces it.
+                    graph.transfers.onUnpaired(it.deviceId)
+                }
                 devices.upsert(DeviceEntity(target.id, name, "windows", now, now, ordered.joinToString(",")))
                 log.i("pairing", "paired with $name (${target.id.take(8)}…) via ${result.address}")
                 mutableState.value = PairingUiState.Idle

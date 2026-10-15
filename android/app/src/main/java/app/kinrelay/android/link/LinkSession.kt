@@ -9,6 +9,8 @@ import app.kinrelay.android.protocol.Frames
 import app.kinrelay.android.protocol.Hello
 import app.kinrelay.android.protocol.MessageIds
 import app.kinrelay.android.protocol.MessageReceiver
+import app.kinrelay.android.protocol.Offer
+import app.kinrelay.android.protocol.ReceiverRole
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -22,6 +24,7 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 
 /** How one WebSocket ended. */
 class SessionEnd(
@@ -47,9 +50,16 @@ sealed interface AckResult {
     data object NoConnection : AckResult
 }
 
+/** Where the HTTPS requests of a transfer go: the PC the WebSocket is connected to, over the same TLS setup and network. */
+class HttpEndpoint(val client: OkHttpClient, val address: PairingAddress)
+
 /** One connection to the PC, as the reconnect loop and the UI see it. */
 interface LinkConnection {
     val isReady: Boolean
+
+    /** The HTTPS side of this connection (file bytes go over separate requests, never over the WebSocket). Null in tests that have none. */
+    val httpEndpoint: HttpEndpoint? get() = null
+
     fun open()
     suspend fun awaitEnd(): SessionEnd
     fun closeNormally(reason: String)
@@ -69,10 +79,22 @@ interface SessionListener {
     fun onPeerUnpaired()
 
     /** A valid `text` from the PC, already acked. Called in arrival order from the socket's thread: don't block. */
-    fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean)
+    fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean, sensitive: Boolean)
 
     /** A valid `clipboard` from the PC, already acked. */
     fun onClipboardReceived(id: String, text: String)
+
+    /**
+     * A valid, new `offer`, before it is acked: null accepts it, an error code (`disk_full`) answers with an `error` instead of the
+     * ack. Runs on the socket's thread: keep it cheap.
+     */
+    fun acceptOffer(offer: Offer): String? = null
+
+    /** A valid `offer` that was acked. Don't block: start the download on another coroutine. */
+    fun onOfferReceived(fromName: String, offer: Offer) = Unit
+
+    /** A `cancel` for a transfer, already acked. The transfer may be unknown or finished: then there is nothing to do. */
+    fun onCancelReceived(transferId: String, reason: String) = Unit
 }
 
 /** The phone's own name, sent in its `hello`. */
@@ -94,7 +116,7 @@ class LinkSession(
     private val listener: SessionListener,
     private val helloTimeoutMillis: Long = CloseRules.HELLO_TIMEOUT_MILLIS,
 ) : LinkConnection {
-    private val receiver = MessageReceiver(dedup)
+    private val receiver = MessageReceiver(dedup, ReceiverRole.PHONE, listener::acceptOffer)
     private val ended = CompletableDeferred<SessionEnd>()
     private val pending = ConcurrentHashMap<String, CompletableDeferred<Action>>()
     private var socket: WebSocket? = null
@@ -106,6 +128,12 @@ class LinkSession(
     private var helloTimeout: Job? = null
 
     override val isReady: Boolean get() = helloAcceptedAt != null && !ended.isCompleted
+
+    /** File requests wait longer than the connection's own defaults: a response may follow a long upload, and a busy PC may be slow to write. */
+    override val httpEndpoint: HttpEndpoint = HttpEndpoint(
+        client.newBuilder().readTimeout(HTTP_READ_TIMEOUT_SECONDS, TimeUnit.SECONDS).writeTimeout(HTTP_WRITE_TIMEOUT_SECONDS, TimeUnit.SECONDS).build(),
+        address,
+    )
 
     override fun open() {
         val request = Request.Builder().url("https://${address.host}:${address.port}/v1/ws").build()
@@ -203,8 +231,12 @@ class LinkSession(
             }
             is Action.ShowErrorOnly -> log.w("link", "peer error ${action.code}: ${action.message}")
             is Action.ShowPing -> listener.onPingReceived(receiver.peer?.name ?: "PC")
-            is Action.DeliverText -> listener.onTextReceived(receiver.peer?.name ?: "PC", action.id, action.text, action.isUrl)
+            is Action.DeliverText -> listener.onTextReceived(receiver.peer?.name ?: "PC", action.id, action.text, action.isUrl, action.sensitive)
             is Action.SetClipboard -> listener.onClipboardReceived(action.id, action.text)
+            is Action.StartDownload -> listener.onOfferReceived(receiver.peer?.name ?: "PC", action.offer)
+            is Action.CancelTransfer -> listener.onCancelReceived(action.transferId, action.reason)
+            is Action.OfferRefused -> log.w("link", "an offer was refused: ${action.code}")
+            is Action.MarkTransferDone -> Unit
             is Action.RemovePeerAndClose -> {
                 peerUnpaired = true
                 listener.onPeerUnpaired()
@@ -251,5 +283,7 @@ class LinkSession(
     private companion object {
         const val ACK_TIMEOUT_MILLIS = 5_000L
         const val CLOSE_GRACE_MILLIS = 5_000L
+        const val HTTP_READ_TIMEOUT_SECONDS = 60L
+        const val HTTP_WRITE_TIMEOUT_SECONDS = 30L
     }
 }

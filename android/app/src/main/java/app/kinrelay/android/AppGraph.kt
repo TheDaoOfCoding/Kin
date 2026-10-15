@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Build
 import android.os.SystemClock
 import android.provider.Settings
+import android.webkit.MimeTypeMap
 import app.kinrelay.android.clipboard.ClipboardGuard
 import app.kinrelay.android.data.DeviceEntity
 import app.kinrelay.android.data.KinDatabase
@@ -20,10 +21,20 @@ import app.kinrelay.android.link.Clock
 import app.kinrelay.android.link.LinkController
 import app.kinrelay.android.link.Notifications
 import app.kinrelay.android.link.OutgoingSender
+import app.kinrelay.android.link.TextFileSender
 import app.kinrelay.android.log.FileLog
 import app.kinrelay.android.pairing.DeviceInfo
 import app.kinrelay.android.pairing.PairingController
 import app.kinrelay.android.protocol.DedupMemory
+import app.kinrelay.android.protocol.MessageIds
+import app.kinrelay.android.share.ShareShortcuts
+import app.kinrelay.android.transfer.AndroidSourceFiles
+import app.kinrelay.android.transfer.AndroidWakeLocks
+import app.kinrelay.android.transfer.MediaStoreSink
+import app.kinrelay.android.transfer.RoomTransferStore
+import app.kinrelay.android.transfer.TransferDeps
+import app.kinrelay.android.transfer.TransferEngine
+import app.kinrelay.android.transfer.TransferNotifications
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -70,6 +81,28 @@ class AppGraph(private val context: Context) {
     /** Remembers what the PC just put on the clipboard, so "send clipboard" doesn't send it back. */
     val clipboardGuard = ClipboardGuard(System::currentTimeMillis)
 
+    /** The transfers: uploads from a share, downloads from an `offer`. Needs the link, the shared files, MediaStore and the notifications. */
+    val transfers: TransferEngine by lazy {
+        val sources = AndroidSourceFiles(appContext)
+        val wake = AndroidWakeLocks(appContext)
+        val deps = TransferDeps(
+            store = RoomTransferStore(database.transfers()),
+            link = link,
+            sources = sources,
+            sink = MediaStoreSink(appContext),
+            notifier = TransferNotifications(appContext),
+            wake = wake,
+            log = log,
+            newId = MessageIds::newId,
+        )
+        wakeLocks = wake
+        TransferEngine(scope, deps, mimeForExtension = { MimeTypeMap.getSingleton().getMimeTypeFromExtension(it) })
+    }
+
+    /** Kept for the debug state dump. Set when [transfers] is first used. */
+    @Volatile var wakeLocks: AndroidWakeLocks? = null
+        private set
+
     /** Sends text to the PC and waits for the ack. Used by the share target, the text menu, the tile and the notification button. */
     val sender: OutgoingSender by lazy {
         OutgoingSender(
@@ -79,6 +112,9 @@ class AppGraph(private val context: Context) {
             arrivals = ArrivalSink { settings.setLastArrival(it) },
             clock = Clock { SystemClock.elapsedRealtime() },
             log = log,
+            textFiles = TextFileSender { wire ->
+                transfers.enqueueText(wire, TransferEngine.textFileName(System.currentTimeMillis())) != null
+            },
         )
     }
 
@@ -92,12 +128,22 @@ class AppGraph(private val context: Context) {
 
     /** Creates the identity on first run, without blocking the main thread. */
     fun warmUp() {
+        // Cached copies of files that waited for the PC are kept for 24 hours, like the PC keeps partial files (architecture.md).
+        scope.launch(Dispatchers.IO) { AndroidSourceFiles(appContext).deleteCacheOlderThan(24L * 60 * 60 * 1000) }
+        // What a crash left behind and no transfer owns (pending gallery entries, cached copies) goes now, before downloads resume.
+        scope.launch(Dispatchers.IO) { runCatching { transfers.sweepOrphans() } }
+        // The paired PC shows up in the share sheet's top row (the direct-share shortcut) and goes away when it is unpaired.
+        scope.launch {
+            database.devices().observeAll().collect { ShareShortcuts.sync(appContext, it.firstOrNull(), log) }
+        }
         scope.launch(Dispatchers.IO) {
             val load = loadIdentity()
             if (load.replaced != null) {
                 // The old identity is lost for good and the PC knows its device ID, so the old pairing can never work again.
                 log.w("identity", "the stored identity was replaced: ${load.replaced}")
+                val gone = database.devices().all()
                 database.devices().deleteAll()
+                gone.forEach { transfers.onUnpaired(it.deviceId) }
                 log.w("identity", "the new identity replaces the old one; paired PCs were removed")
             }
             val identity = load.identity

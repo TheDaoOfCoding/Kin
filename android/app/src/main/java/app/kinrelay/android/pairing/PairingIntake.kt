@@ -37,6 +37,10 @@ sealed interface PairingIntake {
     companion object {
         const val UNKNOWN_PC_NAME = "Unknown PC"
 
+        /** The target to pair with if [state] is still waiting for exactly the confirmation the user saw ([expected]), else null. */
+        fun confirmable(state: PairingUiState, expected: PairingConfirmation): PairingTarget? =
+            (state as? PairingUiState.Confirm)?.confirmation?.takeIf { it == expected }?.target
+
         /**
          * The rule: a link that arrives by intent from outside the app opens the confirmation screen, whatever
          * it contains. Text the user scanned or pasted in the app starts pairing directly ([PairingSource.IN_APP]).

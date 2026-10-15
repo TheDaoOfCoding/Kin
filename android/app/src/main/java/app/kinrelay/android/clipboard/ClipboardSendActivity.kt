@@ -37,9 +37,15 @@ class ClipboardSendActivity : Activity() {
         if (handled) return
         handled = true
         handler.removeCallbacksAndMessages(null)
-        val text = AndroidClipboard.read(this)
-        graph.log.i("clipboard", "clipboard read ($why): ${text?.let(ClipboardGuard::fingerprint) ?: "nothing"}")
-        SendEntry.run(this, text, tapAt, SendSource.CLIPBOARD, nothingToSend = "There's no text on the clipboard to send.")
+        val content = AndroidClipboard.read(this)
+        // A sensitive clip is logged by nothing at all, not even its hash.
+        val shown = when {
+            content == null -> "nothing"
+            content.sensitive -> "sensitive"
+            else -> ClipboardGuard.fingerprint(content.text)
+        }
+        graph.log.i("clipboard", "clipboard read ($why): $shown")
+        SendEntry.run(this, content?.text, tapAt, SendSource.CLIPBOARD, nothingToSend = "There's no text on the clipboard to send.", sensitive = content?.sensitive == true)
     }
 
     override fun onDestroy() {

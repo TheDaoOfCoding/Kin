@@ -1,6 +1,6 @@
 # Kin Android app
 
-Milestone 1.1 (connection spike): identity, pairing, a foreground service that holds one WebSocket to the PC, ping, local log. Milestone 1.2: text, links and the clipboard in both directions. The contract is [docs/protocol.md](../docs/protocol.md); the design is [docs/android.md](../docs/android.md). Details of what was built and measured: [phase-1-1-android.md](../docs/results/phase-1-1-android.md), [phase-1-2-android.md](../docs/results/phase-1-2-android.md).
+Milestone 1.1 (connection spike): identity, pairing, a foreground service that holds one WebSocket to the PC, ping, local log. Milestone 1.2: text, links and the clipboard in both directions. Milestone 1.3: files in both directions (share sheet and direct-share shortcut, upload with progress, receive into MediaStore, resume, cancel). The contract is [docs/protocol.md](../docs/protocol.md); the design is [docs/android.md](../docs/android.md). Details of what was built and measured: [phase-1-1-android.md](../docs/results/phase-1-1-android.md), [phase-1-2-android.md](../docs/results/phase-1-2-android.md), [phase-1-3-android.md](../docs/results/phase-1-3-android.md).
 
 ## Build and test
 
@@ -20,12 +20,13 @@ gradlew.bat --stop
 |---|---|
 | `identity` | P-256 key, hand-rolled DER certificate (`CertificateBuilder`), device and short IDs, key storage (AES-GCM under an Android Keystore key). `IdentityStore` replaces an identity only when it is clearly lost; a temporary Keystore error changes nothing |
 | `tls` | Pinning trust manager, client key manager, the TLS 1.3 OkHttp client, the address race |
-| `protocol` | Strict JSON, message receiver (validation order, replies, de-dup), close-code rules, `UrlRules` (`isUrl`, which links may be opened) |
+| `protocol` | Strict JSON, message receiver (validation order, replies, de-dup, and since 1.3 `offer`, `complete`, `cancel`), close-code rules, `UrlRules` (`isUrl`, which links may be opened), `FileNames` (cleaning and create-new), `TextRules` (128 KiB threshold) |
 | `pairing` | Pairing URL parser, `POST /v1/pair`, the pairing flow, `PairingIntake` (a link from outside the app must be confirmed) |
 | `link` | `LinkService`, `LinkRuntime` (network callback, `WifiTracker`), `LinkLoop` (connection order, backoff), `LinkSession` (one WebSocket), mDNS, notifications, `BootReceiver`. 1.2: `IncomingHandler` (receive `clipboard` and `text`), `OutgoingSender` (send `text`, wait for the ack), `DeliveryQueue` (deliver in arrival order) |
 | `clipboard` | `ClipboardSendActivity`, `SendClipboardTile`, `ClipboardGuard` (loop prevention), `ClipboardPort` |
-| `share` | `ShareActivity` (share sheet), `ProcessTextActivity` (text menu, "Send to PC") |
-| `data` | Room (`devices`, `seen_messages`) and DataStore settings and counters |
+| `share` | `ShareActivity` (share sheet: text and files), `ProcessTextActivity` (text menu, "Send to PC"), `ShareIntents` (reads the URIs), `ShareShortcuts` (the direct-share shortcut) |
+| `transfer` | 1.3: `TransferEngine` (jobs, cancel, retry, recovery, the `offer` gate, unpair clean-up, the start-up sweep, crash clean-up), `ProgressThrottle` (one progress update per 500 ms), `UploadRunner`, `DownloadRunner`, `TransferHttp` (the four file endpoints), `MediaStoreSink`, `AndroidSourceFiles`, `TransferNotifications`, `AndroidWakeLocks`. The runners only know the ports in `TransferPorts.kt`, so the unit tests run them with fakes |
+| `data` | Room (`devices`, `seen_messages`, and since 1.3 `transfers`, `transfer_files`; database version 2 with a real migration) and DataStore settings and counters |
 | `log` | Rotating file log with secret redaction. Text is never logged, only its length and a short hash |
 | `ui` | Compose screens: confirm pairing, onboarding, home, debug |
 
@@ -112,6 +113,59 @@ adb shell cmd statusbar expand-settings
 - The arrival time (targets.md priority 2) is **tap to ack**: from the moment the send activity was created (or the debug command ran) to the PC's `ack`. It is in `CMD SEND_TEXT ... arrivalMillis`, in `STATE` (`lastArrivalMs`), in the log (`text sent (...) ...; tap to ack N ms`) and on the Debug tab.
 - Loop prevention: text the PC just put on the clipboard (`clipboard`, or the copy that comes with `text`) is remembered by its SHA-256 for 60 s. A "send clipboard" of the same text in that time is not sent ("The PC already has this text."; the log says `send skipped (CLIPBOARD)`). Share and "Send to PC" are explicit and never skipped.
 
+### Files (milestone 1.3)
+
+All debug-only (`src/debug`), protected by the `DUMP` permission. Transfer IDs must be new each time: an `offer` whose ID was seen in the last 24 hours is acked and ignored (de-duplication), and since the 1.3 review an `offer` whose ID belongs to anything else the phone has (an upload, another PC's transfer, a finished one) is refused with `error bad_request`. A transfer ID is never reused.
+
+```
+# make files to share (in files/debug-share/): name:size = deterministic random bytes, name@WxH = a real JPEG/PNG
+adb shell am broadcast -a app.kinrelay.android.debug.MAKE_FILES -n app.kinrelay.android/.debug.DebugCommandReceiver --es spec "photo.jpg@1200x800,big.bin:2000000,empty.txt:0"
+#   result: CMD MAKE_FILES <name> <size> <first 16 hex of the SHA-256>
+
+# share them like another app's Share would (starts the real ShareActivity, with FLAG_GRANT_READ_URI_PERMISSION and content:// URIs)
+adb shell "am start -n app.kinrelay.android/.debug.DebugShareActivity --es files 'photo.jpg,big.bin,empty.txt'"
+#   one file = ACTION_SEND, more = ACTION_SEND_MULTIPLE (--es action SEND|SEND_MULTIPLE to force one)
+
+# or skip the activity and give the files to the transfer engine
+adb shell am broadcast -a app.kinrelay.android.debug.SEND_FILES -n app.kinrelay.android/.debug.DebugCommandReceiver --es files "photo.jpg,big.bin"
+
+# transfer state: CMD TRANSFER <id> <up|down> <queued|active|done|failed|canceled> <done>/<total> files=N names=... err=<code>
+adb shell am broadcast -a app.kinrelay.android.debug.TRANSFERS -n app.kinrelay.android/.debug.DebugCommandReceiver
+adb shell am broadcast -a app.kinrelay.android.debug.CANCEL_TRANSFER -n app.kinrelay.android/.debug.DebugCommandReceiver --es id <transfer id>
+adb shell am broadcast -a app.kinrelay.android.debug.RETRY_TRANSFER -n app.kinrelay.android/.debug.DebugCommandReceiver --es id <transfer id>
+adb shell am broadcast -a app.kinrelay.android.debug.RETRY_QUEUED -n app.kinrelay.android/.debug.DebugCommandReceiver
+
+# what was received, with the path MediaStore reports and whether it is still pending
+adb shell am broadcast -a app.kinrelay.android.debug.RECEIVED -n app.kinrelay.android/.debug.DebugCommandReceiver
+#   CMD RECEIVED <images|video|downloads> id=.. name='..' size=.. mime=.. path=Pictures/Kin/ pending=0|1 uri=content://media/...
+#   the files themselves: adb shell sha256sum /sdcard/Pictures/Kin/<name> (also /sdcard/Movies/Kin, /sdcard/Download/Kin)
+adb shell am broadcast -a app.kinrelay.android.debug.DELETE_RECEIVED -n app.kinrelay.android/.debug.DebugCommandReceiver   # a clean slate
+
+# R7: does appending to a pending MediaStore entry work here? (wa, w, and the way the app does it)
+adb shell am broadcast -a app.kinrelay.android.debug.APPEND_CHECK -n app.kinrelay.android/.debug.DebugCommandReceiver
+adb shell am broadcast -a app.kinrelay.android.debug.EMPTY_ENTRY_CHECK -n app.kinrelay.android/.debug.DebugCommandReceiver
+
+# the 1.3 review fixes: leave what a crash would leave (a pending Download/Kin entry no transfer owns, an hour-old cache folder), then sweep
+adb shell am broadcast -a app.kinrelay.android.debug.MAKE_ORPHANS -n app.kinrelay.android/.debug.DebugCommandReceiver
+adb shell am broadcast -a app.kinrelay.android.debug.SWEEP -n app.kinrelay.android/.debug.DebugCommandReceiver   # what every app start does; "start-up sweep: deleted N ..." in the log
+adb shell run-as app.kinrelay.android touch files/debug-refuse-names    # every new file name is "taken": a download fails after the 100 suffixes (internal, cancel reason error)
+adb shell run-as app.kinrelay.android rm files/debug-refuse-names
+```
+
+**Added by the integration run (`tools/e2e-1-3.ps1` uses them).** In a file name for `MAKE_FILES`, `DebugShareActivity` and `SEND_FILES`, `%uXXXX;` stands for one code point (`rtl%u202E;gpj.exe`, `%u4E2D;`): adb can't carry bidi controls or CJK through a Windows console, and a trailing space or dot needs it too (`tail.txt.%u0020;`). `SEND_TEXT` and `SET_CLIPBOARD` take `--es textfile <name>` instead of `--es text`: the text is the UTF-8 content of `files/debug-share/<name>` (an argument can't hold 200 KiB or a bare CR). Big files are not made by `MAKE_FILES` (it keeps the whole file in memory): make them on the phone, `adb shell "run-as app.kinrelay.android sh -c 'head -c 314572800 /dev/urandom > files/debug-share/big.bin'"`, and hash them with `sha256sum` the same way. The `CMD CLIPBOARD` line now has `sensitive=<bool>` between the hash and the text.
+
+`STATE` also shows `wakeLockHeld`. `SEND_TEXT` and `SET_CLIPBOARD` take `--ez sensitive true` (the text is sent flagged / the clip is marked sensitive). For the R5 control experiment, `adb shell run-as app.kinrelay.android touch files/debug-no-grant` makes a share skip the read grant to the service (debug build only).
+
+Useful: `adb shell dumpsys shortcut` (the direct-share shortcut `pc`), `adb shell svc wifi disable` / `enable` (a transfer waits for the PC and resumes), `adb shell dumpsys notification --noredact`.
+
+**A second app to test the share path for real:** `share-source/` is a tiny throwaway app (not part of Kin, not in the release) with a provider that is **not exported**, so Kin can read its files only through the grant on the share intent, exactly like a gallery. Build it with `cd share-source && ..\gradlew.bat assembleDebug` and install it; then:
+
+```
+adb shell am start -n app.kinrelay.sharesource/.ShareActivity --ei n 3 --ei size 3000000          # share 3 files straight to Kin
+adb shell am start -n app.kinrelay.sharesource/.ShareActivity --ei n 2 --ei size 40000000 --ez kill true   # the source app dies 0.5 s after the share
+adb shell am start -n app.kinrelay.sharesource/.ShareActivity --ei n 2 --ei size 5000 --ez jpeg true --ez chooser true   # open the system share sheet: the PC is in the top row
+```
+
 ### Reading the state
 
 - **Logcat:** `adb logcat -d -s KinRelay`. Every line has the tag `KinRelay` and looks like `<ISO time> <I|W|E> <component>: <message>`. Components: `app`, `identity`, `pairing`, `tls`, `link`, `service`, `boot`, `mdns`, `clipboard`, `share`, `debug`. The lines that matter:
@@ -147,7 +201,7 @@ set KIN_FAKE_PC=1
 gradlew.bat testDebugUnitTest --tests "*FakePcSession*" --rerun
 ```
 
-It serves for `KIN_FAKE_PC_SECONDS` (default 300). Drive it by writing a word into `app/build/fake-pc/command.txt`: `ping`, `close4001`, `close4003`, `unpair`, `hello2` (a future-protocol hello) or `stop`. Milestone 1.2 adds `clipboard <text>`, `text <text>`, `url <link>` (a `text` with `isUrl`), `noack` / `ack` (stop / resume acking the phone's `text`) and `errtext` (answer it with an `error`). It logs what it saw to `events.txt`. While it runs it holds `app/build` open, so stop it (`stop`) before the next Gradle build.
+It serves for `KIN_FAKE_PC_SECONDS` (default 300). Milestone 1.3 adds the file endpoints (`FakePcFiles`: `POST`, `PUT`, `DELETE`, `GET` with `Range`). Drive it by writing a word into `app/build/fake-pc/command.txt`: `ping`, `close4001`, `close4003`, `unpair`, `hello2` (a future-protocol hello) or `stop`. Milestone 1.2 adds `clipboard <text>`, `text <text>`, `url <link>` (a `text` with `isUrl`), `noack` / `ack` (stop / resume acking the phone's `text`) and `errtext` (answer it with an `error`). Milestone 1.3 adds `offer <id> <spec,...>` (`name:size[:mime]` or `name@WxH`), `cancel <id>`, `gone <id>`, `changed <id> <fileId>`, `postfail <status>`, `putfail <status>`, `dropput <bytes>`, `dropget <bytes>`, `throttle <bytes per 100 ms>`, `stale <offset>`, `ackmsg` / `noackmsg` (the list is in the header of `FakePcSession.kt`). It logs what it saw to `events.txt`, including what the PC stored (`stored <transfer> <file> ... sha=<hex>`) and the phone's `complete` / `cancel` messages. While it runs it holds `app/build` open, so stop it (`stop`) before the next Gradle build.
 
 ## The certificate fixture
 

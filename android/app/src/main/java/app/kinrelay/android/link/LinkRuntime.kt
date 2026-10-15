@@ -14,6 +14,7 @@ import app.kinrelay.android.identity.DeviceIds
 import app.kinrelay.android.pairing.PairingAddress
 import app.kinrelay.android.protocol.CloseAction
 import app.kinrelay.android.protocol.Hello
+import app.kinrelay.android.protocol.Offer
 import app.kinrelay.android.tls.KinTls
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -170,6 +171,8 @@ class LinkRuntime(
             devices.updateName(device.deviceId, peer.name)
             graph.settings.countConnect()
             graph.log.i("link", "connected to '${peer.name}' via $address")
+            // Transfers an earlier run left behind (or that were waiting for the PC) carry on.
+            graph.transfers.onLinkReady()
         }
 
         override suspend fun onDisconnected(end: SessionEnd, action: CloseAction) {
@@ -184,14 +187,21 @@ class LinkRuntime(
             notifications.pingFrom(fromName)
         }
 
-        override suspend fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean) =
-            incoming.onText(fromName, id, text, isUrl)
+        override suspend fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean, sensitive: Boolean) =
+            incoming.onText(fromName, id, text, isUrl, sensitive)
 
         override suspend fun onClipboardReceived(id: String, text: String) = incoming.onClipboard(text)
+
+        override fun acceptOffer(offer: Offer): String? = graph.transfers.acceptOffer(offer)
+
+        override suspend fun onOfferReceived(fromName: String, offer: Offer) = graph.transfers.onOffer(fromName, offer)
+
+        override suspend fun onCancelReceived(transferId: String, reason: String) = graph.transfers.onPeerCancel(transferId, reason)
 
         override suspend fun onPeerUnpaired() {
             graph.log.i("link", "the PC unpaired this phone")
             graph.database.devices().delete(device.deviceId)
+            graph.transfers.onUnpaired(device.deviceId)
             onStopRequested()
         }
     }

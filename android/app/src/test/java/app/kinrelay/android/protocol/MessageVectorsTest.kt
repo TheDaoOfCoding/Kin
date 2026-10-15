@@ -27,6 +27,8 @@ class MessageVectorsTest {
         "brackets-inside-strings-do-not-count-as-nesting",
         // 1.2
         "text-*", "clipboard-*", "duplicate-keys-*",
+        // 1.3
+        "offer-*", "complete-*", "cancel-*",
     )
     private val invalidScope = listOf(
         "first-message-*", "hello-*", "ack-*", "error-*", "unpair-missing-id", "ping-*", "type-*",
@@ -35,6 +37,8 @@ class MessageVectorsTest {
         "text-reversed-surrogate-pair-escape", "lone-surrogate-escape-*", "strict-*", "nesting-*",
         // 1.2
         "text-*", "clipboard-*",
+        // 1.3
+        "offer-*", "complete-*", "cancel-*",
     )
     private val sequenceScope = listOf(
         "second-hello-after-handshake-is-a-normal-message", "invalid-hello-does-not-count-as-accepted",
@@ -42,13 +46,15 @@ class MessageVectorsTest {
         "duplicate-ping-shows-one-toast",
         // 1.2
         "handshake-then-text-then-duplicate", "invalid-message-keeps-connection-open", "rejected-message-id-is-not-remembered",
+        // 1.3
+        "duplicate-offer-is-acked-not-restarted",
     )
 
     /** The invalid-UTF-8 case can only be checked on the PC side: OkHttp never shows the bad bytes. */
     private val skipped = setOf("text-frame-invalid-utf8")
 
     /** The phone is the receiver for `to: phone`; for `to: pc` the receiver stands for the PC, which refuses `clipboard`. */
-    private fun newReceiver(role: String = "phone") = MessageReceiver(DedupMemory({ 0L }), acceptsClipboard = role == "phone")
+    private fun newReceiver(role: String = "phone") = MessageReceiver(DedupMemory({ 0L }), if (role == "phone") ReceiverRole.PHONE else ReceiverRole.PC)
 
     private fun open(receiver: MessageReceiver) {
         val hello = receiver.onText("""{"type":"hello","id":"prime","protocol":1,"name":"Peer","platform":"windows","appVersion":"0.1.0"}""")
@@ -100,6 +106,10 @@ class MessageVectorsTest {
             }
         }
         expect["action"]?.let { assertEquals("$name: action", it.str(), outcome.action.category) }
+        // `expect.sensitive` says how the receiver treats a delivered text (absent means false).
+        (outcome.action as? Action.DeliverText)?.let {
+            assertEquals("$name: sensitive", expect["sensitive"]?.jsonPrimitive?.boolean ?: false, it.sensitive)
+        }
     }
 
     private fun runSingleCases(section: String, scope: List<String>) {

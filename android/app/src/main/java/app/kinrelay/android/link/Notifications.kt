@@ -80,14 +80,12 @@ class Notifications(context: Context) : Alerts {
         manager.notify(PING_ID, notification)
     }
 
-    override fun textFrom(pcName: String, messageId: String, text: String, openUrl: String?) {
+    override fun textFrom(pcName: String, messageId: String, text: String?, openUrl: String?) {
         if (!canPost()) return
         val title = "Text from $pcName"
         val builder = NotificationCompat.Builder(context, TEXT_CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_kin)
             .setContentTitle(title)
-            .setContentText(preview(text, SHORT_PREVIEW))
-            .setStyle(NotificationCompat.BigTextStyle().bigText(preview(text, LONG_PREVIEW, singleLine = false)))
             .setAutoCancel(true)
             .setContentIntent(openApp())
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
@@ -96,6 +94,11 @@ class Notifications(context: Context) : Alerts {
             .setPublicVersion(
                 NotificationCompat.Builder(context, TEXT_CHANNEL).setSmallIcon(R.drawable.ic_stat_kin).setContentTitle(title).build()
             )
+        // No text means sensitive text: the title is all there is.
+        if (text != null) {
+            builder.setContentText(preview(text, SHORT_PREVIEW))
+                .setStyle(NotificationCompat.BigTextStyle().bigText(preview(text, LONG_PREVIEW, singleLine = false)))
+        }
         if (openUrl != null) {
             val view = Intent(Intent.ACTION_VIEW, openUrl.toUri()).addCategory(Intent.CATEGORY_BROWSABLE).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             val pending = PendingIntent.getActivity(

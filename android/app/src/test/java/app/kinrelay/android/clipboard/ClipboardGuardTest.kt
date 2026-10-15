@@ -69,6 +69,17 @@ class ClipboardGuardTest {
     }
 
     @Test
+    fun theHashIsOfTheWireFormSoCrlfAndLfClipboardsMatchWhatThePcSent() {
+        // The PC sent LF-only text (the wire form); a clipboard that holds the CRLF form of it is the same text.
+        guard.notePeerSet("a\nb")
+        assertTrue(guard.isEcho("a\r\nb"))
+        assertTrue(guard.isEcho("a\nb"))
+        // A received text is hashed as received, never converted a second time: "\r\n" in it stays a CRLF.
+        guard.notePeerSet("a\r\r\nb".replace("\r\r\n", "\r\n"))
+        assertFalse(guard.isEcho("a\nb"))
+    }
+
+    @Test
     fun describeIsNoneUntilSomethingWasSet() {
         assertEquals("none", guard.describe())
         guard.notePeerSet("x")

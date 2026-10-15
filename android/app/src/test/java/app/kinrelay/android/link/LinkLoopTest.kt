@@ -72,7 +72,7 @@ class LinkLoopTest {
         var unpaired = 0
         val delivered = mutableListOf<String>()
         override suspend fun lastAddresses() = addresses
-        override suspend fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean) {
+        override suspend fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean, sensitive: Boolean) {
             // The first message is slow on purpose: the second must still wait for it.
             if (text == "slow") kotlinx.coroutines.delay(1_000)
             delivered += "text:$text"
@@ -199,9 +199,9 @@ class LinkLoopTest {
         runCurrent()
         val listener = env.sessions.single().listener
         listener.onHelloAccepted(peer)
-        listener.onTextReceived("Desk PC", "a", "slow", false)
+        listener.onTextReceived("Desk PC", "a", "slow", false, false)
         listener.onClipboardReceived("b", "second")
-        listener.onTextReceived("Desk PC", "c", "third", true)
+        listener.onTextReceived("Desk PC", "c", "third", true, false)
         runCurrent()
         assertTrue("the slow one holds the others back", host.delivered.isEmpty())
         advance(1_000)

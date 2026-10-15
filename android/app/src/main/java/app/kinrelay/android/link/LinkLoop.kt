@@ -5,6 +5,7 @@ import app.kinrelay.android.pairing.PairingAddress
 import app.kinrelay.android.protocol.CloseAction
 import app.kinrelay.android.protocol.CloseRules
 import app.kinrelay.android.protocol.Hello
+import app.kinrelay.android.protocol.Offer
 import app.kinrelay.android.tls.RaceResult
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -34,10 +35,19 @@ interface LinkHost {
     suspend fun onPeerUnpaired()
 
     /** A `text` from the PC (acked already). Called one at a time, in arrival order. */
-    suspend fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean)
+    suspend fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean, sensitive: Boolean)
 
     /** A `clipboard` from the PC (acked already). Called one at a time, in arrival order. */
     suspend fun onClipboardReceived(id: String, text: String)
+
+    /** Before an `offer` is acked: null accepts it, an error code refuses it. Cheap and synchronous. */
+    fun acceptOffer(offer: Offer): String? = null
+
+    /** An `offer` (acked already). Called one at a time, in arrival order. It must return soon: the download runs elsewhere. */
+    suspend fun onOfferReceived(fromName: String, offer: Offer) = Unit
+
+    /** A `cancel` (acked already). Called one at a time, in arrival order. */
+    suspend fun onCancelReceived(transferId: String, reason: String) = Unit
 }
 
 /**
@@ -116,11 +126,19 @@ class LinkLoop(
                     scope.launch { host.onPeerUnpaired() }
                 }
 
-                override fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean) =
-                    deliveries.submit { host.onTextReceived(fromName, id, text, isUrl) }
+                override fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean, sensitive: Boolean) =
+                    deliveries.submit { host.onTextReceived(fromName, id, text, isUrl, sensitive) }
 
                 override fun onClipboardReceived(id: String, text: String) =
                     deliveries.submit { host.onClipboardReceived(id, text) }
+
+                override fun acceptOffer(offer: Offer): String? = host.acceptOffer(offer)
+
+                override fun onOfferReceived(fromName: String, offer: Offer) =
+                    deliveries.submit { host.onOfferReceived(fromName, offer) }
+
+                override fun onCancelReceived(transferId: String, reason: String) =
+                    deliveries.submit { host.onCancelReceived(transferId, reason) }
             }
             val opened = env.openSession(address, listener)
             session = opened

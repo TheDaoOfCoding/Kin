@@ -7,7 +7,7 @@ import app.kinrelay.android.log.KinLog
 import app.kinrelay.android.pairing.PairingAddress
 import app.kinrelay.android.protocol.DedupMemory
 import app.kinrelay.android.protocol.Hello
-import app.kinrelay.android.protocol.MAX_FRAME_BYTES
+import app.kinrelay.android.protocol.MAX_TEXT_BYTES
 import app.kinrelay.android.protocol.Utf8
 import app.kinrelay.android.testing.FakePc
 import app.kinrelay.android.testing.str
@@ -62,12 +62,12 @@ class TextFlowTest {
     }
 
     private class FakeAlerts : Alerts {
-        class TextAlert(val pc: String, val id: String, val text: String, val openUrl: String?)
+        class TextAlert(val pc: String, val id: String, val text: String?, val openUrl: String?)
         val texts = LinkedBlockingQueue<TextAlert>()
         val sent = CopyOnWriteArrayList<Pair<String?, Long>>()
         val failures = CopyOnWriteArrayList<Pair<String, String>>()
         val messages = CopyOnWriteArrayList<String>()
-        override fun textFrom(pcName: String, messageId: String, text: String, openUrl: String?) { texts.add(TextAlert(pcName, messageId, text, openUrl)) }
+        override fun textFrom(pcName: String, messageId: String, text: String?, openUrl: String?) { texts.add(TextAlert(pcName, messageId, text, openUrl)) }
         override fun sent(pcName: String?, arrivalMillis: Long) { sent += pcName to arrivalMillis }
         val failureTitles = LinkedBlockingQueue<String>()
         override fun sendFailed(title: String, reason: String) { failures += title to reason; failureTitles += title }
@@ -96,8 +96,8 @@ class TextFlowTest {
             override fun onHelloAccepted(peer: Hello) { hellos.add(peer) }
             override fun onPingReceived(fromName: String) = Unit
             override fun onPeerUnpaired() = Unit
-            override fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean) =
-                harness.queue.submit { IncomingHandler(harness.clipboard, harness.alerts, harness.guard, KinLog.None).onText(fromName, id, text, isUrl) }
+            override fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean, sensitive: Boolean) =
+                harness.queue.submit { IncomingHandler(harness.clipboard, harness.alerts, harness.guard, KinLog.None).onText(fromName, id, text, isUrl, sensitive) }
             override fun onClipboardReceived(id: String, text: String) =
                 harness.queue.submit { IncomingHandler(harness.clipboard, harness.alerts, harness.guard, KinLog.None).onClipboard(text) }
         }
@@ -113,7 +113,11 @@ class TextFlowTest {
         return harness
     }
 
-    private fun Harness.sender(ackTimeoutMillis: Long = OutgoingSender.ACK_TIMEOUT_MILLIS, link: OutgoingLink? = null) = OutgoingSender(
+    private fun Harness.sender(
+        ackTimeoutMillis: Long = OutgoingSender.ACK_TIMEOUT_MILLIS,
+        link: OutgoingLink? = null,
+        textFiles: TextFileSender = TextFileSender.None,
+    ) = OutgoingSender(
         link = link ?: object : OutgoingLink {
             override suspend fun await(waitMillis: Long): LinkConnection? = session.takeIf { it.isReady }
             override fun unreachableReason() = "not connected"
@@ -121,10 +125,15 @@ class TextFlowTest {
         },
         alerts = alerts, guard = guard, arrivals = { arrivals += it }, clock = { System.nanoTime() / 1_000_000 }, log = KinLog.None,
         ackTimeoutMillis = ackTimeoutMillis,
+        textFiles = textFiles,
     )
 
-    private fun Harness.sendText(text: String, source: SendSource = SendSource.SHARE, sender: OutgoingSender = sender()): SendOutcome =
-        blocking { sender.send(text, tapAtMillis = System.nanoTime() / 1_000_000, source = source) }
+    private fun Harness.sendText(
+        text: String,
+        source: SendSource = SendSource.SHARE,
+        sender: OutgoingSender = sender(),
+        sensitive: Boolean = false,
+    ): SendOutcome = blocking { sender.send(text, tapAtMillis = System.nanoTime() / 1_000_000, source = source, sensitive = sensitive) }
 
     private fun FakePc.nextOfType(type: String, timeoutMillis: Long = 5_000): JsonObject? {
         val deadline = System.currentTimeMillis() + timeoutMillis
@@ -295,24 +304,88 @@ class TextFlowTest {
     }
 
     @Test
-    fun aFrameOfExactly1MiBIsSentAndOneByteMoreIsTooLong() {
+    fun aTextOfExactly128KiBIsAMessageAndOneByteMoreGoesAsAFile() {
         val h = connect()
-        val overhead = Utf8.size("""{"type":"text","id":"0193a5c2-7b1e-7c3a-9d4f-5e6a7b8c9d28","text":"","isUrl":false}""")
-        val exact = "a".repeat(MAX_FRAME_BYTES - overhead)
-        assertTrue(h.sendText(exact) is SendOutcome.Delivered)
+        val files = CopyOnWriteArrayList<String>()
+        val sender = h.sender(textFiles = TextFileSender { files += it; true })
+        val exact = "a".repeat(MAX_TEXT_BYTES)
+        assertTrue(h.sendText(exact, sender = sender) is SendOutcome.Delivered)
         assertEquals(exact.length, h.pc.nextOfType("text")!!.getValue("text").str().length)
-        assertEquals(SendOutcome.TooLong, h.sendText(exact + "a"))
-        assertTrue("nothing was sent for the long one", h.pc.nextOfType("text", 400) == null)
-        assertEquals(listOf("That text is too long to send for now."), h.alerts.messages.toList())
+        assertTrue(files.isEmpty())
+
+        assertEquals(SendOutcome.SentAsFile, h.sendText(exact + "a", sender = sender))
+        assertTrue("nothing was sent as a message for the long one", h.pc.nextOfType("text", 400) == null)
+        assertEquals(listOf(exact + "a"), files.toList())
     }
 
     @Test
-    fun theFrameIsMeasuredInBytesNotCharacters() {
+    fun theThresholdIsMeasuredInUtf8BytesOnTheWireForm() {
         val h = connect()
-        val overhead = Utf8.size("""{"type":"text","id":"0193a5c2-7b1e-7c3a-9d4f-5e6a7b8c9d28","text":"","isUrl":false}""")
-        val fits = "é".repeat((MAX_FRAME_BYTES - overhead) / 2)
-        assertTrue(h.sendText(fits) is SendOutcome.Delivered)
-        assertEquals(SendOutcome.TooLong, h.sendText(fits + "é"))
+        val files = CopyOnWriteArrayList<String>()
+        val sender = h.sender(textFiles = TextFileSender { files += it; true })
+        val fits = "é".repeat(MAX_TEXT_BYTES / 2) // 2 bytes each: exactly 128 KiB
+        assertTrue(h.sendText(fits, sender = sender) is SendOutcome.Delivered)
+        assertEquals(SendOutcome.SentAsFile, h.sendText(fits + "é", sender = sender))
+        // CRLF counts as one byte on the wire, so this text is 128 KiB on the wire although the clipboard holds more.
+        val crlf = "ab\r\n".repeat(43_690) // 174,760 bytes in the clipboard, 131,070 on the wire
+        assertTrue(h.sendText(crlf, sender = sender) is SendOutcome.Delivered)
+        assertEquals(1, files.size)
+    }
+
+    @Test
+    fun theTextGoesOutWithLfOnlyAndALoneCrStays() {
+        val h = connect()
+        assertTrue(h.sendText("a\r\nb\rc\r\r\nd") is SendOutcome.Delivered)
+        assertEquals("a\nb\rc\r\nd", h.pc.nextOfType("text")!!.getValue("text").str())
+    }
+
+    @Test
+    fun aSensitiveTextIsFlaggedOnTheWireAndAPlainOneHasNoField() {
+        val h = connect()
+        assertTrue(h.sendText("hunter2", sensitive = true) is SendOutcome.Delivered)
+        val sensitive = h.pc.nextOfType("text")!!
+        assertEquals("true", sensitive.getValue("sensitive").jsonPrimitive.content)
+        assertTrue(h.sendText("plain") is SendOutcome.Delivered)
+        assertNull(h.pc.nextOfType("text")!!["sensitive"])
+    }
+
+    @Test
+    fun aSensitiveTextOver128KiBIsNotSentAtAll() {
+        val h = connect()
+        val files = CopyOnWriteArrayList<String>()
+        val sender = h.sender(textFiles = TextFileSender { files += it; true })
+        assertEquals(SendOutcome.TooLong, h.sendText("a".repeat(MAX_TEXT_BYTES + 1), sender = sender, sensitive = true))
+        assertTrue("a file has no sensitive mark, so no file either", files.isEmpty())
+        assertTrue(h.pc.nextOfType("text", 400) == null)
+        assertEquals(listOf("That text is sensitive and too long to send."), h.alerts.messages.toList())
+    }
+
+    @Test
+    fun aLongTextWithNoFileQueueIsTooLong() {
+        val h = connect()
+        assertEquals(SendOutcome.TooLong, h.sendText("a".repeat(MAX_TEXT_BYTES + 1)))
+        assertEquals(listOf("That text is too long to send."), h.alerts.messages.toList())
+    }
+
+    @Test
+    fun nothingAboutASensitiveTextIsLogged() {
+        val h = connect()
+        val lines = CopyOnWriteArrayList<String>()
+        val log = object : KinLog {
+            override fun log(level: Char, component: String, message: String) { lines += message }
+        }
+        val sender = OutgoingSender(
+            link = object : OutgoingLink {
+                override suspend fun await(waitMillis: Long): LinkConnection? = h.session.takeIf { it.isReady }
+                override fun unreachableReason() = "x"
+                override suspend fun peerName() = "Desk PC"
+            },
+            alerts = h.alerts, guard = h.guard, arrivals = { }, clock = { System.nanoTime() / 1_000_000 }, log = log,
+        )
+        val secret = "correct horse battery staple"
+        assertTrue(h.sendText(secret, sender = sender, sensitive = true) is SendOutcome.Delivered)
+        val hash = ClipboardGuard.hash(secret).take(8)
+        assertTrue(lines.joinToString("\n"), lines.none { it.contains(secret) || it.contains(hash) || it.contains("len=${secret.length}") })
     }
 
     @Test

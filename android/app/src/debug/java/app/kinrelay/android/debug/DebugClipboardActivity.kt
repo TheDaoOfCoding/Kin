@@ -22,11 +22,11 @@ class DebugClipboardActivity : Activity() {
         super.onWindowFocusChanged(hasFocus)
         if (!hasFocus || done) return
         done = true
-        val text = AndroidClipboard.read(this)
-        val line = if (text == null) {
+        val content = AndroidClipboard.read(this)
+        val line = if (content == null) {
             "CMD CLIPBOARD empty"
         } else {
-            "CMD CLIPBOARD ${ClipboardGuard.fingerprint(text)} text=${quote(text)}"
+            "CMD CLIPBOARD ${ClipboardGuard.fingerprint(content.text)} sensitive=${content.sensitive} text=${quote(content.text)}"
         }
         Log.i(KinApp.LOG_TAG, line)
         finish()

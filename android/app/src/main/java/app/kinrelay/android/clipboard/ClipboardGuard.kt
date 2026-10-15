@@ -13,13 +13,14 @@ class ClipboardGuard(private val nowMillis: () -> Long, private val windowMillis
     private var lastHash: String? = null
     private var lastAt = 0L
 
+    /** [text] is what the peer sent, which is already the wire form: it is hashed as received, with no second conversion. */
     @Synchronized
     fun notePeerSet(text: String) {
-        lastHash = hash(text)
+        lastHash = hashOfWire(text)
         lastAt = nowMillis()
     }
 
-    /** True if [text] is what the peer just put on this clipboard. */
+    /** True if the clipboard text [text] is what the peer just put on this clipboard: it is converted to the wire form first, as a send would. */
     @Synchronized
     fun isEcho(text: String): Boolean = lastHash != null && hash(text) == lastHash && nowMillis() - lastAt in 0..windowMillis
 
@@ -30,10 +31,12 @@ class ClipboardGuard(private val nowMillis: () -> Long, private val windowMillis
     companion object {
         const val WINDOW_MILLIS = 60_000L
 
-        /** SHA-256 of the UTF-8 text as the wire would carry it (unpaired surrogates already replaced), as hex. */
-        fun hash(text: String): String =
-            MessageDigest.getInstance("SHA-256").digest(Frames.sanitize(text).toByteArray(Charsets.UTF_8))
-                .joinToString("") { "%02x".format(it) }
+        /** SHA-256, as hex, of a clipboard [text] in its wire form ([Frames.wireText]: LF only, unpaired surrogates replaced). */
+        fun hash(text: String): String = hashOfWire(Frames.wireText(text))
+
+        /** SHA-256, as hex, of a text that is already in its wire form (a received text is hashed as received). */
+        fun hashOfWire(wire: String): String =
+            MessageDigest.getInstance("SHA-256").digest(wire.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
 
         /** What the log may say about a text: its length and a short hash, never the text. */
         fun fingerprint(text: String): String = "len=${text.codePointCount(0, text.length)} sha=${hash(text).take(8)}"

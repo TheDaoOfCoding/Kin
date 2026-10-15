@@ -44,6 +44,15 @@ class IdentityStoreTest {
         }
     }
 
+    /** Stands for `android.security.KeyStoreException` (its constructor isn't public): the test probe reads [transient]. */
+    private class FakeKeystoreError(val transient: Boolean) : Exception("keystore error")
+
+    private val probe = KeystoreCauseProbe { (it as? FakeKeystoreError)?.transient }
+
+    /** What `KeyStore.getKey()` throws: an `UnrecoverableKeyException` that wraps the Keystore's own error. */
+    private fun unrecoverable(cause: Throwable?): UnrecoverableKeyException =
+        UnrecoverableKeyException("Failed to obtain information about key").also { if (cause != null) it.initCause(cause) }
+
     private fun tempDir(): File = Files.createTempDirectory("kin-identity").toFile().also { it.deleteOnExit() }
 
     private fun keyFile(dir: File) = File(dir, "identity.key")
@@ -219,6 +228,55 @@ class IdentityStoreTest {
         assertEquals(before.getValue("identity.crt"), certFile(dir).readBytes().toList())
     }
 
+    // --- UnrecoverableKeyException is only "gone for good" when nothing under it says "temporary" ---
+
+    @Test
+    fun anUnrecoverableKeyExceptionOverATemporaryKeystoreErrorLeavesTheFilesAlone() {
+        for (wrapped in listOf<() -> Throwable>(
+            { unrecoverable(FakeKeystoreError(transient = true)) },
+            // further down the chain, as the providers nest them:
+            { IllegalStateException("outer", unrecoverable(RuntimeException("mid", FakeKeystoreError(transient = true)))) },
+        )) {
+            val dir = tempDir()
+            val wrapper = SoftwareWrapper()
+            val first = IdentityStore(dir, wrapper, keystoreProbe = probe).loadOrCreate().identity
+            val before = snapshot(dir)
+            wrapper.failure = wrapped
+            assertThrows(IdentityUnavailableException::class.java) { IdentityStore(dir, wrapper, keystoreProbe = probe).loadOrCreate() }
+            assertEquals("files unchanged", before, snapshot(dir))
+            wrapper.failure = null
+            val again = IdentityStore(dir, wrapper, keystoreProbe = probe).loadOrCreate()
+            assertNull("the identity is still the old one", again.replaced)
+            assertEquals(first.deviceId, again.identity.deviceId)
+        }
+    }
+
+    @Test
+    fun anUnrecoverableKeyExceptionIsPermanentWithoutAKeystoreCauseOrWithAPermanentOne() {
+        for (wrapped in listOf<() -> Throwable>(
+            { unrecoverable(null) },
+            { unrecoverable(IOException("not a keystore error")) },
+            { unrecoverable(FakeKeystoreError(transient = false)) },
+        )) {
+            val dir = tempDir()
+            val wrapper = SoftwareWrapper()
+            val first = IdentityStore(dir, wrapper, keystoreProbe = probe).loadOrCreate().identity
+            wrapper.failure = wrapped
+            val second = IdentityStore(dir, wrapper, keystoreProbe = probe).loadOrCreate()
+            assertNotNull("the lost key replaces the identity", second.replaced)
+            assertNotEquals(first.deviceId, second.identity.deviceId)
+        }
+    }
+
+    @Test
+    fun theRealProbeTellsKeystoreErrorsByNameAndIgnoresOtherExceptions() {
+        assertNull(AndroidKeystoreCauseProbe.transientFailure(IOException("x")))
+        assertNull(AndroidKeystoreCauseProbe.transientFailure(FakeKeystoreError(true)))
+        // Without a Keystore error underneath, the plain exception is permanent with the real probe too.
+        assertEquals(IdentityFailure.Kind.UNUSABLE, IdentityFailure.classify(unrecoverable(null)))
+        assertEquals(IdentityFailure.Kind.UNUSABLE, IdentityFailure.classify(unrecoverable(IOException("x"))))
+    }
+
     // --- the write order ---
 
     @Test
@@ -266,6 +324,8 @@ class IdentityStoreTest {
         assertEquals(IdentityFailure.Kind.UNUSABLE, kind(KeyMissingException("x")))
         assertEquals(IdentityFailure.Kind.UNUSABLE, kind(AEADBadTagException()))
         assertEquals(IdentityFailure.Kind.UNUSABLE, kind(UnrecoverableKeyException()))
+        assertEquals(IdentityFailure.Kind.TRANSIENT, IdentityFailure.classify(unrecoverable(FakeKeystoreError(true)), probe))
+        assertEquals(IdentityFailure.Kind.UNUSABLE, IdentityFailure.classify(unrecoverable(FakeKeystoreError(false)), probe))
         assertEquals(IdentityFailure.Kind.UNUSABLE, kind(KeyPermanentlyInvalidatedException("x")))
         assertEquals(IdentityFailure.Kind.UNUSABLE, kind(CorruptKeyFileException("x")))
         assertEquals(IdentityFailure.Kind.UNUSABLE, kind(RuntimeException("outer", AEADBadTagException())))

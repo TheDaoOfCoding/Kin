@@ -8,6 +8,12 @@ import java.security.SecureRandom
 const val PROTOCOL_VERSION = 1
 const val MAX_FRAME_BYTES = 1_048_576
 
+/** Files in one `offer`; a bigger one is answered with `too_large`. The PC splits its sends at the same number (protocol.md, Files: PC -> phone). */
+const val MAX_OFFER_FILES = 800
+
+/** A text larger than this (UTF-8, wire form) is sent as a `.txt` file instead (the sender size threshold). */
+const val MAX_TEXT_BYTES = 128 * 1024
+
 /** A `hello` the receiver accepted. */
 data class Hello(val id: String, val name: String, val platform: String, val appVersion: String)
 
@@ -15,6 +21,8 @@ object ErrorCodes {
     const val BAD_REQUEST = "bad_request"
     const val UNSUPPORTED_TYPE = "unsupported_type"
     const val UNSUPPORTED_VERSION = "unsupported_version"
+    const val DISK_FULL = "disk_full"
+    const val TOO_LARGE = "too_large"
 }
 
 /** Builders for the frames this app sends. Output is compact JSON, as senders must write it. */
@@ -47,17 +55,33 @@ object Frames {
     }
 
     /**
-     * An explicit send. The text is made valid first (an unpaired surrogate becomes U+FFFD). Returns null when the
-     * serialized frame is over 1 MiB: the spec sends longer text as a `.txt` file, which comes with the files in 1.3.
+     * An explicit send. The text goes out in its wire form ([wireText]). [sensitive] is written only when true (an optional
+     * field is left out when absent). Returns null when the serialized frame is over 1 MiB: the sender switches to a `.txt`
+     * file long before that ([MAX_TEXT_BYTES]), so this is only a guard.
      */
-    fun text(id: String, text: String, isUrl: Boolean): String? {
+    fun text(id: String, text: String, isUrl: Boolean, sensitive: Boolean = false): String? {
         val frame = buildJsonObject {
             put("type", "text")
             put("id", id)
-            put("text", sanitize(text))
+            put("text", wireText(text))
             put("isUrl", isUrl)
+            if (sensitive) put("sensitive", true)
         }.toString()
         return frame.takeIf { Utf8.size(it) <= MAX_FRAME_BYTES }
+    }
+
+    /** The phone tells the PC every file of the transfer is saved. */
+    fun complete(id: String, transferId: String): String = obj {
+        put("type", "complete")
+        put("id", id)
+        put("transferId", transferId)
+    }
+
+    fun cancel(id: String, transferId: String, reason: String): String = obj {
+        put("type", "cancel")
+        put("id", id)
+        put("transferId", transferId)
+        put("reason", reason)
     }
 
     fun unpair(id: String): String = obj {
@@ -71,6 +95,12 @@ object Frames {
         check(Utf8.size(text) <= MAX_FRAME_BYTES) { "outgoing frame is over 1 MiB" }
         return text
     }
+
+    /**
+     * What a text looks like on the wire: the wire uses LF only, so CRLF becomes LF and a lone CR is left alone, and an
+     * unpaired surrogate becomes U+FFFD. Loop-guard hashes are taken on this form.
+     */
+    fun wireText(text: String): String = sanitize(text.replace("\r\n", "\n"))
 
     /** Senders replace an unpaired surrogate with U+FFFD before serializing. */
     fun sanitize(text: String): String {

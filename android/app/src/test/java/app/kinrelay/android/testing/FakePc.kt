@@ -52,6 +52,12 @@ class FakePc(
     val requests = CopyOnWriteArrayList<Recorded>()
     val pairedPhones: MutableSet<String> = mutableSetOf()
 
+    /** The file endpoints (uploads from the phone, offers to it). */
+    val files = FakePcFiles()
+
+    /** Answers a `/v1/transfers...` request itself (returns the response) instead of [files]: for replaying the shared vectors. */
+    @Volatile var canned: ((RecordedRequest) -> MockResponse?)? = null
+
     /** Frames the phone sent on its WebSocket, in order. */
     val received = LinkedBlockingQueue<String>()
     val sockets = CopyOnWriteArrayList<WebSocket>()
@@ -98,6 +104,13 @@ class FakePc(
     fun sendText(id: String, text: String, isUrl: Boolean) =
         send(buildJsonObject { put("type", "text"); put("id", id); put("text", text); put("isUrl", isUrl) }.toString())
 
+    /** Offers files to the phone: registers them for `GET` and sends the `offer` frame. */
+    fun sendOffer(id: String, vararg offered: FakePcFiles.OfferedFile): FakePcFiles.Offered =
+        files.offered(id, *offered).also { send(files.offerFrame(it)) }
+
+    fun sendCancel(transferId: String, reason: String = "user") =
+        send("""{"type":"cancel","id":"pc-cancel-${System.nanoTime()}","transferId":"$transferId","reason":"$reason"}""")
+
     fun sendBinary(bytes: ByteArray) = sockets.last().send(ByteString.of(*bytes))
 
     fun closeSocket(code: Int, reason: String = "test") = sockets.last().close(code, reason)
@@ -110,7 +123,8 @@ class FakePc(
 
     private fun route(request: RecordedRequest): MockResponse {
         val phone = request.handshake?.peerCertificates?.firstOrNull()?.let { DeviceIds.deviceIdOfCertificate(it.encoded) }
-        requests += Recorded(request.method, request.url.encodedPath, request.headers["Content-Type"], request.body?.utf8().orEmpty(), phone)
+        val small = request.bodySize < 4096
+        requests += Recorded(request.method, request.url.encodedPath, request.headers["Content-Type"], if (small) request.body?.utf8().orEmpty() else "<${request.bodySize} bytes>", phone)
         return when {
             request.url.encodedPath == "/v1/pair" && request.method == "POST" -> pairResponse?.invoke() ?: autoPairing(phone).let { json(200, """{"name":"$name","deviceId":"${identity.deviceId}","protocol":1}""") }
             request.url.encodedPath == "/v1/ws" -> {
@@ -121,6 +135,8 @@ class FakePc(
                     MockResponse.Builder().webSocketUpgrade(PcSocket()).build()
                 }
             }
+            request.url.encodedPath.startsWith("/v1/transfers") ->
+                canned?.invoke(request) ?: if (phone != null && phone in pairedPhones) files.handle(request) else json(401, """{"error":"unauthorized","message":"This device is not paired."}""")
             else -> json(404, """{"error":"not_found","message":"Unknown route."}""")
         }
     }
@@ -147,6 +163,7 @@ class FakePc(
             onFrame?.invoke(webSocket, frame)
             val type = frame["type"]?.jsonPrimitive?.content
             val id = frame["id"]?.jsonPrimitive?.content
+            files.onFrame(frame)?.let { webSocket.send(it) }
             when (type) {
                 "ping" -> if (ackPings && id != null) webSocket.send("""{"type":"ack","ref":"$id"}""")
                 "text" -> if (id != null) {

@@ -100,4 +100,31 @@ class PairingIntakeTest {
             }
         }
     }
+
+    // --- the tap confirms the link that was on screen, not whichever one is pending now ---
+
+    private fun confirmation(id: String, name: String) =
+        (decide(link(id, name), PairingSource.EXTERNAL_LINK) as PairingIntake.AskUser).confirmation
+
+    @Test
+    fun confirmingTheLinkThatWasShownGivesItsTarget() {
+        val shown = confirmation(pcId, "Desk%20PC")
+        val target = PairingIntake.confirmable(PairingUiState.Confirm(shown), shown)
+        assertEquals(pcId, target?.id)
+    }
+
+    @Test
+    fun aLinkThatReplacedTheShownOneIsNotConfirmedByAnOldTap() {
+        val shown = confirmation(pcId, "Desk%20PC")
+        val replacedBy = confirmation(otherId, "Attacker")
+        // The user is looking at `shown`, a second link arrives, and the tap lands after the state changed.
+        assertNull(PairingIntake.confirmable(PairingUiState.Confirm(replacedBy), shown))
+    }
+
+    @Test
+    fun nothingIsConfirmedWhenNoConfirmationIsWaiting() {
+        val shown = confirmation(pcId, "Desk%20PC")
+        assertNull(PairingIntake.confirmable(PairingUiState.Idle, shown))
+        assertNull(PairingIntake.confirmable(PairingUiState.Working("x"), shown))
+    }
 }

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The direct-share target: the shortcut that ShareShortcuts pushes for the paired PC has this category, so the system lists it in the
+    share sheet's top row for any content. A tap on it starts ShareActivity with the shared files or text.
+-->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <share-target android:targetClass="app.kinrelay.android.share.ShareActivity">
+        <data android:mimeType="*/*" />
+        <category android:name="app.kinrelay.android.category.SEND_TO_PC" />
+    </share-target>
+</shortcuts>

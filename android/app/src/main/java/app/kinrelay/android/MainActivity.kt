@@ -50,7 +50,7 @@ class MainActivity : ComponentActivity() {
                     onAllowLocalNetwork = ::allowLocalNetwork,
                     onScan = ::scan,
                     onPair = { onPairingText(it, PairingSource.IN_APP) },
-                    onConfirmPairing = { graph.pairing.confirm()?.let(::beginPairing) },
+                    onConfirmPairing = { shown -> graph.pairing.confirm(shown)?.let(::beginPairing) },
                     onCancelPairing = { graph.pairing.cancel() },
                 )
             }

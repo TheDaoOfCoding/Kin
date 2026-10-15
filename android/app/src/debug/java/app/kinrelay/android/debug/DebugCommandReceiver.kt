@@ -10,6 +10,7 @@ import app.kinrelay.android.graph
 import app.kinrelay.android.link.SendSource
 import app.kinrelay.android.pairing.PairingIntake
 import app.kinrelay.android.pairing.PairingSource
+import app.kinrelay.android.transfer.ShareSource
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
@@ -43,7 +44,7 @@ class DebugCommandReceiver : BroadcastReceiver() {
                                 "lastArrivalMs=${stats.lastArrivalMillis} clipboardGuard=${graph.clipboardGuard.describe()} " +
                                 "identityProblem=${graph.identityProblem.value} pairing=${graph.pairing.state.value.javaClass.simpleName} " +
                                 "connects=${stats.connects} disconnects=${stats.disconnects} kills=${stats.kills} " +
-                                "phoneId=${graph.identityFlow.value?.deviceId}",
+                                "phoneId=${graph.identityFlow.value?.deviceId} wakeLockHeld=${graph.wakeLocks?.isHeld()}",
                         )
                     }
                     "CONNECT" -> {
@@ -67,23 +68,69 @@ class DebugCommandReceiver : BroadcastReceiver() {
                         }
                     }
                     "SEND_TEXT" -> {
-                        val text = intent.getStringExtra("text")
+                        // `--es textfile <name>`: the text is the UTF-8 content of files/debug-share/<name> (adb can't carry 200 KiB or a bare CR/LF in an argument)
+                        val text = intent.getStringExtra("textfile")?.let { java.io.File(DebugFiles.dir(context), DebugFiles.fileName(it)).readText() } ?: intent.getStringExtra("text")
                         if (text == null) {
                             graph.log.w("debug", "CMD SEND_TEXT needs --es text <text>")
                         } else {
-                            val result = graph.sender.send(text, SystemClock.elapsedRealtime(), SendSource.DEBUG)
+                            val result = graph.sender.send(text, SystemClock.elapsedRealtime(), SendSource.DEBUG, sensitive = intent.getBooleanExtra("sensitive", false))
                             graph.log.i("debug", "CMD SEND_TEXT result=$result")
                         }
                     }
                     "SET_CLIPBOARD" -> {
-                        val text = intent.getStringExtra("text")
+                        val text = intent.getStringExtra("textfile")?.let { java.io.File(DebugFiles.dir(context), DebugFiles.fileName(it)).readText() } ?: intent.getStringExtra("text")
                         if (text == null) {
                             graph.log.w("debug", "CMD SET_CLIPBOARD needs --es text <text>")
                         } else {
-                            AndroidClipboard(context).write(text, sensitive = false)
+                            AndroidClipboard(context).write(text, sensitive = intent.getBooleanExtra("sensitive", false))
                             graph.log.i("debug", "CMD SET_CLIPBOARD ${ClipboardGuard.fingerprint(text)}")
                         }
                     }
+                    "MAKE_FILES" -> {
+                        val spec = intent.getStringExtra("spec")
+                        if (spec == null) {
+                            graph.log.w("debug", "CMD MAKE_FILES needs --es spec <name:size|name@WxH,...>")
+                        } else {
+                            DebugFiles.make(context, spec).forEach { graph.log.i("debug", "CMD MAKE_FILES $it") }
+                        }
+                    }
+                    "SEND_FILES" -> {
+                        // Straight to the transfer engine (no share activity): the files are those made by MAKE_FILES.
+                        val names = intent.getStringExtra("files")?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() }.orEmpty()
+                        if (names.isEmpty()) {
+                            graph.log.w("debug", "CMD SEND_FILES needs --es files <name,name>")
+                        } else {
+                            graph.link.ensureRunning(context)
+                            val id = graph.transfers.enqueueUpload(names.map { ShareSource(DebugFiles.uriOf(context, it).toString()) })
+                            graph.log.i("debug", "CMD SEND_FILES transfer=$id")
+                        }
+                    }
+                    "TRANSFERS" -> {
+                        val lines = graph.transfers.summary(20)
+                        graph.log.i("debug", "CMD TRANSFERS count=${lines.size} wakeLockHeld=${graph.wakeLocks?.isHeld()}")
+                        lines.forEach { graph.log.i("debug", "CMD TRANSFER $it") }
+                    }
+                    "RECEIVED" -> DebugChecks.received(context).forEach { graph.log.i("debug", "CMD RECEIVED $it") }
+                    "CANCEL_TRANSFER" -> {
+                        val id = intent.getStringExtra("id")
+                        if (id == null) graph.log.w("debug", "CMD CANCEL_TRANSFER needs --es id <transfer id>") else { graph.transfers.cancel(id); graph.log.i("debug", "CMD CANCEL_TRANSFER $id requested") }
+                    }
+                    "RETRY_TRANSFER" -> {
+                        val id = intent.getStringExtra("id")
+                        if (id == null) graph.log.w("debug", "CMD RETRY_TRANSFER needs --es id <transfer id>") else { graph.transfers.retry(id); graph.log.i("debug", "CMD RETRY_TRANSFER $id requested") }
+                    }
+                    "RETRY_QUEUED" -> {
+                        graph.transfers.retryQueuedUploads()
+                        graph.log.i("debug", "CMD RETRY_QUEUED done")
+                    }
+                    "DELETE_RECEIVED" -> DebugChecks.deleteReceived(context).forEach { graph.log.i("debug", "CMD DELETE_RECEIVED $it") }
+                    "MAKE_ORPHANS" -> DebugChecks.makeOrphans(context).forEach { graph.log.i("debug", "CMD MAKE_ORPHANS $it") }
+                    "SWEEP" -> {
+                        graph.transfers.sweepOrphans()
+                        graph.log.i("debug", "CMD SWEEP done")
+                    }
+                    "EMPTY_ENTRY_CHECK" -> DebugChecks.emptyEntryCheck(context).forEach { graph.log.i("debug", "CMD EMPTY_ENTRY_CHECK $it") }
+                    "APPEND_CHECK" -> DebugChecks.appendCheck(context).forEach { graph.log.i("debug", "CMD APPEND_CHECK $it") }
                     "SET_PING_INTERVAL" -> {
                         val seconds = intent.getIntExtra("seconds", -1)
                         if (seconds > 0) {

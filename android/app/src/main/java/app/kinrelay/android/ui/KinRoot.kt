@@ -18,6 +18,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import app.kinrelay.android.AppGraph
 import app.kinrelay.android.data.Stats
+import app.kinrelay.android.pairing.PairingConfirmation
 import app.kinrelay.android.pairing.PairingUiState
 import kotlinx.coroutines.launch
 
@@ -30,7 +31,7 @@ fun KinRoot(
     onAllowLocalNetwork: () -> Unit,
     onScan: () -> Unit,
     onPair: (String) -> Unit,
-    onConfirmPairing: () -> Unit,
+    onConfirmPairing: (PairingConfirmation) -> Unit,
     onCancelPairing: () -> Unit,
 ) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
@@ -49,7 +50,7 @@ fun KinRoot(
             val confirm = pairingState as? PairingUiState.Confirm
             if (confirm != null) {
                 // A pairing link from outside the app: nothing else is shown until the user decides.
-                ConfirmPairingScreen(confirm.confirmation, onConfirm = onConfirmPairing, onCancel = onCancelPairing)
+                ConfirmPairingScreen(confirm.confirmation, onConfirm = { onConfirmPairing(confirm.confirmation) }, onCancel = onCancelPairing)
                 return@Column
             }
             PrimaryTabRow(selectedTabIndex = tab) {

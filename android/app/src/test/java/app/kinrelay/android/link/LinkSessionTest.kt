@@ -46,7 +46,7 @@ class LinkSessionTest {
         override fun onHelloAccepted(peer: Hello) { hellos.add(peer) }
         override fun onPingReceived(fromName: String) { pings.incrementAndGet() }
         override fun onPeerUnpaired() = unpaired.countDown()
-        override fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean) { texts.add(Text(fromName, id, text, isUrl)) }
+        override fun onTextReceived(fromName: String, id: String, text: String, isUrl: Boolean, sensitive: Boolean) { texts.add(Text(fromName, id, text, isUrl)) }
         override fun onClipboardReceived(id: String, text: String) { clipboards.add(id to text) }
     }
 

@@ -1,6 +1,8 @@
 package app.kinrelay.android.identity
 
+import android.os.Build
 import android.security.keystore.KeyPermanentlyInvalidatedException
+import androidx.annotation.RequiresApi
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -31,27 +33,68 @@ class CorruptKeyFileException(message: String) : GeneralSecurityException(messag
  */
 class IdentityUnavailableException(message: String, cause: Throwable? = null) : Exception(message, cause)
 
+/**
+ * Looks at an exception that sits under an `UnrecoverableKeyException`. `KeyStore.getKey()` wraps the Keystore's own
+ * errors in that exception, including temporary ones (the Keystore is busy, a system error), so the type alone doesn't
+ * say whether the key is really gone. The real probe reads `android.security.KeyStoreException`; tests pass their own.
+ */
+fun interface KeystoreCauseProbe {
+    /**
+     * Null if [error] is not a Keystore error. Otherwise true when the error may pass (or when it can't be told, so the
+     * answer is "try again"), false when the Keystore says it will never work.
+     */
+    fun transientFailure(error: Throwable): Boolean?
+}
+
+/** The real probe. `isTransientFailure()` exists from API 33; before that a Keystore error can't be judged and counts as temporary. */
+object AndroidKeystoreCauseProbe : KeystoreCauseProbe {
+    private const val KEYSTORE_EXCEPTION = "android.security.KeyStoreException"
+
+    override fun transientFailure(error: Throwable): Boolean? {
+        // Matched by name: the class is public only from API 33, and an `is` check on a missing class is not safe.
+        if (generateSequence<Class<*>>(error.javaClass) { it.superclass }.none { it.name == KEYSTORE_EXCEPTION }) return null
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) isTransient(error) else true
+    }
+
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+    private fun isTransient(error: Throwable): Boolean = (error as android.security.KeyStoreException).isTransientFailure
+}
+
 /** Sorts a failure into "this identity is lost for good" and "try again later". */
 object IdentityFailure {
     enum class Kind { UNUSABLE, TRANSIENT }
 
     /**
      * Only these mean the stored identity can never be read again: the Keystore key is gone
-     * ([KeyMissingException]), was invalidated or can't be recovered, the ciphertext doesn't verify
-     * ([AEADBadTagException]), or the file isn't in our format. Everything else (a busy or restarting
-     * Keystore, `ProviderException`, I/O errors, ...) is [Kind.TRANSIENT].
+     * ([KeyMissingException]), was invalidated, the ciphertext doesn't verify ([AEADBadTagException]), or the file
+     * isn't in our format. An [UnrecoverableKeyException] counts only when nothing under it says the Keystore had a
+     * temporary problem: it is permanent when it has no `KeyStoreException` cause, or (API 33+) when that cause's
+     * `isTransientFailure()` is false. Everything else (a busy or restarting Keystore, `ProviderException`, I/O
+     * errors, ...) is [Kind.TRANSIENT].
      */
-    fun classify(error: Throwable): Kind {
+    fun classify(error: Throwable, probe: KeystoreCauseProbe = AndroidKeystoreCauseProbe): Kind {
         var current: Throwable? = error
         var depth = 0
         while (current != null && depth++ < MAX_CAUSE_DEPTH) {
             if (current is KeyMissingException || current is CorruptKeyFileException ||
-                current is KeyPermanentlyInvalidatedException || current is UnrecoverableKeyException ||
-                current is AEADBadTagException
+                current is KeyPermanentlyInvalidatedException || current is AEADBadTagException ||
+                (current is UnrecoverableKeyException && isPermanent(current, probe))
             ) return Kind.UNUSABLE
             current = current.cause
         }
         return Kind.TRANSIENT
+    }
+
+    /** An `UnrecoverableKeyException` that may be wrapping a temporary Keystore error is not a lost key. */
+    private fun isPermanent(error: UnrecoverableKeyException, probe: KeystoreCauseProbe): Boolean {
+        var cause = error.cause
+        var depth = 0
+        while (cause != null && depth++ < MAX_CAUSE_DEPTH) {
+            val transient = probe.transientFailure(cause)
+            if (transient != null) return !transient
+            cause = cause.cause
+        }
+        return true
     }
 
     /** How long to wait before retry number [attempt] (0 based) while the identity is unavailable. */
@@ -76,6 +119,7 @@ class IdentityLoad(val identity: Identity, val replaced: String?)
 class IdentityStore(
     private val directory: File,
     private val wrapper: KeyWrapper,
+    private val keystoreProbe: KeystoreCauseProbe = AndroidKeystoreCauseProbe,
     private val writeFile: (File, ByteArray) -> Unit = ::writeAtomically,
 ) {
     private val keyFile get() = File(directory, "identity.key")
@@ -118,7 +162,7 @@ class IdentityStore(
         val pkcs8 = try {
             wrapper.decrypt(wrapped)
         } catch (e: Exception) {
-            return when (IdentityFailure.classify(e)) {
+            return when (IdentityFailure.classify(e, keystoreProbe)) {
                 IdentityFailure.Kind.UNUSABLE -> Loaded.Unusable("the key can't be decrypted for good (${e.javaClass.simpleName})")
                 IdentityFailure.Kind.TRANSIENT ->
                     throw IdentityUnavailableException("the key can't be decrypted right now: ${e.javaClass.simpleName}", e)

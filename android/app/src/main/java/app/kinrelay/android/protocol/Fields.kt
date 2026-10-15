@@ -23,6 +23,11 @@ object Fields {
     fun id(element: JsonElement?): String? =
         string(element)?.takeIf { it.isNotEmpty() && it.codePointCount(0, it.length) <= 64 }
 
+    private val PATH_ID = Regex("[A-Za-z0-9_-]{1,64}")
+
+    /** A transfer ID or file ID: it goes in a URL path, so only `A-Z a-z 0-9 - _`, 1 to 64 characters. */
+    fun isPathId(value: String): Boolean = PATH_ID.matches(value)
+
     /** A JSON integer: no quotes, sign, fraction or exponent, at most 2^53-1. */
     fun integer(element: JsonElement?): Long? {
         val primitive = element as? JsonPrimitive ?: return null

@@ -1,6 +1,13 @@
 package app.kinrelay.android.protocol
 
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+
+/** One file of an `offer`. [name] is the sender's raw name: it is cleaned only when the file is saved. */
+data class OfferFile(val fileId: String, val name: String, val size: Long, val mime: String)
+
+/** A valid `offer`. [id] is the transfer ID. */
+data class Offer(val id: String, val files: List<OfferFile>, val totalSize: Long)
 
 /** What the receiver did with a frame. [category] is the name the test vectors use. */
 sealed class Action(val category: String) {
@@ -9,8 +16,21 @@ sealed class Action(val category: String) {
     class MarkFailed(val ref: String, val code: String, val message: String) : Action("mark_failed")
     class ShowErrorOnly(val code: String, val message: String) : Action("show_error_only")
     class ShowPing(val id: String) : Action("show_ping_toast")
-    class DeliverText(val id: String, val text: String, val isUrl: Boolean) : Action("deliver_text")
+    class DeliverText(val id: String, val text: String, val isUrl: Boolean, val sensitive: Boolean) : Action("deliver_text")
     class SetClipboard(val id: String, val text: String) : Action("set_clipboard")
+
+    /** A valid `offer`, acked: download the files. */
+    class StartDownload(val offer: Offer) : Action("start_download")
+
+    /** The PC (role) got a `complete` from the phone: the transfer is done. */
+    class MarkTransferDone(val transferId: String) : Action("mark_transfer_done")
+
+    /** A `cancel`: stop the transfer and delete its partial files. Unknown transfers are ignored by whoever handles this. */
+    class CancelTransfer(val transferId: String, val reason: String) : Action("cancel_transfer")
+
+    /** An `offer` the phone can't take (no space): an `error` went out instead of the ack. */
+    class OfferRefused(val code: String) : Action("offer_refused")
+
     data object IgnoreDuplicate : Action("ignore_duplicate")
     data object RemovePeerAndClose : Action("remove_peer_and_close")
     data object CloseOnly : Action("close_only")
@@ -22,23 +42,41 @@ sealed class Action(val category: String) {
 /** Frames to send back (in order), a WebSocket close code to use, and what happened. */
 class Outcome(val replies: List<String>, val close: Int?, val action: Action)
 
+/** Which side of the connection a [MessageReceiver] stands for. The direction of a message decides whether it is a known type. */
+enum class ReceiverRole {
+    /** The real app. Accepts `clipboard` and `offer`, refuses `complete` (only the phone sends it). */
+    PHONE,
+
+    /** Stands for the PC in the shared test vectors. Accepts `complete`, refuses `clipboard` and `offer`. */
+    PC,
+}
+
 /**
  * The receiving side of the control channel for one connection: framing, validation order and
  * replies exactly as protocol.md, "Control channel". It does no I/O: the caller sends the replies,
  * closes the socket and acts on [Outcome.action].
  *
- * Milestones 1.1 and 1.2 handle `hello`, `ack`, `error`, `ping`, `unpair`, `text` and `clipboard`. The file
- * messages (`offer`, `complete`, `cancel`) are answered with `unsupported_type` until 1.3, the same as an
- * unknown type. `clipboard` only goes from the PC to the phone, so a receiver that stands for the PC
- * ([acceptsClipboard] false, used by the shared test vectors) answers it with `unsupported_type`.
+ * Handles `hello`, `ack`, `error`, `ping`, `unpair`, `text`, `clipboard` and, since 1.3, `offer`, `complete` and
+ * `cancel`. A message type that only goes the other way (`clipboard` and `offer` from the phone, `complete` from the
+ * PC) is `unsupported_type`.
+ *
+ * [offerGate] runs on a valid, new `offer` before it is acked: it returns null to accept, or an error code (the phone
+ * says `disk_full`) to send an `error` *instead of* the ack, which ends the offer's life (protocol.md, Files: PC → phone).
  */
-class MessageReceiver(private val dedup: DedupMemory, private val acceptsClipboard: Boolean = true) {
+class MessageReceiver(
+    private val dedup: DedupMemory,
+    private val role: ReceiverRole = ReceiverRole.PHONE,
+    private val offerGate: (Offer) -> String? = { null },
+) {
     var peer: Hello? = null
         private set
 
     val helloAccepted: Boolean get() = peer != null
 
-    private val handled = setOf("hello", "ack", "error", "ping", "unpair", "text", "clipboard")
+    private val handled: Set<String> = buildSet {
+        addAll(listOf("hello", "ack", "error", "ping", "unpair", "text", "cancel"))
+        if (role == ReceiverRole.PHONE) addAll(listOf("clipboard", "offer")) else add("complete")
+    }
 
     fun onBinary(): Outcome = Outcome(emptyList(), 1003, Action.CloseOnly)
 
@@ -64,8 +102,8 @@ class MessageReceiver(private val dedup: DedupMemory, private val acceptsClipboa
             return rejected(ErrorCodes.BAD_REQUEST, "Send hello first.", ref, close = 1002)
         }
 
-        // 5. Unknown, wrong-direction or not yet supported type.
-        if (type !in handled || (type == "clipboard" && !acceptsClipboard)) return rejected(ErrorCodes.UNSUPPORTED_TYPE, "Unsupported message type.", ref)
+        // 5. Unknown or wrong-direction type.
+        if (type !in handled) return rejected(ErrorCodes.UNSUPPORTED_TYPE, "Unsupported message type.", ref)
 
         return when (type) {
             "hello" -> onHello(frame, ref)
@@ -74,6 +112,9 @@ class MessageReceiver(private val dedup: DedupMemory, private val acceptsClipboa
             "ping" -> onPing(frame, ref)
             "text" -> onText(frame, ref)
             "clipboard" -> onClipboard(frame, ref)
+            "offer" -> onOffer(frame, ref)
+            "complete" -> onComplete(frame, ref)
+            "cancel" -> onCancel(frame, ref)
             else -> onUnpair(frame, ref)
         }
     }
@@ -127,10 +168,13 @@ class MessageReceiver(private val dedup: DedupMemory, private val acceptsClipboa
     private fun onText(frame: JsonObject, ref: String?): Outcome {
         val text = Fields.nonEmptyString(frame["text"])
         val isUrl = Fields.boolean(frame["isUrl"])
-        if (ref == null || text == null || isUrl == null) {
-            return rejected(ErrorCodes.BAD_REQUEST, "The text message needs an id, a non-empty text and isUrl.", ref)
+        // `sensitive` is optional: absent or null is false, anything but a boolean is invalid.
+        val rawSensitive = Fields.present(frame["sensitive"])
+        val sensitive = if (rawSensitive == null) false else Fields.boolean(rawSensitive)
+        if (ref == null || text == null || isUrl == null || sensitive == null) {
+            return rejected(ErrorCodes.BAD_REQUEST, "The text message needs an id, a non-empty text and isUrl (and sensitive, if present, must be a boolean).", ref)
         }
-        return processOnce(ref, Action.DeliverText(ref, text, isUrl))
+        return processOnce(ref, Action.DeliverText(ref, text, isUrl, sensitive))
     }
 
     private fun onClipboard(frame: JsonObject, ref: String?): Outcome {
@@ -139,6 +183,62 @@ class MessageReceiver(private val dedup: DedupMemory, private val acceptsClipboa
             return rejected(ErrorCodes.BAD_REQUEST, "The clipboard message needs an id and a non-empty text.", ref)
         }
         return processOnce(ref, Action.SetClipboard(ref, text))
+    }
+
+    private fun onOffer(frame: JsonObject, ref: String?): Outcome {
+        val offer = parseOffer(frame, ref)
+            ?: return rejected(ErrorCodes.BAD_REQUEST, "The offer needs a transfer id, at least one file (fileId, name, size, mime) and totalSize.", ref)
+        // A repeated offer gets its first response again and is not looked at again (protocol.md, de-duplication).
+        dedup.lookup(offer.id)?.let { return Outcome(listOf(it), null, Action.IgnoreDuplicate) }
+        // More than 800 files: an `error` instead of the ack, and the ID is not remembered, so a smaller offer may use it (protocol.md, Files: PC -> phone).
+        if (offer.files.size > MAX_OFFER_FILES) {
+            val error = Frames.error(ErrorCodes.TOO_LARGE, "An offer has at most $MAX_OFFER_FILES files.", offer.id)
+            return Outcome(listOf(error), null, Action.OfferRefused(ErrorCodes.TOO_LARGE))
+        }
+        val refusal = offerGate(offer)
+        if (refusal != null) {
+            // An `error` in place of the ack ends the offer's life. It is remembered like any response.
+            val error = Frames.error(refusal, "The phone can't take this transfer.", offer.id)
+            dedup.record(offer.id, error)
+            return Outcome(listOf(error), null, Action.OfferRefused(refusal))
+        }
+        return processOnce(offer.id, Action.StartDownload(offer))
+    }
+
+    private fun parseOffer(frame: JsonObject, ref: String?): Offer? {
+        val id = ref?.takeIf { Fields.isPathId(it) } ?: return null
+        val files = frame["files"] as? JsonArray ?: return null
+        val totalSize = Fields.integer(frame["totalSize"]) ?: return null
+        if (files.isEmpty()) return null
+        val parsed = ArrayList<OfferFile>(files.size)
+        val seen = HashSet<String>()
+        for (entry in files) {
+            val file = entry as? JsonObject ?: return null
+            val fileId = Fields.string(file["fileId"])?.takeIf { Fields.isPathId(it) } ?: return null
+            val name = Fields.string(file["name"]) ?: return null
+            val size = Fields.integer(file["size"]) ?: return null
+            val mime = Fields.string(file["mime"]) ?: return null
+            if (!seen.add(fileId)) return null
+            parsed += OfferFile(fileId, name, size, mime)
+        }
+        return Offer(id, parsed, totalSize)
+    }
+
+    private fun onComplete(frame: JsonObject, ref: String?): Outcome {
+        val transferId = Fields.string(frame["transferId"])?.takeIf { Fields.isPathId(it) }
+        if (ref == null || transferId == null) {
+            return rejected(ErrorCodes.BAD_REQUEST, "The complete message needs an id and a transferId.", ref)
+        }
+        return processOnce(ref, Action.MarkTransferDone(transferId))
+    }
+
+    private fun onCancel(frame: JsonObject, ref: String?): Outcome {
+        val transferId = Fields.string(frame["transferId"])?.takeIf { Fields.isPathId(it) }
+        val reason = Fields.string(frame["reason"])
+        if (ref == null || transferId == null || reason == null) {
+            return rejected(ErrorCodes.BAD_REQUEST, "The cancel message needs an id, a transferId and a reason.", ref)
+        }
+        return processOnce(ref, Action.CancelTransfer(transferId, reason))
     }
 
     private fun onUnpair(frame: JsonObject, ref: String?): Outcome {

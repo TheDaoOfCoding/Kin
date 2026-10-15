@@ -30,3 +30,6 @@ fun JsonObject.cases(name: String): List<JsonObject> = getValue(name).jsonArray.
 fun JsonObject.string(name: String): String? = (this[name] as? JsonPrimitive)?.takeIf { it.isString }?.content
 
 fun JsonObject.array(name: String): JsonArray = getValue(name).jsonArray
+
+/** Parses JSON text (a request body the phone sent). */
+fun Vectors.parse(text: String): JsonElement = Json.parseToJsonElement(text)

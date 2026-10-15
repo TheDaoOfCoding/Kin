@@ -12,6 +12,8 @@
     <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Held only while file bytes move, and let go at once (architecture.md, "Battery rules for the phone"). -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- No backup: identity keys and paired devices must not be restored to another device. -->
     <application
@@ -59,11 +61,15 @@
                 <data android:path="/pair" />
                 <data android:path="/pair/" />
             </intent-filter>
+            <!-- The direct-share target (the paired PC in the share sheet's top row): see ShareShortcuts. -->
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
         </activity>
 
         <!--
-            Share sheet: text only for now (files come in 1.3). No UI: it hands the text to the sender and finishes.
-            Exported on purpose: any app may offer text to Kin, and the user picks Kin in the share sheet.
+            Share sheet: text and files of any type, one or many. No UI: it hands them to the sender and finishes.
+            Exported on purpose: any app may offer text or files to Kin, and the user picks Kin in the share sheet (risk R13).
         -->
         <activity
             android:name=".share.ShareActivity"
@@ -73,10 +79,11 @@
             android:theme="@style/Theme.Kin.Transparent">
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
 
                 <category android:name="android.intent.category.DEFAULT" />
 
-                <data android:mimeType="text/plain" />
+                <data android:mimeType="*/*" />
             </intent-filter>
         </activity>
 
@@ -123,6 +130,11 @@
             android:name=".link.LinkService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <!-- The Cancel and Retry buttons of the transfer notifications. Only our own PendingIntents reach it. -->
+        <receiver
+            android:name=".transfer.TransferActionReceiver"
+            android:exported="false" />
 
         <receiver
             android:name=".link.BootReceiver"

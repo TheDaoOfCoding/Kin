@@ -4,13 +4,15 @@ import android.content.Context
 import android.content.Intent
 import android.os.SystemClock
 import app.kinrelay.android.AppGraph
+import app.kinrelay.android.transfer.PeerInfo
+import app.kinrelay.android.transfer.TransferLink
 import app.kinrelay.android.ui.UiText
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
 /** How the UI and the debug hooks talk to the running service, which may or may not exist. */
-class LinkController(private val graph: AppGraph) : OutgoingLink {
+class LinkController(private val graph: AppGraph) : OutgoingLink, TransferLink {
     @Volatile var runtime: LinkRuntime? = null
 
     val state = MutableStateFlow<LinkState>(LinkState.Stopped)
@@ -50,11 +52,16 @@ class LinkController(private val graph: AppGraph) : OutgoingLink {
      * and waits up to [waitMillis]. It gives up early when waiting can't help (no permission, the PC doesn't
      * trust this phone, versions differ).
      */
-    override suspend fun await(waitMillis: Long): LinkConnection? {
+    override suspend fun await(waitMillis: Long): LinkConnection? = connection(waitMillis, kick = true)
+
+    /** [await], but with [kick] false it only waits (a transfer waiting for the PC to come back must not reset the backoff). */
+    override suspend fun connection(waitMillis: Long, kick: Boolean): LinkConnection? {
         readySession()?.let { return it }
         if (graph.pairedDevice() == null) return null
-        ensureRunning(graph.appContext)
-        userAction()
+        if (kick) {
+            ensureRunning(graph.appContext)
+            userAction()
+        }
         val deadline = SystemClock.elapsedRealtime() + waitMillis
         while (true) {
             readySession()?.let { return it }
@@ -69,11 +76,15 @@ class LinkController(private val graph: AppGraph) : OutgoingLink {
 
     override suspend fun peerName(): String? = graph.pairedDevice()?.name
 
+    override suspend fun peer(): PeerInfo? = graph.pairedDevice()?.let { PeerInfo(it.deviceId, it.name) }
+
     /** Removes the PC here first, then tells it if connected (protocol.md, "Unpair"), then stops the service. */
     suspend fun unpair(context: Context) {
         val device = graph.pairedDevice() ?: return
         graph.log.i("link", "unpairing from '${device.name}'")
         graph.database.devices().delete(device.deviceId)
+        // Transfers with this PC end here: nothing of them may go to a PC that is paired later.
+        graph.transfers.onUnpaired(device.deviceId)
         runtime?.currentSession?.sendUnpairAndClose()
         context.stopService(Intent(context, LinkService::class.java))
         mutableLastPing.value = null

@@ -10,6 +10,8 @@ import app.kinrelay.android.protocol.UrlRules
  * - `clipboard`: set the clipboard, silently. Not stored, not shown. The log gets a length and a hash.
  * - `text`: set the clipboard and post "Text from <PC>" with a preview; a link gets an Open action.
  *   History comes in 1.4, so for now the de-duplication memory is all that remembers it.
+ * - `text` with `sensitive` (the PC saw a password manager): the clipboard is set and marked sensitive, the notification has no
+ *   preview and no Open action, and nothing about the text is logged, not even its hash. It is never stored.
  */
 class IncomingHandler(
     private val clipboard: ClipboardPort,
@@ -24,12 +26,17 @@ class IncomingHandler(
         if (!written) tellNotCopied()
     }
 
-    suspend fun onText(fromName: String, id: String, text: String, isUrl: Boolean) {
+    suspend fun onText(fromName: String, id: String, text: String, isUrl: Boolean, sensitive: Boolean = false) {
         guard.notePeerSet(text)
-        val written = write(text, sensitive = false)
-        val openUrl = if (isUrl) UrlRules.httpUrl(text) else null
-        alerts.textFrom(fromName, id, text, openUrl)
-        log.i("link", "text from '$fromName' ${ClipboardGuard.fingerprint(text)} isUrl=$isUrl openable=${openUrl != null} written=$written")
+        val written = write(text, sensitive = sensitive)
+        if (sensitive) {
+            alerts.textFrom(fromName, id, text = null, openUrl = null)
+            log.i("link", "sensitive text from '$fromName' written=$written (its content is not logged)")
+        } else {
+            val openUrl = if (isUrl) UrlRules.httpUrl(text) else null
+            alerts.textFrom(fromName, id, text, openUrl)
+            log.i("link", "text from '$fromName' ${ClipboardGuard.fingerprint(text)} isUrl=$isUrl openable=${openUrl != null} written=$written")
+        }
         if (!written) tellNotCopied()
     }
 

@@ -1,9 +1,11 @@
 package app.kinrelay.android.link
 
 import android.app.Service
+import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.Uri
 import android.os.IBinder
 import android.provider.Settings
 import androidx.core.app.ServiceCompat
@@ -97,6 +99,24 @@ class LinkService : Service() {
     }
 
     companion object {
+        /**
+         * Starts the service (a visible activity may) and gives it read access to [uris] with `FLAG_GRANT_READ_URI_PERMISSION`.
+         * A share only grants access to the activity that receives it; the share activity finishes at once, and a grant held by the
+         * service outlives it. The service itself ignores the payload: the grant is the point.
+         */
+        fun startWithGrant(context: Context, uris: List<Uri>) {
+            if (uris.isEmpty()) return start(context)
+            val intent = Intent(context, LinkService::class.java).apply {
+                clipData = ClipData.newRawUri("shared files", uris[0]).also { clip -> uris.drop(1).forEach { clip.addItem(ClipData.Item(it)) } }
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            try {
+                ContextCompat.startForegroundService(context, intent)
+            } catch (e: Exception) {
+                context.graph.log.e("service", "start with files refused: ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }
+
         /** Starts the service. Allowed from a visible activity and from a boot broadcast. */
         fun start(context: Context) {
             try {
