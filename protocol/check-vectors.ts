@@ -536,9 +536,24 @@ function validateFields(type: string, o: any, badInts: Set<string>): boolean {
 
 class Receiver {
   state: "before_hello" | "open";
+  // processed message IDs, per paired PC (`device|id`), as the database remembers them
   seen = new Set<string>();
+  // offers by transfer ID, shared by all paired PCs: who made it, how its download stands, and its files (`fileId:size`, sorted)
+  offers = new Map<string, { device: string; how: "unfinished" | "done" | "canceled" | "failed"; files: string }>();
+  // the paired PC on this connection
+  device = "first";
   constructor(public role: Role, state: "before_hello" | "open") {
     this.state = state;
+  }
+  // a new connection: the state starts again, the memory of IDs stays (it is stored in the database). `device`: the connection is from
+  // another paired PC.
+  reconnect(device?: string) {
+    this.state = "before_hello";
+    if (device !== undefined) this.device = device;
+  }
+  transferOver(transferId: string, how: "done" | "canceled" | "failed") {
+    const offer = this.offers.get(transferId);
+    if (offer) offer.how = how;
   }
   receive(from: Role, input: any): Outcome {
     const fb = frameBytes(input);
@@ -587,8 +602,21 @@ class Receiver {
     if (type === "error") return { reply: "none", action: o.ref ? "mark_failed" : "show_error_only", close: null };
     if (!ACKED.has(type)) return { reply: "none", action: ACTION[type], close: null };
     // step 8
-    if (this.seen.has(o.id)) return { reply: "ack", ref: o.id, action: "ignore_duplicate", close: null };
-    this.seen.add(o.id);
+    const seenKey = `${this.device}|${o.id}`;
+    if (type === "offer") {
+      // changelog 52: the same paired PC repeating its own offer is a repeat WHATEVER the state of the download (acked with the first
+      // response, nothing downloaded again). Any other reuse is bad_request with ref = the offer id: an offer of another PC, the id of any
+      // other message, and (optional) a repeat that lists other fileIds or sizes.
+      const known = this.offers.get(o.id);
+      if (known && known.device !== this.device) return bad(ref);
+      const files = o.files.map((f: any) => `${f.fileId}:${f.size}`).sort().join(",");
+      if (known) return known.files === files ? { reply: "ack", ref: o.id, action: "ignore_duplicate", close: null } : bad(ref);
+      if (this.seen.has(seenKey)) return bad(ref);
+      this.offers.set(o.id, { device: this.device, how: "unfinished", files });
+    } else if (this.seen.has(seenKey)) {
+      return { reply: "ack", ref: o.id, action: "ignore_duplicate", close: null };
+    }
+    this.seen.add(seenKey);
     return { reply: "ack", ref: o.id, action: ACTION[type], close: type === "unpair" ? 1000 : null, ...(type === "text" ? { sensitive: o.sensitive === true } : {}) };
   }
 }
@@ -930,6 +958,18 @@ function checkResponse(group: string, name: string, expected: any, actual: Reply
   for (const s of d.sequences) {
     const rx: Record<Role, Receiver> = { phone: new Receiver("phone", "before_hello"), pc: new Receiver("pc", "before_hello") };
     s.steps.forEach((st: any, i: number) => {
+      // local events, not frames: a new connection (the receivers are before_hello again, their memory of IDs stays) and the end of a transfer
+      if (st.event !== undefined) {
+        check(g, `sequence ${s.name} step ${i + 1}: a known event`, ["reconnect", "transfer_over"].includes(st.event), () => String(st.event));
+        for (const r of Object.values(rx)) {
+          if (st.event === "reconnect") r.reconnect(st.device);
+          else {
+            check(g, `sequence ${s.name} step ${i + 1}: transfer_over has a transferId and how`, typeof st.transferId === "string" && ["done", "canceled", "failed"].includes(st.how));
+            r.transferOver(st.transferId, st.how);
+          }
+        }
+        return;
+      }
       const to: Role = st.from === "pc" ? "phone" : "pc";
       // each role has its own receiver state, and the first message a role receives is its peer's hello
       const out = rx[to].receive(st.from, st);
@@ -1300,6 +1340,50 @@ function receiverModel(frame: any) {
   }
   for (const f of ["urls.json", "text-rules.json"]) check(g, `${f} exists`, Object.keys(load(f)).length > 0);
   console.log(`milestone 1.3 scope: ${inScope} cases in messages.json and http.json, plus file-names.json, urls.json and text-rules.json`);
+}
+
+// ---- milestone 1.4 scope (queue, and the reviewer's rulings on 1.3). Same rule as for the other milestones: every name in
+// protocol/README.md must match a case. The `transfer-id-*` sequences are also in the 1.3 pattern list above (they come with it).
+{
+  const g = "scope-1.4";
+  const messages = load("messages.json");
+  const http = load("http.json");
+  const matches = (name: string, p: string) => (p.endsWith("*") ? name.startsWith(p.slice(0, -1)) : name === p);
+  const SCOPE: [string, any[], string[], number][] = [
+    ["messages.sequences", messages.sequences, ["offer-reusing-*", "offer-from-another-device-is-bad-request", "offer-repeated-while-unfinished-is-acked-after-a-reconnect", "same-pc-repeat-*", "complete-re-sent-*", "cancel-re-sent-*", "queue-*"], 10],
+    ["http.sequences", http.sequences, ["transfer-id-window-*", "transfer-id-retry-after-404-sends-only-the-missing-files"], 3],
+  ];
+  let inScope = 0;
+  for (const [label, cases, patterns, atLeast] of SCOPE) {
+    for (const p of patterns) check(g, `${label}: "${p}" matches a case`, cases.some((c) => matches(c.name, p)));
+    const hits = cases.filter((c) => patterns.some((p) => matches(c.name, p)));
+    inScope += hits.length;
+    check(g, `${label}: at least ${atLeast} cases in scope`, hits.length >= atLeast, () => String(hits.length));
+  }
+  // the window sequences have a clock step of exactly 24 hours in total after the done time
+  for (const s of http.sequences.filter((s: any) => s.name.startsWith("transfer-id-window-"))) {
+    const hours = s.steps.filter((st: any) => st.clock).reduce((n: number, st: any) => n + st.clock.advanceHours, 0);
+    check(g, `${s.name}: the clock moves exactly 24 hours in all`, hours === 24, () => String(hours));
+  }
+  // an offer that reuses an id is an error with ref = the offer id; a repeat that is not a reuse is an ack
+  for (const s of messages.sequences.filter((s: any) => /^(offer-re|offer-from-|same-pc-repeat-)/.test(s.name))) {
+    const reused = s.steps.filter((st: any) => st.expect?.reply === "error");
+    for (const st of reused) check(g, `${s.name}: a reused offer id answers bad_request with ref = its id`, st.expect.code === "bad_request" && st.expect.ref === st.frame.id && st.frame.type === "offer");
+  }
+  // changelog 52: a repeat from the same PC after the download is over (done, canceled or failed) is acked, never bad_request. Both sequences
+  // end the download with a transfer_over event and reconnect before the repeat.
+  for (const [name, how] of [["same-pc-repeat-after-done-is-acked", ["done"]], ["same-pc-repeat-after-canceled-is-acked", ["canceled", "failed"]]] as [string, string[]][]) {
+    const s = messages.sequences.find((s: any) => s.name === name);
+    check(g, `${name}: exists`, s !== undefined);
+    if (!s) continue;
+    const ends = s.steps.filter((st: any) => st.event === "transfer_over").map((st: any) => st.how);
+    check(g, `${name}: ends the download with ${how.join(" and ")}`, how.every((h) => ends.includes(h)), () => ends.join(","));
+    check(g, `${name}: reconnects`, s.steps.some((st: any) => st.event === "reconnect"));
+    const repeats = s.steps.filter((st: any) => st.expect?.action === "ignore_duplicate");
+    check(g, `${name}: the repeats are acked as duplicates`, repeats.length >= how.length && repeats.every((st: any) => st.expect.reply === "ack" && st.expect.ref === st.frame.id));
+  }
+  check(g, "the old offer-reused-after-it-is-over sequence is gone", !messages.sequences.some((s: any) => s.name === "offer-reused-after-it-is-over-is-bad-request"));
+  console.log(`milestone 1.4 scope: ${inScope} sequences in messages.json and http.json`);
 }
 
 // ---- fixtures/: DER certificates for the negative tls[] cases (made by fixtures/make-fixtures.ts)
