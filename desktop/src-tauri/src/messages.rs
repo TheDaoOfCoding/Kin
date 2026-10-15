@@ -4,7 +4,7 @@
 //! touches a socket or the UI, so the vectors in `protocol/messages.json` drive it directly.
 use serde_json::{Map, Value, json};
 
-use crate::json::{self, non_empty_str, uint, valid_id};
+use crate::json::{self, is_url_safe_id, non_empty_str, uint, valid_id};
 
 pub const PROTOCOL: u64 = 1;
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
@@ -47,11 +47,27 @@ pub enum Action {
     },
     ShowErrorOnly,
     ShowPingToast,
-    /// A `text` message: put it on the clipboard and show it. (History comes in 1.4.)
+    /// A `text` message: put it on the clipboard and show it. (History comes in 1.4.) `sensitive`: no preview, never stored or logged.
     DeliverText {
         id: String,
         text: String,
         is_url: bool,
+        sensitive: bool,
+    },
+    /// An `offer` (PC to phone only): download the files. The PC never receives one (it answers `unsupported_type`), but the
+    /// receiver implements both roles so the vectors can run on it.
+    StartDownload {
+        id: String,
+        files: Vec<OfferedFile>,
+    },
+    /// A `complete` message (phone to PC): the phone has all the files of this offer.
+    MarkTransferDone {
+        transfer_id: String,
+    },
+    /// A `cancel` message, from either side.
+    CancelTransfer {
+        transfer_id: String,
+        reason: String,
     },
     /// A `clipboard` message (PC to phone only): set the clipboard silently, no notification, no history. The PC never
     /// receives one (it answers `unsupported_type`), but the receiver implements both roles so the vectors can run on it.
@@ -76,11 +92,23 @@ impl Action {
             Action::ShowPingToast => "show_ping_toast",
             Action::DeliverText { .. } => "deliver_text",
             Action::SetClipboard { .. } => "set_clipboard",
+            Action::StartDownload { .. } => "start_download",
+            Action::MarkTransferDone { .. } => "mark_transfer_done",
+            Action::CancelTransfer { .. } => "cancel_transfer",
             Action::RemovePeerAndClose => "remove_peer_and_close",
             Action::IgnoreDuplicate => "ignore_duplicate",
             Action::CloseOnly => "close_only",
         })
     }
+}
+
+/// A file of an `offer`, as offered. The name is raw: the receiver cleans it when it saves.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct OfferedFile {
+    pub file_id: String,
+    pub name: String,
+    pub size: u64,
+    pub mime: String,
 }
 
 #[derive(Debug)]
@@ -150,11 +178,6 @@ fn receivable(role: Role, ty: &str) -> bool {
     }
 }
 
-/// Types that exist in v1 but whose handlers come in a later milestone (1.3).
-fn handled_in_later_milestone(ty: &str) -> bool {
-    matches!(ty, "offer" | "complete" | "cancel")
-}
-
 impl Receiver {
     pub fn new(role: Role) -> Self {
         Receiver { role, state: State::BeforeHello, peer: None }
@@ -215,10 +238,7 @@ impl Receiver {
             "hello" => self.hello(&obj, reference),
             "ack" => ack(&obj),
             "error" => error(&obj),
-            "ping" | "unpair" | "text" | "clipboard" => self.acked(ty, &obj, reference, dedup),
-            t if handled_in_later_milestone(t) => {
-                Outcome::error("unsupported_type", "This version of the app doesn't handle that yet.", reference, None)
-            }
+            "ping" | "unpair" | "text" | "clipboard" | "offer" | "complete" | "cancel" => self.acked(ty, &obj, reference, dedup),
             _ => unreachable!("receivable() only lets known types through"),
         }
     }
@@ -254,8 +274,35 @@ impl Receiver {
         let new_action = match ty {
             "ping" if obj.get("sentAt").and_then(uint).is_some() => Action::ShowPingToast,
             "unpair" => Action::RemovePeerAndClose,
-            "text" => match (non_empty_str(obj, "text"), obj.get("isUrl").and_then(Value::as_bool)) {
-                (Some(text), Some(is_url)) => Action::DeliverText { id: id.to_string(), text: text.to_string(), is_url },
+            "text" => {
+                // `sensitive` is optional: absent and `null` are false, anything but a boolean is invalid.
+                let sensitive = match obj.get("sensitive") {
+                    None | Some(Value::Null) => Some(false),
+                    Some(Value::Bool(b)) => Some(*b),
+                    Some(_) => None,
+                };
+                match (non_empty_str(obj, "text"), obj.get("isUrl").and_then(Value::as_bool), sensitive) {
+                    (Some(text), Some(is_url), Some(sensitive)) => {
+                        Action::DeliverText { id: id.to_string(), text: text.to_string(), is_url, sensitive }
+                    }
+                    _ => return bad_fields(reference),
+                }
+            }
+            "offer" => match parse_offer(obj, id) {
+                // More files than an offer may hold: rejected like any other offer the receiver can't take (`error`, no ack, nothing
+                // remembered). The PC splits a bigger send into several offers, so a phone never sees one.
+                Some(files) if files.len() > MAX_OFFER_FILES => {
+                    return Outcome::error("too_large", "An offer can have at most 800 files.", reference, None);
+                }
+                Some(files) => Action::StartDownload { id: id.to_string(), files },
+                None => return bad_fields(reference),
+            },
+            "complete" => match transfer_id_of(obj) {
+                Some(transfer_id) => Action::MarkTransferDone { transfer_id },
+                None => return bad_fields(reference),
+            },
+            "cancel" => match (transfer_id_of(obj), obj.get("reason").and_then(Value::as_str)) {
+                (Some(transfer_id), Some(reason)) => Action::CancelTransfer { transfer_id, reason: reason.to_string() },
                 _ => return bad_fields(reference),
             },
             "clipboard" => match non_empty_str(obj, "text") {
@@ -273,6 +320,44 @@ impl Receiver {
         dedup.remember(id, &reply.to_string());
         Outcome { reply: Some(reply), action: new_action, close: is_unpair.then_some(CLOSE_NORMAL) }
     }
+}
+
+/// The most files one `offer` may carry (protocol.md, "Files: PC -> phone"). The message has to stay under 1 MiB: a file takes about 100
+/// bytes plus its name, and a name of 255 characters is at most 765 bytes in UTF-8, so 800 files are under 700 KB even with the longest
+/// names. A receiver rejects an offer over it with `error` `too_large`.
+pub const MAX_OFFER_FILES: usize = 800;
+
+/// `transferId` of `complete` and `cancel`: 1 to 64 characters of `A-Z a-z 0-9 - _`, as it goes in URLs.
+fn transfer_id_of(obj: &Map<String, Value>) -> Option<String> {
+    let t = obj.get("transferId")?.as_str()?;
+    is_url_safe_id(t).then(|| t.to_string())
+}
+
+/// The fields of an `offer`: the transfer ID (the message `id`, which also ends up in URLs), `files` with at least one entry, each
+/// with a URL-safe unique `fileId`, a `name` (any string, even empty), an integer `size` and a `mime`, and the integer `totalSize`,
+/// which is only informational.
+fn parse_offer(obj: &Map<String, Value>, id: &str) -> Option<Vec<OfferedFile>> {
+    if !is_url_safe_id(id) {
+        return None;
+    }
+    uint(obj.get("totalSize")?)?;
+    let files = obj.get("files")?.as_array().filter(|f| !f.is_empty())?;
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(files.len());
+    for f in files {
+        let f = f.as_object()?;
+        let file_id = f.get("fileId")?.as_str().filter(|s| is_url_safe_id(s))?;
+        if !seen.insert(file_id) {
+            return None;
+        }
+        out.push(OfferedFile {
+            file_id: file_id.to_string(),
+            name: f.get("name")?.as_str()?.to_string(),
+            size: uint(f.get("size")?)?,
+            mime: f.get("mime")?.as_str()?.to_string(),
+        });
+    }
+    Some(out)
 }
 
 fn bad_fields(reference: Option<&str>) -> Outcome {

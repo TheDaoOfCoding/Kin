@@ -19,11 +19,37 @@ pub struct Config {
     pub dev_print_pair_url: bool,
     /// Don't create windows or show toasts. A toast is logged instead.
     pub dev_no_windows: bool,
+    /// Developer setting: received files go here instead of `Downloads\Kin` (and instead of `receivedFolder` of settings.json), so
+    /// a test never writes to the real Downloads folder.
+    pub dev_received_dir: Option<PathBuf>,
+    /// Developer hook: pretend the disk has this many free bytes (the check for `507 disk_full` uses it).
+    pub dev_free_bytes: Option<u64>,
 }
 
 impl Config {
     pub fn new(data_dir: PathBuf) -> Config {
-        Config { data_dir, dev_bind: None, dev_qr_address: None, dev_port: None, dev_print_pair_url: false, dev_no_windows: false }
+        Config {
+            data_dir,
+            dev_bind: None,
+            dev_qr_address: None,
+            dev_port: None,
+            dev_print_pair_url: false,
+            dev_no_windows: false,
+            dev_received_dir: None,
+            dev_free_bytes: None,
+        }
+    }
+
+    /// Whether the app was started with any developer setting. The developer clipboard commands (`--dev-set-clipboard`,
+    /// `--dev-get-clipboard`) are honoured only then: in a normal run any other program could launch `Kin.exe` with them.
+    pub fn dev_hooks_enabled(&self) -> bool {
+        self.dev_bind.is_some()
+            || self.dev_qr_address.is_some()
+            || self.dev_port.is_some()
+            || self.dev_print_pair_url
+            || self.dev_no_windows
+            || self.dev_received_dir.is_some()
+            || self.dev_free_bytes.is_some()
     }
 
     /// Any developer address setting means loopback only.
@@ -58,6 +84,12 @@ pub enum Command {
     DevSetClipboard { text: String, mark: Option<Exclusion> },
     /// Developer hook: write the PC clipboard text to `dev-clipboard.txt` in the data directory.
     DevGetClipboard,
+    /// Send these files to the phone: Explorer's "Send to" (`Kin.exe --send <paths>`), the same as dropping them on the drop window.
+    Send(Vec<PathBuf>),
+    /// Open the drop window, like the tray's left click.
+    Drop,
+    /// Cancel every transfer that is going, in both directions: what the Cancel button of the drop window does for each row.
+    CancelTransfers,
     /// Quit.
     Quit,
 }
@@ -72,6 +104,9 @@ impl Command {
             Command::SendClipboard => "send clipboard",
             Command::DevSetClipboard { .. } => "dev set clipboard",
             Command::DevGetClipboard => "dev get clipboard",
+            Command::Send(_) => "send files",
+            Command::Drop => "drop window",
+            Command::CancelTransfers => "cancel transfers",
             Command::Quit => "quit",
         }
     }
@@ -112,10 +147,12 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
     let mut dev_port = env("KIN_DEV_PORT");
     let mut print_url = truthy(env("KIN_DEV_PRINT_PAIR_URL"));
     let mut no_windows = truthy(env("KIN_DEV_NO_WINDOWS"));
+    let mut received_dir = env("KIN_DEV_RECEIVED_DIR").map(PathBuf::from);
+    let mut free_bytes = env("KIN_DEV_FREE_BYTES");
     let (mut commands, mut unknown) = (Vec::new(), Vec::new());
     let mut mark: Option<Exclusion> = None;
 
-    let mut it = args.iter();
+    let mut it = args.iter().peekable();
     while let Some(arg) = it.next() {
         let (name, inline) = match arg.split_once('=') {
             Some((n, v)) if n.starts_with("--") => (n, Some(v.to_string())),
@@ -131,6 +168,18 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
             "--dev-port" => dev_port = Some(value(name)?),
             "--dev-print-pair-url" => print_url = true,
             "--dev-no-windows" => no_windows = true,
+            "--dev-received-dir" => received_dir = Some(PathBuf::from(value(name)?)),
+            "--dev-free-bytes" => free_bytes = Some(value(name)?),
+            "--drop" => commands.push(Command::Drop),
+            "--cancel-transfers" => commands.push(Command::CancelTransfers),
+            // Every argument up to the next flag is a path: Explorer's "Send to" appends the selected files to the shortcut.
+            "--send" => {
+                let mut paths: Vec<PathBuf> = inline.clone().map(PathBuf::from).into_iter().collect();
+                while let Some(next) = it.next_if(|a| !a.starts_with("--")) {
+                    paths.push(PathBuf::from(next));
+                }
+                commands.push(Command::Send(paths));
+            }
             "--ping" => commands.push(Command::Ping),
             "--pair" => commands.push(Command::Pair),
             "--dev-start-pairing" => commands.push(Command::StartPairing),
@@ -186,7 +235,24 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
     }
     config.dev_print_pair_url = print_url;
     config.dev_no_windows = no_windows;
+    config.dev_received_dir = received_dir;
+    if let Some(v) = free_bytes {
+        config.dev_free_bytes = Some(v.parse().map_err(|_| format!("--dev-free-bytes: {v:?} is not a number of bytes"))?);
+    }
     Ok(Parsed { config, commands, unknown })
+}
+
+/// A second launch passes its working directory along. A relative path in `--send` is relative to that.
+pub fn resolve_paths(commands: &mut [Command], cwd: &std::path::Path) {
+    for c in commands {
+        if let Command::Send(paths) = c {
+            for p in paths.iter_mut() {
+                if p.is_relative() {
+                    *p = cwd.join(&p);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -274,8 +340,57 @@ mod tests {
 
     #[test]
     fn unknown_arguments_are_reported_not_fatal() {
-        let p = parse(&args("--data-dir x --send C:\\a.txt"), &no_env).unwrap();
-        assert_eq!(p.unknown, ["--send", "C:\\a.txt"]);
+        let p = parse(&args("--data-dir x --whatever C:\\a.txt"), &no_env).unwrap();
+        assert_eq!(p.unknown, ["--whatever", "C:\\a.txt"]);
         assert!(parse(&args("--data-dir"), &no_env).is_err());
+    }
+
+    #[test]
+    fn send_takes_every_path_up_to_the_next_flag() {
+        let p = parse(&args("--data-dir x --send C:\\a.txt D:\\b.jpg --ping"), &no_env).unwrap();
+        assert_eq!(p.commands, [Command::Send(vec!["C:\\a.txt".into(), "D:\\b.jpg".into()]), Command::Ping]);
+        let p = parse(&args("--data-dir x --send"), &no_env).unwrap();
+        assert_eq!(p.commands, [Command::Send(vec![])]);
+        let argv = vec!["--data-dir".to_string(), "x".to_string(), "--send".to_string(), "C:\\with space\\a b.txt".to_string()];
+        assert_eq!(parse(&argv, &no_env).unwrap().commands, [Command::Send(vec!["C:\\with space\\a b.txt".into()])]);
+    }
+
+    #[test]
+    fn cancel_transfers_is_a_command() {
+        let p = parse(&args("--data-dir x --cancel-transfers"), &no_env).unwrap();
+        assert_eq!(p.commands, [Command::CancelTransfers]);
+        assert_eq!(Command::CancelTransfers.name(), "cancel transfers");
+    }
+
+    #[test]
+    fn relative_paths_of_a_second_launch_are_relative_to_its_directory() {
+        let mut commands = vec![Command::Send(vec!["a.txt".into(), "C:\\abs.txt".into()])];
+        resolve_paths(&mut commands, std::path::Path::new("D:\\work"));
+        assert_eq!(commands, [Command::Send(vec!["D:\\work\\a.txt".into(), "C:\\abs.txt".into()])]);
+    }
+
+    #[test]
+    fn the_developer_clipboard_hooks_need_a_developer_setting() {
+        let normal = parse(&args("--data-dir x"), &no_env).unwrap().config;
+        assert!(!normal.dev_hooks_enabled());
+        for flag in [
+            "--dev-bind 127.0.0.1",
+            "--dev-no-windows",
+            "--dev-print-pair-url",
+            "--dev-port 5",
+            "--dev-received-dir C:\\r",
+            "--dev-free-bytes 5",
+            "--dev-qr-address 10.0.2.2",
+        ] {
+            assert!(parse(&args(&format!("--data-dir x {flag}")), &no_env).unwrap().config.dev_hooks_enabled(), "{flag}");
+        }
+    }
+
+    #[test]
+    fn the_new_developer_settings() {
+        let p = parse(&args("--data-dir x --dev-received-dir D:\\recv --dev-free-bytes 1048576"), &no_env).unwrap();
+        assert_eq!(p.config.dev_received_dir, Some(PathBuf::from("D:\\recv")));
+        assert_eq!(p.config.dev_free_bytes, Some(1_048_576));
+        assert!(parse(&args("--data-dir x --dev-free-bytes lots"), &no_env).is_err());
     }
 }

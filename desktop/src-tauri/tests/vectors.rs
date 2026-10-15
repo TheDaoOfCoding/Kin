@@ -1,7 +1,8 @@
 //! The vectors in `protocol/` that are in scope for milestones 1.1 and 1.2 (see protocol/README.md, "What each milestone
 //! needs"), run against the real code: the encodings, the certificate profile, the pairing URL, the error table, the WebSocket
-//! receiver (1.2 adds the `text` and `clipboard` cases) and the HTTP endpoints (in-process, without TLS: the TLS cases are in
-//! `tls_vectors.rs`).
+//! receiver (1.2 adds the `text` and `clipboard` cases, 1.3 the `offer`, `complete` and `cancel` ones and the `sensitive` flag) and
+//! the pairing endpoints (in-process, without TLS: the TLS cases are in `tls_vectors.rs`). The 1.3 transfers, file names, URLs and
+//! text rules are in `transfer_vectors.rs`.
 mod common;
 
 use std::collections::HashMap;
@@ -220,6 +221,10 @@ fn check_outcome(name: &str, out: &messages::Outcome, expect: &Value, frame_id: 
     if let Some(action) = expect.get("action").and_then(Value::as_str) {
         assert_eq!(out.action.vector_name(), Some(action), "{name}: action");
     }
+    // A text that is delivered says whether it is sensitive: `expect.sensitive`, false when the case doesn't say.
+    if let messages::Action::DeliverText { sensitive, .. } = &out.action {
+        assert_eq!(*sensitive, expect["sensitive"].as_bool().unwrap_or(false), "{name}: sensitive");
+    }
 }
 
 fn run_message_case(case: &Value) {
@@ -280,12 +285,36 @@ const MESSAGES_SEQUENCE_SCOPE: &[&str] = &[
 /// `text-valid-surrogate-pair-escape` are among the `text-*` ones.) The `offer`, `complete` and `cancel` cases and
 /// `duplicate-offer-is-acked-not-restarted` are 1.3.
 const MESSAGES_VALID_SCOPE_1_2: &[&str] = &["text-*", "clipboard-*", "duplicate-keys-*"];
+/// Milestone 1.3: the transfer messages. (The `text-sensitive-*` cases are among the `text-*` ones above.)
+const MESSAGES_VALID_SCOPE_1_3: &[&str] = &["offer-*", "complete-*", "cancel-*"];
+const MESSAGES_INVALID_SCOPE_1_3: &[&str] = &["offer-*", "complete-*", "cancel-*"];
+const MESSAGES_SEQUENCE_SCOPE_1_3: &[&str] = &["duplicate-offer-is-acked-not-restarted"];
 const MESSAGES_INVALID_SCOPE_1_2: &[&str] = &["text-*", "clipboard-*"];
 const MESSAGES_SEQUENCE_SCOPE_1_2: &[&str] =
     &["handshake-then-text-then-duplicate", "invalid-message-keeps-connection-open", "rejected-message-id-is-not-remembered"];
 
 fn with(a: &[&'static str], b: &[&'static str]) -> Vec<&'static str> {
     a.iter().chain(b).copied().collect()
+}
+
+/// The 1.3 message cases are in the runs above. This pins how many there are and that the sensitive flag is covered, so a dropped
+/// vector is noticed here.
+#[test]
+fn messages_1_3_scope_is_what_the_readme_says() {
+    let root = load("messages.json");
+    for (key, scope, at_least) in [
+        ("valid", MESSAGES_VALID_SCOPE_1_3, 12),
+        ("invalid", MESSAGES_INVALID_SCOPE_1_3, 27),
+        ("sequences", MESSAGES_SEQUENCE_SCOPE_1_3, 1),
+    ] {
+        assert_patterns_match(key, scope, &names(&root[key]));
+        let n = root[key].as_array().unwrap().iter().filter(|c| matches(c["name"].as_str().unwrap(), scope)).count();
+        assert!(n >= at_least, "messages.json {key}[]: {n} cases in the 1.3 scope, expected at least {at_least}");
+    }
+    let sensitive = names(&root["valid"]).into_iter().filter(|n| n.starts_with("text-sensitive-")).count();
+    assert!(sensitive >= 6, "the sensitive flag has {sensitive} valid cases");
+    let bad = names(&root["invalid"]).into_iter().filter(|n| n.starts_with("text-sensitive-")).count();
+    assert!(bad >= 5, "the sensitive flag has {bad} invalid cases");
 }
 
 fn names(cases: &Value) -> Vec<&str> {
@@ -295,8 +324,8 @@ fn names(cases: &Value) -> Vec<&str> {
 #[test]
 fn messages_valid_and_invalid() {
     let root = load("messages.json");
-    let valid = with(MESSAGES_VALID_SCOPE, MESSAGES_VALID_SCOPE_1_2);
-    let invalid = with(MESSAGES_INVALID_SCOPE, MESSAGES_INVALID_SCOPE_1_2);
+    let valid = with(&with(MESSAGES_VALID_SCOPE, MESSAGES_VALID_SCOPE_1_2), MESSAGES_VALID_SCOPE_1_3);
+    let invalid = with(&with(MESSAGES_INVALID_SCOPE, MESSAGES_INVALID_SCOPE_1_2), MESSAGES_INVALID_SCOPE_1_3);
     for (key, scope) in [("valid", valid.as_slice()), ("invalid", invalid.as_slice())] {
         assert_patterns_match(key, scope, &names(&root[key]));
         let mut run = 0;
@@ -325,7 +354,7 @@ fn messages_1_2_scope_is_what_the_readme_says() {
         let n = root[key].as_array().unwrap().iter().filter(|c| matches(c["name"].as_str().unwrap(), scope)).count();
         assert!(n >= at_least, "messages.json {key}[]: {n} cases in the 1.2 scope, expected at least {at_least}");
     }
-    // None of the 1.3 cases (offer, complete, cancel) is in this scope: those still answer `unsupported_type` on the PC.
+    // None of the 1.3 cases (offer, complete, cancel) is in the 1.2 scope.
     for key in ["valid", "invalid"] {
         for case in root[key].as_array().unwrap() {
             let name = case["name"].as_str().unwrap();
@@ -339,7 +368,7 @@ fn messages_1_2_scope_is_what_the_readme_says() {
 #[test]
 fn messages_sequences() {
     let root = load("messages.json");
-    let scope = with(MESSAGES_SEQUENCE_SCOPE, MESSAGES_SEQUENCE_SCOPE_1_2);
+    let scope = with(&with(MESSAGES_SEQUENCE_SCOPE, MESSAGES_SEQUENCE_SCOPE_1_2), MESSAGES_SEQUENCE_SCOPE_1_3);
     assert_patterns_match("sequences", &scope, &names(&root["sequences"]));
     for seq in root["sequences"].as_array().unwrap() {
         let seq_name = seq["name"].as_str().unwrap();

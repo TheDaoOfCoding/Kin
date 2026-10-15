@@ -15,148 +15,12 @@ use std::time::{Duration, Instant};
 use common::*;
 use futures_util::{SinkExt, StreamExt};
 use kin_lib::clipboard::{CAN_INCLUDE_IN_HISTORY, CAN_UPLOAD_TO_CLOUD, ClipFormat, EXCLUDE_FROM_MONITOR};
-use kin_lib::core::{Core, Event, LinkState, PingReport};
-use kin_lib::identity::Identity;
+use kin_lib::core::{Event, LinkState, PingReport};
 use kin_lib::sync::SendResult;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::client::TlsStream;
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::protocol::CloseFrame;
-
-type Ws = WebSocketStream<TlsStream<tokio::net::TcpStream>>;
-
-const PHONE_NAME: &str = "Test Phone";
-
-struct World {
-    env: TestEnv,
-    server: kin_lib::server::ServerHandle,
-    pc: TestKey,
-    phone: TestKey,
-}
-
-impl World {
-    async fn new() -> World {
-        let pc_identity = Identity::generate().unwrap();
-        let pc = TestKey {
-            pkcs8: pc_identity.key_der.clone(),
-            cert: pc_identity.cert_der.clone(),
-            device_id: pc_identity.device_id.clone(),
-            short_id: pc_identity.short_id.clone(),
-        };
-        let phone_identity = Identity::generate().unwrap();
-        let phone = TestKey {
-            pkcs8: phone_identity.key_der,
-            cert: phone_identity.cert_der,
-            device_id: phone_identity.device_id,
-            short_id: phone_identity.short_id,
-        };
-        let env = test_core(pc_identity, "Desk PC");
-        let server = start(&env.core).await;
-        World { env, server, pc, phone }
-    }
-
-    fn core(&self) -> &Core {
-        &self.env.core
-    }
-
-    async fn tls(&self) -> TlsStream<tokio::net::TcpStream> {
-        connect(self.server.local_addr, phone_config(&self.pc.device_id, &self.phone)).await.unwrap()
-    }
-
-    /// Pairs the phone: starts a pairing like a developer would, and sends the token from its URL.
-    async fn pair(&self) {
-        let token = start_pairing_and_read_token(&self.env);
-        let mut stream = self.tls().await;
-        let response = request(
-            &mut stream,
-            "POST",
-            "/v1/pair",
-            &[("Content-Type", "application/json; charset=utf-8")],
-            &pair_body(&token, PHONE_NAME),
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.status, 200, "{:?}", response.json());
-    }
-
-    /// Opens the WebSocket. `Err` carries the HTTP status that refused the upgrade.
-    async fn try_open_ws(&self) -> Result<Ws, u16> {
-        let stream = self.tls().await;
-        match tokio_tungstenite::client_async(format!("ws://127.0.0.1:{}/v1/ws", self.server.local_addr.port()), stream).await {
-            Ok((ws, response)) => {
-                assert_eq!(response.status().as_u16(), 101);
-                Ok(ws)
-            }
-            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => Err(response.status().as_u16()),
-            Err(other) => panic!("unexpected WebSocket error: {other}"),
-        }
-    }
-
-    /// Opens the WebSocket and does the `hello` exchange.
-    async fn open_ws(&self) -> Ws {
-        let mut ws = self.try_open_ws().await.expect("the upgrade works for a paired phone");
-        let hello = next_json(&mut ws).await;
-        assert_eq!(hello["type"], "hello");
-        assert_eq!(hello["protocol"], 1);
-        assert_eq!(hello["name"], "Desk PC");
-        assert_eq!(hello["platform"], "windows");
-        assert_eq!(hello["id"].as_str().unwrap().len(), 36, "a UUIDv7");
-        assert!(hello["appVersion"].is_string());
-        send_json(&mut ws, &phone_hello()).await;
-        self.wait_for_state(LinkState::PhoneConnected).await;
-        ws
-    }
-
-    async fn wait_for_state(&self, state: LinkState) {
-        for _ in 0..100 {
-            if self.core().snapshot().state == state {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(30)).await;
-        }
-        panic!("the state never became {state:?}, it is {:?}", self.core().snapshot().state);
-    }
-}
-
-fn phone_hello() -> Value {
-    json!({ "type": "hello", "id": "0193a5c2-7b1e-7c3a-9d4f-5e6a7b8c9d01", "protocol": 1, "name": PHONE_NAME, "platform": "android", "appVersion": "0.1.0" })
-}
-
-async fn send_json(ws: &mut Ws, v: &Value) {
-    ws.send(Message::Text(v.to_string().into())).await.unwrap();
-}
-
-/// The next text frame as JSON. Ping and pong frames are skipped.
-async fn next_json(ws: &mut Ws) -> Value {
-    loop {
-        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await.expect("a frame within 5 s") {
-            Some(Ok(Message::Text(t))) => return serde_json::from_str(t.as_str()).unwrap(),
-            Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
-            other => panic!("expected a text frame, got {other:?}"),
-        }
-    }
-}
-
-/// Reads until the close frame and returns its code. `None` if the connection ended without one.
-async fn next_close(ws: &mut Ws, within: Duration) -> Option<u16> {
-    loop {
-        match tokio::time::timeout(within, ws.next()).await.expect("a close within the time") {
-            Some(Ok(Message::Close(frame))) => return frame.map(|f: CloseFrame| u16::from(f.code)),
-            Some(Ok(_)) => continue,
-            _ => return None,
-        }
-    }
-}
-
-fn drain(events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>) -> Vec<Event> {
-    std::iter::from_fn(|| events.try_recv().ok()).collect()
-}
-
-fn toasts(events: &[Event]) -> Vec<String> {
-    events.iter().filter_map(|e| if let Event::Toast(t) = e { Some(t.clone()) } else { None }).collect()
-}
 
 // ----- pairing ----------------------------------------------------------------------------------------------------
 
@@ -884,7 +748,6 @@ async fn a_link_toast_opens_the_link_when_clicked_and_only_for_http_and_https() 
         wait_until("the toast", || core.status_json()["lastReceived"]["text"]["id"] == json!(want)).await;
         let received = w.core().status_json()["lastReceived"]["text"].clone();
         assert_eq!(received["openable"], false, "{text}");
-        assert!(w.core().newest_link_toast().is_none(), "{text}");
     }
     let toasts = text_toasts(&drain(&mut w.env.events));
     assert_eq!(toasts.len(), 4);
@@ -894,7 +757,6 @@ async fn a_link_toast_opens_the_link_when_clicked_and_only_for_http_and_https() 
     next_json(&mut ws).await;
     let core = w.env.core.clone();
     wait_until("the toast", || core.status_json()["lastReceived"]["text"]["id"] == "plain").await;
-    assert!(w.core().newest_link_toast().is_none());
     assert_eq!(w.opener_opened().len(), 1, "only the first link was ever opened");
 }
 
@@ -993,13 +855,13 @@ async fn the_hotkey_says_so_when_there_is_nothing_to_send_or_nobody_to_send_to()
     let mut w = World::new().await;
     // No phone is paired.
     w.env.clipboard.user_copy("something", vec![]);
-    assert_eq!(w.core().send_clipboard_text("hotkey", kin_lib::sync::Tap::now()).await, SendResult::NoPhonePaired);
+    assert_eq!(w.env.core.send_clipboard_text("hotkey", kin_lib::sync::Tap::now()).await, SendResult::NoPhonePaired);
     assert_eq!(toasts(&drain(&mut w.env.events)), ["No phone is paired yet."]);
 
     // Paired but not connected: the send just fails, with a notice (the queue is 1.4).
     w.pair().await;
     drain(&mut w.env.events);
-    assert_eq!(w.core().send_clipboard_text("tray", kin_lib::sync::Tap::now()).await, SendResult::PhoneOffline);
+    assert_eq!(w.env.core.send_clipboard_text("tray", kin_lib::sync::Tap::now()).await, SendResult::PhoneOffline);
     assert_eq!(toasts(&drain(&mut w.env.events)), ["The phone isn't connected. The text was not sent."]);
     assert_eq!(w.core().status_json()["lastSent"]["text"]["result"], "phone_offline");
 
@@ -1007,7 +869,7 @@ async fn the_hotkey_says_so_when_there_is_nothing_to_send_or_nobody_to_send_to()
     let _ws = w.open_ws().await;
     drain(&mut w.env.events);
     w.env.clipboard.user_copy_non_text();
-    assert_eq!(w.core().send_clipboard_text("hotkey", kin_lib::sync::Tap::now()).await, SendResult::Rejected("no_text".into()));
+    assert_eq!(w.env.core.send_clipboard_text("hotkey", kin_lib::sync::Tap::now()).await, SendResult::Rejected("no_text".into()));
     assert_eq!(toasts(&drain(&mut w.env.events)), ["The clipboard has no text to send."]);
 }
 
@@ -1031,7 +893,7 @@ async fn no_ack_in_5_seconds_marks_the_phone_offline_and_the_send_fails_visibly(
 
     // An explicit send after that fails at once with a notice: the phone is offline now.
     drain(&mut w.env.events);
-    assert_eq!(w.core().send_clipboard_text("hotkey", kin_lib::sync::Tap::now()).await, SendResult::PhoneOffline);
+    assert_eq!(w.env.core.send_clipboard_text("hotkey", kin_lib::sync::Tap::now()).await, SendResult::PhoneOffline);
     assert_eq!(toasts(&drain(&mut w.env.events)), ["The phone isn't connected. The text was not sent."]);
 }
 
@@ -1152,7 +1014,13 @@ async fn the_text_of_the_clipboard_never_reaches_the_log_or_status_json() {
     next_json(&mut ws).await;
     let core = w.env.core.clone();
     wait_until("the link toast", || core.status_json()["lastReceived"]["text"]["id"] == "s2").await;
-    let id = w.core().newest_link_toast().expect("a link toast");
+    let id = drain(&mut w.env.events)
+        .iter()
+        .find_map(|e| match e {
+            Event::TextToast { id, has_link: true, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("a link toast");
     assert!(w.core().toast_clicked(id));
 
     w.env.clipboard.user_copy(flagged, vec![ClipFormat::named(EXCLUDE_FROM_MONITOR)]);
@@ -1188,4 +1056,235 @@ async fn the_text_of_the_clipboard_never_reaches_the_log_or_status_json() {
     ] {
         assert!(log.contains(needle), "the log has no {needle:?}");
     }
+}
+
+// ===== Milestone 1.3: the sensitive flag, the 128 KiB threshold and line ends (driven by protocol/text-rules.json) ===============
+
+fn formats_of(v: &Value) -> Vec<ClipFormat> {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|f| match f {
+            Value::String(name) => ClipFormat::named(name),
+            Value::Object(o) => {
+                let (name, value) = o.iter().next().unwrap();
+                ClipFormat::with_dword(name, value.as_u64().unwrap() as u32)
+            }
+            other => panic!("a format is a name or a name with a value, not {other}"),
+        })
+        .collect()
+}
+
+/// What a PC sender does, by category, with a clipboard that offers the listed formats (`sensitiveSender[]`, side `pc`).
+#[tokio::test]
+async fn the_pc_sets_sensitive_exactly_when_the_clipboard_carried_an_opt_out_format() {
+    let root = load("text-rules.json");
+    let mut run = 0;
+    for case in root["sensitiveSender"].as_array().unwrap().iter().filter(|c| c["side"] == "pc") {
+        let name = case["name"].as_str().unwrap();
+        let w = World::new().await;
+        let mut ws = w.connected().await;
+        let expect = &case["expect"];
+        match case["trigger"].as_str().unwrap() {
+            "hotkey" => {
+                // The automatic sync would also react to the copy: it is off, so only the hotkey sends.
+                w.core().set_auto_clipboard_sync(false);
+                w.env.clipboard.user_copy("some text to send", formats_of(&case["formats"]));
+                let core = w.env.core.clone();
+                let sending = tokio::spawn(async move { core.send_clipboard_text("hotkey", kin_lib::sync::Tap::now()).await });
+                let frame = next_json(&mut ws).await;
+                assert_eq!(frame["type"], expect["send"], "{name}");
+                assert_eq!(frame["sensitive"] == json!(true), expect["sensitive"].as_bool().unwrap(), "{name}: {frame}");
+                if expect["sensitive"] == false {
+                    assert!(frame.get("sensitive").is_none(), "{name}: an ordinary text carries no flag");
+                }
+                send_json(&mut ws, &json!({ "type": "ack", "ref": frame["id"] })).await;
+                assert!(matches!(sending.await.unwrap(), SendResult::Acked { .. }), "{name}");
+            }
+            "automatic" => {
+                w.env.clipboard.user_copy("some text to send", formats_of(&case["formats"]));
+                match expect["send"].as_str().unwrap() {
+                    "clipboard" => {
+                        let frame = next_json(&mut ws).await;
+                        assert_eq!(frame["type"], "clipboard", "{name}");
+                        assert!(frame.get("sensitive").is_none(), "{name}: automatic sync never sends a flag");
+                    }
+                    "none" => {
+                        assert_silent(&mut ws, 600).await;
+                        assert_eq!(
+                            w.core().status_json()["clipboardSync"]["lastSkip"]["reason"]
+                                .as_str()
+                                .map(|r| r.starts_with("password_manager")),
+                            Some(true),
+                            "{name}"
+                        );
+                    }
+                    other => panic!("unknown send {other}"),
+                }
+            }
+            other => panic!("unknown trigger {other}"),
+        }
+        run += 1;
+    }
+    assert!(run >= 8, "{run} cases ran");
+}
+
+/// A received text with `sensitive` (`receiver[]`): marked on the clipboard, no preview, nothing to open, nothing in the log.
+#[tokio::test]
+async fn a_sensitive_text_from_the_phone_has_no_preview_no_link_and_leaves_nothing_in_the_log() {
+    let log_dir = file_log_dir();
+    let root = load("text-rules.json");
+    let mut run = 0;
+    for (n, case) in root["receiver"].as_array().unwrap().iter().enumerate() {
+        let name = case["name"].as_str().unwrap();
+        let mut w = World::new().await;
+        let mut ws = w.connected().await;
+        drain(&mut w.env.events);
+        let id = format!("recv-{n}-{}", name.replace(' ', "-"));
+        let secret_text = format!("{} SECRET-{n}", case["frame"]["text"].as_str().unwrap());
+        // A link keeps being one link: the secret goes into the query, not after a space.
+        let text = if case["frame"]["isUrl"] == true {
+            format!("{}?secret=SECRET-{n}", case["frame"]["text"].as_str().unwrap())
+        } else {
+            secret_text
+        };
+        let mut frame = json!({ "type": "text", "id": id, "text": text, "isUrl": case["frame"]["isUrl"] });
+        if let Some(s) = case["frame"].get("sensitive") {
+            frame["sensitive"] = s.clone();
+        }
+        send_json(&mut ws, &frame).await;
+        assert_eq!(next_json(&mut ws).await, json!({ "type": "ack", "ref": id }), "{name}");
+        let core = w.env.core.clone();
+        wait_until("the text to arrive", || core.status_json()["lastReceived"]["text"]["id"] == json!(id)).await;
+        let expect = &case["expect"];
+        let sensitive = expect["clipboardMarkedSensitive"].as_bool().unwrap();
+        // The clipboard: the text is there, and marked when it is sensitive.
+        assert_eq!(w.env.clipboard.text().as_deref(), Some(text.as_str()), "{name}");
+        assert_eq!(w.env.clipboard.app_sensitive_writes().len(), usize::from(sensitive), "{name}: written as sensitive");
+        let snapshot = kin_lib::clipboard::Clipboard::read(w.env.clipboard.as_ref()).unwrap();
+        assert_eq!(
+            kin_lib::clipboard::exclusion(&snapshot.formats).is_some(),
+            sensitive,
+            "{name}: the opt-out formats are on the clipboard"
+        );
+        if sensitive {
+            let on = |n: &str| snapshot.formats.iter().find(|f| f.name == n).map(|f| f.dword);
+            assert_eq!(on(CAN_INCLUDE_IN_HISTORY), Some(Some(0)), "{name}");
+            assert_eq!(on(CAN_UPLOAD_TO_CLOUD), Some(Some(0)), "{name}");
+            assert!(on(EXCLUDE_FROM_MONITOR).is_some(), "{name}");
+        }
+        // The toast: "Text from <device>", with a preview unless sensitive, and a link only for an ordinary link.
+        let toasts = text_toasts(&drain(&mut w.env.events));
+        assert_eq!(toasts.len(), 1, "{name}");
+        assert_eq!(toasts[0].0, PHONE_NAME);
+        assert_eq!(!toasts[0].1.is_empty(), expect["preview"].as_bool().unwrap(), "{name}: preview {:?}", toasts[0].1);
+        assert_eq!(toasts[0].2, expect["openAction"].as_bool().unwrap(), "{name}: link on the toast");
+        // status.json: nothing about a sensitive text, not even its length.
+        let received = w.core().status_json()["lastReceived"]["text"].clone();
+        assert_eq!(received["sensitive"], sensitive, "{name}");
+        if sensitive {
+            assert!(received["chars"].is_null() && received["isUrl"] == false && received["openable"] == false, "{name}: {received}");
+        }
+        // The log: for a sensitive text no length and no hash, never the text.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let log = std::fs::read_to_string(log_dir.join("kin.log")).unwrap();
+        let mine: Vec<&str> = log.lines().filter(|l| l.contains(&id)).collect();
+        assert!(!mine.is_empty(), "{name}: the log says it happened");
+        assert!(!log.contains(&format!("SECRET-{n}")), "{name}: the text is in the log");
+        let says_how_long = mine.iter().any(|l| l.contains("characters") || l.contains("hash "));
+        assert_eq!(says_how_long, expect["logsTextLengthOrHash"].as_bool().unwrap(), "{name}: {mine:?}");
+        run += 1;
+    }
+    assert!(run >= 5);
+}
+
+#[tokio::test]
+async fn text_from_the_phone_with_a_sensitive_of_the_wrong_type_is_bad_request_and_changes_nothing() {
+    let w = World::new().await;
+    let mut ws = w.connected().await;
+    w.env.clipboard.user_copy("mine", vec![]);
+    let frame = next_json(&mut ws).await;
+    send_json(&mut ws, &json!({ "type": "ack", "ref": frame["id"] })).await;
+    for (i, bad) in [json!("true"), json!(1), json!(0), json!([true]), json!({})].into_iter().enumerate() {
+        let id = format!("bad-sensitive-{i}");
+        let mut frame = text_message(&id, "x", false);
+        frame["sensitive"] = bad;
+        send_json(&mut ws, &frame).await;
+        let reply = next_json(&mut ws).await;
+        assert_eq!(
+            (reply["type"].as_str(), reply["code"].as_str(), reply["ref"].as_str()),
+            (Some("error"), Some("bad_request"), Some(id.as_str()))
+        );
+    }
+    assert_eq!(w.env.clipboard.text().as_deref(), Some("mine"));
+    // null is the same as absent.
+    let mut frame = text_message("null-sensitive", "plain", false);
+    frame["sensitive"] = Value::Null;
+    send_json(&mut ws, &frame).await;
+    assert_eq!(next_json(&mut ws).await["type"], "ack");
+    let core = w.env.core.clone();
+    wait_until("the text", || core.status_json()["lastReceived"]["text"]["id"] == "null-sensitive").await;
+    assert!(w.env.clipboard.app_sensitive_writes().is_empty());
+}
+
+#[tokio::test]
+async fn an_automatic_clipboard_over_128_kib_is_not_sent_and_is_recorded_as_too_large() {
+    let w = World::new().await;
+    let mut ws = w.connected().await;
+    w.env.clipboard.user_copy(&"a".repeat(128 * 1024 + 1), vec![]);
+    assert_silent(&mut ws, 600).await;
+    let status = w.core().status_json();
+    assert_eq!(status["lastSent"]["clipboard"]["result"], "too_large");
+    assert_eq!(status["clipboardSync"]["lastSkip"]["reason"], "too_large");
+    // Exactly 128 KiB is sent.
+    w.env.clipboard.user_copy(&"b".repeat(128 * 1024), vec![]);
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["type"], "clipboard");
+    assert_eq!(frame["text"].as_str().unwrap().len(), 128 * 1024);
+}
+
+#[tokio::test]
+async fn crlf_on_the_pc_clipboard_goes_out_as_lf_and_the_phones_lf_comes_back_as_crlf_without_an_echo() {
+    let mut w = World::new().await;
+    let mut ws = w.connected().await;
+    // PC -> phone: the clipboard has CRLF, the wire has LF (a lone CR stays).
+    w.env.clipboard.user_copy("one\r\ntwo\rthree\r\nfour", vec![]);
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["text"], "one\ntwo\rthree\nfour");
+    send_json(&mut ws, &json!({ "type": "ack", "ref": frame["id"] })).await;
+    // Phone -> PC: LF on the wire, CRLF on the clipboard, and the change that write causes is recognised (the guard hashes the wire form).
+    drain(&mut w.env.events);
+    send_json(&mut ws, &text_message("lf-1", "a\nb\nc", false)).await;
+    next_json(&mut ws).await;
+    let core = w.env.core.clone();
+    wait_until("the text", || core.status_json()["lastReceived"]["text"]["id"] == "lf-1").await;
+    assert_eq!(w.env.clipboard.text().as_deref(), Some("a\r\nb\r\nc"));
+    assert_silent(&mut ws, 700).await;
+    assert_eq!(w.core().status_json()["clipboardSync"]["lastSkip"]["reason"], "echo_of_phone_text");
+}
+
+#[tokio::test]
+async fn the_developer_clipboard_hooks_are_refused_unless_the_app_was_started_with_a_developer_setting() {
+    let keys = vector_keys();
+    // A normal run: no developer setting at all.
+    let env = test_core_with(identity_of(&keys[0]), "Desk PC", |c| {
+        c.dev_bind = None;
+        c.dev_qr_address = None;
+        c.dev_port = None;
+        c.dev_print_pair_url = false;
+        c.dev_received_dir = None;
+    });
+    assert!(!env.core.config.dev_hooks_enabled());
+    env.clipboard.user_copy("mine", vec![]);
+    env.core.dev_set_clipboard("changed by a hook".into(), None).await;
+    assert_eq!(env.clipboard.text().as_deref(), Some("mine"), "--dev-set-clipboard is refused");
+    env.core.dev_get_clipboard().await;
+    assert!(!env.dir.path().join("dev-clipboard.txt").exists(), "--dev-get-clipboard is refused: nothing is written");
+    // With a developer setting both work.
+    let dev = test_core(identity_of(&keys[0]), "Desk PC");
+    dev.clipboard.user_copy("mine", vec![]);
+    dev.core.dev_set_clipboard("changed by a hook".into(), None).await;
+    assert_eq!(dev.clipboard.text().as_deref(), Some("changed by a hook"));
+    dev.core.dev_get_clipboard().await;
+    assert_eq!(std::fs::read_to_string(dev.dir.path().join("dev-clipboard.txt")).unwrap(), "changed by a hook");
 }

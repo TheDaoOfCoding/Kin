@@ -20,7 +20,8 @@ use crate::netaddr;
 use crate::pairing::{self, PairError, Pairing};
 use crate::settings::Settings;
 use crate::storage::{Db, Device, NewDevice};
-use crate::sync::{HotkeyStatus, LinkToasts, Stats};
+use crate::sync::{HotkeyStatus, Stats, ToastTargets};
+use crate::transfers::{Hooks, Transfers};
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_PORT: u16 = 47821;
@@ -43,6 +44,17 @@ pub enum Event {
         from: String,
         preview: String,
         has_link: bool,
+    },
+    /// "3 files from <phone>". A click opens the file (one file) or the folder (`Core::toast_clicked`).
+    FilesToast {
+        id: u32,
+        title: String,
+        body: String,
+        /// One file: the toast can offer "Open" and "Show in folder". Several: only "Open folder".
+        single: bool,
+        /// One file whose type is on the allow-list (`links::may_open_file`): only then is there an "Open" button. Any other file gets
+        /// "Show in folder" alone, because a click on a toast must never run a program.
+        openable: bool,
     },
 }
 
@@ -80,6 +92,8 @@ pub struct Snapshot {
     pub devices: Vec<DeviceRow>,
     /// For the tray's check item.
     pub auto_clipboard_sync: bool,
+    /// The progress of the transfers that are going ("sending 45%"), for the tray's tooltip.
+    pub transfers: Option<String>,
 }
 
 impl Snapshot {
@@ -160,7 +174,10 @@ pub struct Core {
     pub(crate) hotkey: Mutex<HotkeyStatus>,
     pub(crate) stats: Mutex<Stats>,
     pub(crate) loop_guard: Mutex<LoopGuard>,
-    pub(crate) link_toasts: Mutex<LinkToasts>,
+    pub(crate) toast_targets: Mutex<ToastTargets>,
+    /// File transfers (1.3): both directions, by transfer ID.
+    pub transfers: Transfers,
+    pub hooks: Hooks,
     pub(crate) next_toast_id: AtomicU32,
     pub(crate) clipboard: Arc<dyn Clipboard>,
     pub(crate) opener: Arc<dyn UrlOpener>,
@@ -174,6 +191,13 @@ pub struct Services {
     pub clock: Arc<dyn Clock>,
 }
 
+/// The developer settings that change how transfers behave (`--dev-free-bytes`).
+fn hooks_of(config: &Config) -> Hooks {
+    let hooks = Hooks::default();
+    *lock(&hooks.free_bytes) = config.dev_free_bytes;
+    hooks
+}
+
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -181,6 +205,12 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// The first 8 characters of a device ID: enough to tell devices apart in a log.
 pub fn short(device_id: &str) -> &str {
     device_id.get(..8).unwrap_or(device_id)
+}
+
+/// The last 8 characters of a transfer ID, for logs. A transfer ID is usually a UUIDv7, whose first characters are a timestamp: two
+/// transfers started in the same few minutes share them, the last characters are the random part.
+pub fn short_transfer(id: &str) -> &str {
+    id.len().checked_sub(8).and_then(|from| id.get(from..)).unwrap_or(id)
 }
 
 pub fn computer_name() -> String {
@@ -191,7 +221,8 @@ impl Core {
     pub fn new(config: Config, identity: Identity, db: Db, pc_name: String, events: UnboundedSender<Event>, services: Services) -> Core {
         let settings = Settings::load(&config.data_dir);
         let hotkey = HotkeyStatus { accelerator: settings.hotkey.clone(), registered: false, error: None };
-        Core {
+        let config_for_hooks = config.clone();
+        let core = Core {
             config,
             identity,
             pc_name,
@@ -206,12 +237,16 @@ impl Core {
             hotkey: Mutex::new(hotkey),
             stats: Mutex::new(Stats::default()),
             loop_guard: Mutex::new(LoopGuard::default()),
-            link_toasts: Mutex::new(LinkToasts::default()),
+            toast_targets: Mutex::new(ToastTargets::default()),
+            transfers: Transfers::default(),
+            hooks: hooks_of(&config_for_hooks),
             next_toast_id: AtomicU32::new(0),
             clipboard: services.clipboard,
             opener: services.opener,
             clock: services.clock,
-        }
+        };
+        core.recover_transfers();
+        core
     }
 
     pub fn emit(&self, event: Event) {
@@ -247,7 +282,7 @@ impl Core {
         } else {
             LinkState::PhoneOffline
         };
-        Snapshot { state, devices, auto_clipboard_sync: self.auto_clipboard_sync() }
+        Snapshot { state, devices, auto_clipboard_sync: self.auto_clipboard_sync(), transfers: self.transfer_summary() }
     }
 
     /// The contents of `status.json`, for scripts that want to know what the app is doing.
@@ -281,6 +316,7 @@ impl Core {
             "lastSent": sync["lastSent"],
             "lastReceived": sync["lastReceived"],
             "clipboardSync": sync["clipboardSync"],
+            "transfers": self.transfers_status(),
             "updatedAtMs": unix_ms(),
         })
     }

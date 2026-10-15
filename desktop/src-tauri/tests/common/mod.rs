@@ -28,6 +28,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
+pub mod transfer;
+
 // ----- the vector files -------------------------------------------------------------------------------------------
 
 pub fn protocol_dir() -> PathBuf {
@@ -88,12 +90,20 @@ pub struct TestEnv {
 }
 
 pub fn test_core(identity: Identity, pc_name: &str) -> TestEnv {
+    test_core_with(identity, pc_name, |_| {})
+}
+
+/// [`test_core`] with a chance to change the configuration first. Received files go to `received` inside the test's temporary
+/// directory, so **no test ever writes to the real Downloads folder**.
+pub fn test_core_with(identity: Identity, pc_name: &str, configure: impl FnOnce(&mut Config)) -> TestEnv {
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config::new(dir.path().to_path_buf());
     config.dev_bind = Some("127.0.0.1".parse().unwrap());
     config.dev_qr_address = Some("10.0.2.2".parse().unwrap());
     config.dev_port = Some(0);
     config.dev_print_pair_url = true;
+    config.dev_received_dir = Some(dir.path().join("received"));
+    configure(&mut config);
     let (tx, events) = tokio::sync::mpsc::unbounded_channel();
     let clipboard = Arc::new(MemoryClipboard::default());
     let opener = Arc::new(RecordingOpener::default());
@@ -363,4 +373,146 @@ pub fn capture_logs() {
 
 pub fn captured_lines() -> Vec<String> {
     CAPTURED.lock().unwrap().clone()
+}
+
+// ----- the fake phone's world: a PC in the test process, a paired phone, and its WebSocket (moved here from fake_phone.rs) -----
+use futures_util::{SinkExt, StreamExt};
+use kin_lib::core::LinkState;
+use serde_json::json;
+use std::time::Duration;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+
+pub type Ws = WebSocketStream<TlsStream<tokio::net::TcpStream>>;
+
+pub const PHONE_NAME: &str = "Test Phone";
+
+pub struct World {
+    pub env: TestEnv,
+    pub server: kin_lib::server::ServerHandle,
+    pub pc: TestKey,
+    pub phone: TestKey,
+}
+
+impl World {
+    pub async fn new() -> World {
+        let pc_identity = Identity::generate().unwrap();
+        let pc = TestKey {
+            pkcs8: pc_identity.key_der.clone(),
+            cert: pc_identity.cert_der.clone(),
+            device_id: pc_identity.device_id.clone(),
+            short_id: pc_identity.short_id.clone(),
+        };
+        let phone_identity = Identity::generate().unwrap();
+        let phone = TestKey {
+            pkcs8: phone_identity.key_der,
+            cert: phone_identity.cert_der,
+            device_id: phone_identity.device_id,
+            short_id: phone_identity.short_id,
+        };
+        let env = test_core(pc_identity, "Desk PC");
+        let server = start(&env.core).await;
+        World { env, server, pc, phone }
+    }
+
+    pub fn core(&self) -> &Core {
+        &self.env.core
+    }
+
+    pub async fn tls(&self) -> TlsStream<tokio::net::TcpStream> {
+        connect(self.server.local_addr, phone_config(&self.pc.device_id, &self.phone)).await.unwrap()
+    }
+
+    /// Pairs the phone: starts a pairing like a developer would, and sends the token from its URL.
+    pub async fn pair(&self) {
+        let token = start_pairing_and_read_token(&self.env);
+        let mut stream = self.tls().await;
+        let response = request(
+            &mut stream,
+            "POST",
+            "/v1/pair",
+            &[("Content-Type", "application/json; charset=utf-8")],
+            &pair_body(&token, PHONE_NAME),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status, 200, "{:?}", response.json());
+    }
+
+    /// Opens the WebSocket. `Err` carries the HTTP status that refused the upgrade.
+    pub async fn try_open_ws(&self) -> Result<Ws, u16> {
+        let stream = self.tls().await;
+        match tokio_tungstenite::client_async(format!("ws://127.0.0.1:{}/v1/ws", self.server.local_addr.port()), stream).await {
+            Ok((ws, response)) => {
+                assert_eq!(response.status().as_u16(), 101);
+                Ok(ws)
+            }
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => Err(response.status().as_u16()),
+            Err(other) => panic!("unexpected WebSocket error: {other}"),
+        }
+    }
+
+    /// Opens the WebSocket and does the `hello` exchange.
+    pub async fn open_ws(&self) -> Ws {
+        let mut ws = self.try_open_ws().await.expect("the upgrade works for a paired phone");
+        let hello = next_json(&mut ws).await;
+        assert_eq!(hello["type"], "hello");
+        assert_eq!(hello["protocol"], 1);
+        assert_eq!(hello["name"], "Desk PC");
+        assert_eq!(hello["platform"], "windows");
+        assert_eq!(hello["id"].as_str().unwrap().len(), 36, "a UUIDv7");
+        assert!(hello["appVersion"].is_string());
+        send_json(&mut ws, &phone_hello()).await;
+        self.wait_for_state(LinkState::PhoneConnected).await;
+        ws
+    }
+
+    pub async fn wait_for_state(&self, state: LinkState) {
+        for _ in 0..100 {
+            if self.core().snapshot().state == state {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        panic!("the state never became {state:?}, it is {:?}", self.core().snapshot().state);
+    }
+}
+
+pub fn phone_hello() -> Value {
+    json!({ "type": "hello", "id": "0193a5c2-7b1e-7c3a-9d4f-5e6a7b8c9d01", "protocol": 1, "name": PHONE_NAME, "platform": "android", "appVersion": "0.1.0" })
+}
+
+pub async fn send_json(ws: &mut Ws, v: &Value) {
+    ws.send(Message::Text(v.to_string().into())).await.unwrap();
+}
+
+/// The next text frame as JSON. Ping and pong frames are skipped.
+pub async fn next_json(ws: &mut Ws) -> Value {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await.expect("a frame within 5 s") {
+            Some(Ok(Message::Text(t))) => return serde_json::from_str(t.as_str()).unwrap(),
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+            other => panic!("expected a text frame, got {other:?}"),
+        }
+    }
+}
+
+/// Reads until the close frame and returns its code. `None` if the connection ended without one.
+pub async fn next_close(ws: &mut Ws, within: Duration) -> Option<u16> {
+    loop {
+        match tokio::time::timeout(within, ws.next()).await.expect("a close within the time") {
+            Some(Ok(Message::Close(frame))) => return frame.map(|f: CloseFrame| u16::from(f.code)),
+            Some(Ok(_)) => continue,
+            _ => return None,
+        }
+    }
+}
+
+pub fn drain(events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>) -> Vec<Event> {
+    std::iter::from_fn(|| events.try_recv().ok()).collect()
+}
+
+pub fn toasts(events: &[Event]) -> Vec<String> {
+    events.iter().filter_map(|e| if let Event::Toast(t) = e { Some(t.clone()) } else { None }).collect()
 }

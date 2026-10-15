@@ -30,10 +30,14 @@ pub fn run(parsed: Parsed) {
     let built = tauri::Builder::default()
         // Must be the first plugin. A second launch (`kin.exe --ping`, later Explorer's "Send to") runs this callback in the
         // running instance with its arguments, and exits.
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             let env = |k: &str| std::env::var(k).ok();
             match cli::parse(argv.get(1..).unwrap_or_default(), &env) {
-                Ok(parsed) => handle_commands(app, &parsed.commands),
+                Ok(mut parsed) => {
+                    // `Kin.exe --send a.jpg` from another folder: the path is relative to where that launch was.
+                    cli::resolve_paths(&mut parsed.commands, Path::new(&cwd));
+                    handle_commands(app, &parsed.commands);
+                }
                 Err(e) => log::warn!("ignoring the arguments of a second launch: {e}"),
             }
         }))
@@ -48,7 +52,16 @@ pub fn run(parsed: Parsed) {
                 })
                 .build(),
         )
-        .invoke_handler(tauri::generate_handler![ui::pairing_view, ui::new_pairing, ui::remove_device, ui::close_window])
+        .invoke_handler(tauri::generate_handler![
+            ui::pairing_view,
+            ui::new_pairing,
+            ui::remove_device,
+            ui::close_window,
+            ui::drop_view,
+            ui::send_files,
+            ui::pick_files,
+            ui::cancel_transfer
+        ])
         .setup(move |app| setup(app, parsed).map_err(|e| -> Box<dyn std::error::Error> { e }))
         .on_window_event(|window, event| {
             // The pairing window is destroyed when it closes. An unused token stops working with it.
@@ -85,7 +98,10 @@ fn fatal(error: &dyn std::fmt::Display) -> ! {
 }
 
 fn setup(app: &mut tauri::App, parsed: Parsed) -> Result<()> {
-    let Parsed { config, commands, unknown } = parsed;
+    let Parsed { config, mut commands, unknown } = parsed;
+    if let Ok(cwd) = std::env::current_dir() {
+        cli::resolve_paths(&mut commands, &cwd);
+    }
     std::fs::create_dir_all(&config.data_dir)?;
     filelog::init(&config.data_dir.join("logs"))?;
     filelog::install_panic_hook();
@@ -133,6 +149,31 @@ fn setup(app: &mut tauri::App, parsed: Parsed) -> Result<()> {
         let core = core.clone();
         tauri::async_runtime::spawn(async move { core.run_clipboard_sync(clipboard_changes).await });
     }
+    // Housekeeping: old offers and `.part` files go (at start, and every hour), and `status.json` keeps up with a running transfer.
+    {
+        let core = core.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut hourly = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                hourly.tick().await;
+                core.clean_up().await;
+            }
+        });
+    }
+    {
+        let (core, handle) = (core.clone(), handle.clone());
+        tauri::async_runtime::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                if core.has_active_transfers() {
+                    // The tray's tooltip ("sending 45%"), `status.json` and the drop window all follow the numbers.
+                    refresh(&handle, &core);
+                    ui::transfers_changed(&handle);
+                }
+            }
+        });
+    }
     register_toast_clicks(&handle, &core);
     register_hotkey(&handle, &core);
     refresh(&handle, &core);
@@ -160,7 +201,7 @@ async fn event_loop(app: AppHandle, core: Arc<Core>, mut events: tokio::sync::mp
             Event::StateChanged => refresh(&app, &core),
             Event::PairingChanged => {
                 ui::pairing_changed(&app);
-                write_status(&core, false);
+                write_status_in_background(&core);
             }
             Event::DevicePaired(device) => {
                 // The "New device paired" notice, with a way to remove the device in case someone else scanned the code.
@@ -169,20 +210,36 @@ async fn event_loop(app: AppHandle, core: Arc<Core>, mut events: tokio::sync::mp
             }
             Event::Toast(text) => toast(&app, &core, &text),
             Event::TextToast { id, from, preview, has_link } => text_toast(&app, &core, id, &from, &preview, has_link),
+            Event::FilesToast { id, title, body, single, openable } => files_toast(&app, &core, id, &title, &body, single, openable),
         }
     }
 }
 
 /// Updates the tray and `status.json` after a change of state.
-fn refresh(app: &AppHandle, core: &Core) {
+fn refresh(app: &AppHandle, core: &Arc<Core>) {
     if let Some(state) = app.try_state::<AppState>() {
         state.tray.update(app, &core.snapshot());
     }
-    write_status(core, false);
+    write_status_in_background(core);
+}
+
+/// One write of `status.json` at a time, and none after the last one (the one that says `stopped`).
+static STATUS_WRITE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+/// `status.json` is written on the blocking pool: the event loop is an async task and a file write (which can wait for a script that has
+/// the old file open) must not hold it.
+fn write_status_in_background(core: &Arc<Core>) {
+    let core = core.clone();
+    tauri::async_runtime::spawn_blocking(move || write_status(&core, false));
 }
 
 /// `status.json` in the data directory, for scripts: written on every state change.
 fn write_status(core: &Core, stopped: bool) {
+    let mut done = STATUS_WRITE.lock().unwrap_or_else(|p| p.into_inner());
+    if *done {
+        return;
+    }
+    *done = stopped;
     let mut status = core.status_json();
     if stopped {
         status["state"] = "stopped".into();
@@ -190,8 +247,20 @@ fn write_status(core: &Core, stopped: bool) {
     let path = core.config.data_dir.join("status.json");
     let tmp = path.with_extension("json.tmp");
     let written = serde_json::to_vec_pretty(&status).map_err(std::io::Error::other).and_then(|bytes| std::fs::write(&tmp, bytes));
-    // `rename` replaces the old file, which is what we want for a status file.
-    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, &path)) {
+    // `rename` replaces the old file, which is what we want for a status file. A script that has the old one open at that very moment
+    // makes Windows say "access denied": try again a few times (the file is rewritten every second during a transfer).
+    let result = written.and_then(|()| {
+        let mut last = Ok(());
+        for attempt in 0..5 {
+            last = std::fs::rename(&tmp, &path);
+            if last.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10 * (attempt + 1)));
+        }
+        last
+    });
+    if let Err(e) = result {
         log::warn!("writing status.json failed: {e}");
     }
 }
@@ -209,19 +278,58 @@ fn text_toast(app: &AppHandle, core: &Core, id: u32, from: &str, preview: &str, 
     }
 }
 
-/// A click on a toast ("tap") opens its link, if it had one. The plugin reports a click only while the toast is on screen, not
-/// once it has moved to the Action Center.
+/// "<n> file(s) from <phone>": a click opens the file (one file) or the folder (several). The title and the names are the PC's
+/// own (the names were cleaned when the files were saved).
+fn files_toast(app: &AppHandle, core: &Core, id: u32, title: &str, body: &str, single: bool, openable: bool) {
+    log::info!("toast: {title} ({} characters of names shown)", body.chars().count());
+    if core.config.dev_no_windows {
+        return;
+    }
+    let kind = match (single, openable) {
+        (true, true) => ACTIONS_ONE_FILE,
+        (true, false) => ACTIONS_ONE_FILE_SHOW_ONLY,
+        (false, _) => ACTIONS_SEVERAL_FILES,
+    };
+    if let Err(e) = app.notification().builder().id(id as i32).title(title).body(body).action_type_id(kind).show() {
+        log::warn!("showing a toast failed: {e}");
+    }
+}
+
+/// The buttons of a toast for one received file ("Open", "Show in folder"), for one whose type may not be opened ("Show in folder"
+/// alone: see `links::may_open_file`) and for several ("Open folder"). A click on the toast itself does what the first button does.
+const ACTIONS_ONE_FILE: &str = "received_file";
+const ACTIONS_ONE_FILE_SHOW_ONLY: &str = "received_file_show_only";
+const ACTIONS_SEVERAL_FILES: &str = "received_files";
+
+fn register_toast_buttons(app: &AppHandle) {
+    use tauri_plugin_notification::{Action, ActionType};
+    let one = ActionType::builder(ACTIONS_ONE_FILE)
+        .actions(vec![Action::builder("open", "Open").build(), Action::builder("show", "Show in folder").build()])
+        .build();
+    let show_only =
+        ActionType::builder(ACTIONS_ONE_FILE_SHOW_ONLY).actions(vec![Action::builder("show", "Show in folder").build()]).build();
+    let several = ActionType::builder(ACTIONS_SEVERAL_FILES).actions(vec![Action::builder("open", "Open folder").build()]).build();
+    if let Err(e) = app.notification().register_action_types(vec![one, show_only, several]) {
+        log::warn!("toast buttons are not available: {e}");
+    }
+}
+
+/// A click on a toast ("tap") does what the toast was made for: opens its link, its file or its folder. The plugin reports a click
+/// only while the toast is on screen, not once it has moved to the Action Center. A click that doesn't say which toast it was
+/// opens nothing: there is no guess about the newest one.
 fn register_toast_clicks(app: &AppHandle, core: &Arc<Core>) {
     let core = core.clone();
     let registered = app.notification().on_action(move |performed| {
-        if performed.action_id() != "tap" {
+        // "tap" is a click on the toast, "open" and "show" are its buttons. Anything else (a dismissal) does nothing.
+        let action = performed.action_id();
+        if !matches!(action, "tap" | "open" | "show") {
             return;
         }
-        let id = performed.notification().map(|n| n.id() as u32).or_else(|| core.newest_link_toast());
-        if let Some(id) = id {
-            core.toast_clicked(id);
+        if let Some(id) = performed.notification().map(|n| n.id() as u32) {
+            core.toast_action(id, action);
         }
     });
+    register_toast_buttons(app);
     if let Err(e) = registered {
         log::warn!("toast clicks are not available: {e}");
     }
@@ -282,6 +390,12 @@ fn toast(app: &AppHandle, core: &Core, text: &str) {
 pub fn on_menu(app: &AppHandle, id: &str) {
     match id {
         tray::MENU_SEND_CLIPBOARD => send_clipboard(app, "tray"),
+        tray::MENU_SEND_FILES => {
+            if let Some(state) = app.try_state::<AppState>() {
+                ui::pick_and_send(app, state.core.clone());
+            }
+        }
+        tray::MENU_OPEN_FOLDER => open_received_folder(app),
         tray::MENU_AUTO_SYNC => {
             // Windows has already flipped the check by the time the click arrives.
             if let Some(state) = app.try_state::<AppState>() {
@@ -302,6 +416,15 @@ fn open_log_folder(app: &AppHandle) {
         return;
     };
     let dir = state.core.config.data_dir.join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    open_in_explorer(&dir);
+}
+
+fn open_received_folder(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let dir = state.core.received_dir();
     let _ = std::fs::create_dir_all(&dir);
     open_in_explorer(&dir);
 }
@@ -332,6 +455,16 @@ pub fn handle_commands(app: &AppHandle, commands: &[Command]) {
                 core.start_pairing();
             }
             Command::SendClipboard => send_clipboard(app, "command"),
+            Command::Send(paths) => {
+                let paths = paths.clone();
+                tauri::async_runtime::spawn(async move {
+                    core.send_paths(paths, "command").await;
+                });
+            }
+            Command::Drop => ui::open_drop_window(app),
+            Command::CancelTransfers => {
+                tauri::async_runtime::spawn(async move { core.cancel_all_transfers().await });
+            }
             Command::DevSetClipboard { text, mark } => {
                 let (text, mark) = (text.clone(), *mark);
                 tauri::async_runtime::spawn(async move { core.dev_set_clipboard(text, mark).await });

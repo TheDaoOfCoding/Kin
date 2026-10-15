@@ -1,9 +1,9 @@
-//! The tray icon: its icon and tooltip show the state (not paired, phone connected, phone offline), and the menu has the
-//! status line, "Send clipboard to phone", "Pair new phone", "Ping phone", the clipboard sync check item, "Open log folder"
-//! and "Quit".
+//! The tray icon: its icon and tooltip show the state (not paired, phone connected, phone offline, and the progress of a transfer),
+//! a left click opens the drop window, and the menu has the status line, "Send files...", "Send clipboard to phone", "Pair new
+//! phone", "Open received folder", "Ping phone", the clipboard sync check item, "Open log folder" and "Quit".
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
-use tauri::tray::TrayIconBuilder;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{App, AppHandle, Wry};
 
 use crate::core::{LinkState, Snapshot};
@@ -12,6 +12,8 @@ pub const TRAY_ID: &str = "kin";
 pub const MENU_PAIR: &str = "pair";
 pub const MENU_PING: &str = "ping";
 pub const MENU_SEND_CLIPBOARD: &str = "send_clipboard";
+pub const MENU_SEND_FILES: &str = "send_files";
+pub const MENU_OPEN_FOLDER: &str = "open_folder";
 pub const MENU_AUTO_SYNC: &str = "auto_sync";
 pub const MENU_LOGS: &str = "logs";
 pub const MENU_QUIT: &str = "quit";
@@ -86,10 +88,14 @@ fn icon(base: &(Vec<u8>, usize), state: &LinkState) -> Image<'static> {
 }
 
 pub fn tooltip(snapshot: &Snapshot) -> String {
-    match (&snapshot.state, snapshot.headline_device()) {
+    let base = match (&snapshot.state, snapshot.headline_device()) {
         (LinkState::NotPaired, _) | (_, None) => "Kin: not paired".to_string(),
         (LinkState::PhoneConnected, Some(d)) => format!("Kin: {} connected", d.name),
         (LinkState::PhoneOffline, Some(d)) => format!("Kin: {} offline", d.name),
+    };
+    match &snapshot.transfers {
+        Some(progress) => format!("{base}, {progress}"),
+        None => base,
     }
 }
 
@@ -103,7 +109,9 @@ fn status_line(snapshot: &Snapshot) -> String {
 
 pub fn build(app: &App, snapshot: &Snapshot) -> tauri::Result<Tray> {
     let status = MenuItem::with_id(app, "status", status_line(snapshot), false, None::<&str>)?;
+    let send_files = MenuItem::with_id(app, MENU_SEND_FILES, "Send files\u{2026}", true, None::<&str>)?;
     let send = MenuItem::with_id(app, MENU_SEND_CLIPBOARD, "Send clipboard to phone", true, None::<&str>)?;
+    let open_folder = MenuItem::with_id(app, MENU_OPEN_FOLDER, "Open received folder", true, None::<&str>)?;
     let pair = MenuItem::with_id(app, MENU_PAIR, "Pair new phone", true, None::<&str>)?;
     let ping = MenuItem::with_id(app, MENU_PING, "Ping phone", true, None::<&str>)?;
     let auto_sync =
@@ -115,8 +123,10 @@ pub fn build(app: &App, snapshot: &Snapshot) -> tauri::Result<Tray> {
         &[
             &status,
             &PredefinedMenuItem::separator(app)?,
+            &send_files,
             &send,
             &pair,
+            &open_folder,
             &ping,
             &auto_sync,
             &logs,
@@ -133,6 +143,12 @@ pub fn build(app: &App, snapshot: &Snapshot) -> tauri::Result<Tray> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| crate::app::on_menu(app, event.id().as_ref()))
+        // A left click opens the drop window: Windows doesn't support dropping files on a tray icon, so this window is the target.
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                crate::ui::open_drop_window(tray.app_handle());
+            }
+        })
         .build(app)?;
     Ok(Tray { status, auto_sync, base })
 }
@@ -161,11 +177,13 @@ mod tests {
 
     #[test]
     fn text_follows_the_state() {
-        let s = |state, devices| Snapshot { state, devices, auto_clipboard_sync: true };
+        let s = |state, devices| Snapshot { state, devices, auto_clipboard_sync: true, transfers: None };
         assert_eq!(tooltip(&s(LinkState::NotPaired, vec![])), "Kin: not paired");
         assert_eq!(tooltip(&s(LinkState::PhoneConnected, vec![device("Pixel 8", true)])), "Kin: Pixel 8 connected");
         assert_eq!(status_line(&s(LinkState::PhoneOffline, vec![device("Pixel 8", false)])), "Phone offline: Pixel 8");
         assert_eq!(status_line(&s(LinkState::NotPaired, vec![])), "Not paired");
+        let sending = Snapshot { transfers: Some("sending 45%".into()), ..s(LinkState::PhoneConnected, vec![device("Pixel 8", true)]) };
+        assert_eq!(tooltip(&sending), "Kin: Pixel 8 connected, sending 45%");
     }
 
     #[test]

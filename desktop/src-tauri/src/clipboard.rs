@@ -117,6 +117,12 @@ pub fn short_hash(text: &str) -> String {
     text_hash(text)[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The wire form of a text (protocol.md, "Line ends"): LF only. Every CRLF becomes LF in one left-to-right pass, and a lone CR stays.
+/// The loop guard hashes this form, so the clipboard form (CRLF) and what the phone sent (LF) are the same text to it.
+pub fn to_wire(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
 /// Text that lands on the Windows clipboard should use `\r\n` line ends: Notepad before Windows 11 and older apps show a
 /// text with bare `\n` as one long line. A `\n` that already follows a `\r` is left alone.
 pub fn to_windows_newlines(text: &str) -> String {
@@ -291,6 +297,25 @@ pub trait Clipboard: Send + Sync {
     /// Replaces the clipboard with `text`. `mark` also adds an opt-out format, which is how a developer hook pretends to be a
     /// password manager. The app itself never passes it.
     fn write_text(&self, text: &str, mark: Option<Exclusion>) -> Result<()>;
+    /// Replaces the clipboard with `text` that the sender marked sensitive: along with the text it writes the formats that keep it out
+    /// of the clipboard history and the cloud clipboard (`ExcludeClipboardContentFromMonitorProcessing`,
+    /// `CanIncludeInClipboardHistory` = 0, `CanUploadToCloudClipboard` = 0).
+    fn write_text_sensitive(&self, text: &str) -> Result<()>;
+    /// Puts the image in this file on the clipboard (see `images.rs`). The default is for clipboards that can't.
+    fn write_image_file(&self, _path: &std::path::Path) -> Result<ImageOutcome> {
+        Ok(ImageOutcome::Skipped("this clipboard can't hold images".to_string()))
+    }
+}
+
+/// What `write_image_file` did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImageOutcome {
+    Set {
+        width: u32,
+        height: u32,
+    },
+    /// Not put on the clipboard, and why (too big, not an image the system can decode).
+    Skipped(String),
 }
 
 /// A clipboard in memory, with the change events a real one gives. For tests and developer tooling: nothing here touches
@@ -300,6 +325,8 @@ pub struct MemoryClipboard {
     state: Mutex<ClipSnapshot>,
     listeners: Mutex<Vec<UnboundedSender<()>>>,
     writes: Mutex<Vec<String>>,
+    sensitive_writes: Mutex<Vec<String>>,
+    images: Mutex<Vec<std::path::PathBuf>>,
 }
 
 impl MemoryClipboard {
@@ -332,9 +359,19 @@ impl MemoryClipboard {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).text.clone()
     }
 
-    /// The texts the app itself wrote (not the user), in order.
+    /// The texts the app itself wrote (not the user), in order. (Sensitive ones are in `app_sensitive_writes`.)
     pub fn app_writes(&self) -> Vec<String> {
         self.writes.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The sensitive texts the app wrote, in order.
+    pub fn app_sensitive_writes(&self) -> Vec<String> {
+        self.sensitive_writes.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The image files the app put on the clipboard, in order.
+    pub fn app_images(&self) -> Vec<std::path::PathBuf> {
+        self.images.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 }
 
@@ -348,6 +385,24 @@ impl Clipboard for MemoryClipboard {
         self.writes.lock().unwrap_or_else(|p| p.into_inner()).push(text.to_string());
         self.user_copy(text, formats);
         Ok(())
+    }
+
+    fn write_text_sensitive(&self, text: &str) -> Result<()> {
+        let formats = vec![
+            ClipFormat::named(EXCLUDE_FROM_MONITOR),
+            ClipFormat::with_dword(CAN_INCLUDE_IN_HISTORY, 0),
+            ClipFormat::with_dword(CAN_UPLOAD_TO_CLOUD, 0),
+        ];
+        self.sensitive_writes.lock().unwrap_or_else(|p| p.into_inner()).push(text.to_string());
+        self.user_copy(text, formats);
+        Ok(())
+    }
+
+    fn write_image_file(&self, path: &std::path::Path) -> Result<ImageOutcome> {
+        self.images.lock().unwrap_or_else(|p| p.into_inner()).push(path.to_path_buf());
+        *self.state.lock().unwrap_or_else(|p| p.into_inner()) = ClipSnapshot::default();
+        self.notify();
+        Ok(ImageOutcome::Set { width: 1, height: 1 })
     }
 }
 
@@ -381,7 +436,7 @@ mod win {
     const FIRST_REGISTERED_FORMAT: u32 = 0xC000;
     const OPEN_ATTEMPTS: usize = 10;
     const OPEN_RETRY: Duration = Duration::from_millis(20);
-    /// A clipboard text above this is not read: the protocol can't carry it as a message anyway (1.3 sends it as a file).
+    /// A clipboard text above this is not read at all (it would go as a `.txt` file over 128 KiB, but 64 MiB of text in memory is the limit).
     const MAX_READ_BYTES: usize = 64 * 1024 * 1024;
 
     thread_local! {
@@ -489,6 +544,20 @@ mod win {
 
         fn hwnd(&self) -> HWND {
             HWND(self.hwnd as *mut _)
+        }
+
+        /// The text, and each of `marks` as a registered format that holds a DWORD.
+        fn write_text_marked(&self, text: &str, marks: &[(&str, u32)]) -> Result<()> {
+            let mut bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            bytes.extend_from_slice(&[0, 0]);
+            let _open = Open::new(self.hwnd())?;
+            // SAFETY: the clipboard is open, and this window owns it from here on.
+            unsafe { EmptyClipboard() }?;
+            put(CF_UNICODETEXT, &bytes)?;
+            for (name, value) in marks {
+                put(register(name), &value.to_le_bytes())?;
+            }
+            Ok(())
         }
     }
 
@@ -617,17 +686,19 @@ mod win {
         }
 
         fn write_text(&self, text: &str, mark: Option<Exclusion>) -> Result<()> {
-            let mut bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
-            bytes.extend_from_slice(&[0, 0]);
-            let _open = Open::new(self.hwnd())?;
-            // SAFETY: the clipboard is open, and this window owns it from here on.
-            unsafe { EmptyClipboard() }?;
-            put(CF_UNICODETEXT, &bytes)?;
-            if let Some(mark) = mark {
-                let value: u32 = if matches!(mark, Exclusion::NotInHistory | Exclusion::NotToCloud) { 0 } else { 1 };
-                put(register(mark.format_name()), &value.to_le_bytes())?;
-            }
-            Ok(())
+            let marks: Vec<(&str, u32)> = mark
+                .map(|m| (m.format_name(), if matches!(m, Exclusion::NotInHistory | Exclusion::NotToCloud) { 0 } else { 1 }))
+                .into_iter()
+                .collect();
+            self.write_text_marked(text, &marks)
+        }
+
+        fn write_text_sensitive(&self, text: &str) -> Result<()> {
+            self.write_text_marked(text, &[(super::EXCLUDE_FROM_MONITOR, 1), (CAN_INCLUDE_IN_HISTORY, 0), (CAN_UPLOAD_TO_CLOUD, 0)])
+        }
+
+        fn write_image_file(&self, path: &std::path::Path) -> Result<super::ImageOutcome> {
+            crate::images::write_clipboard_image(self.hwnd(), path)
         }
     }
 }
@@ -893,6 +964,18 @@ mod tests {
 
         // Back to what the user had.
         clipboard.write_text(&restore, None).unwrap();
+    }
+
+    /// Puts the image in the file named by `KIN_TEST_IMAGE` on the real clipboard, the way the app does for a received image, and
+    /// prints what came of it. It **does not restore** the clipboard: `desktop/check-1-3.ps1` saves every format first
+    /// (`clipboard-backup.ps1`), reads the result back with PowerShell, and restores them.
+    #[test]
+    #[ignore = "replaces the real clipboard: only the script check-1-3.ps1 runs it"]
+    fn real_clipboard_image_for_the_script() {
+        let path = std::env::var("KIN_TEST_IMAGE").expect("KIN_TEST_IMAGE is the path of the image to put on the clipboard");
+        let (clipboard, _changes) = WinClipboard::start().unwrap();
+        let outcome = clipboard.write_image_file(std::path::Path::new(&path)).unwrap();
+        println!("IMAGE_OUTCOME {outcome:?}");
     }
 
     /// The formats on the clipboard that are not just plain text (or nothing): an image, files, rich text. Plain text shows up as

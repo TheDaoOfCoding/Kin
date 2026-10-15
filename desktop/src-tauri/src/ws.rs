@@ -233,9 +233,18 @@ impl Conn {
             }
             // The `ack` is out already (acks are due as soon as the message is valid and recorded). Now the text goes to the
             // clipboard and a toast. The text itself is never logged.
-            Action::DeliverText { id, text, is_url } => {
+            Action::DeliverText { id, text, is_url, sensitive } => {
                 let from = self.receiver.peer().map_or("phone".to_string(), |p| p.name.clone());
-                self.core.receive_text(&self.device_id, &from, &id, text, is_url).await;
+                self.core.receive_text(&self.device_id, &from, &id, text, is_url, sensitive).await;
+            }
+            // The control channel never waits for files: what these do (stopping a writer, deleting partial files) runs on its own.
+            Action::MarkTransferDone { transfer_id } => {
+                let (core, device_id) = (self.core.clone(), self.device_id.clone());
+                tokio::spawn(async move { core.peer_completed(&device_id, &transfer_id).await });
+            }
+            Action::CancelTransfer { transfer_id, reason } => {
+                let (core, device_id) = (self.core.clone(), self.device_id.clone());
+                tokio::spawn(async move { core.peer_cancelled(&device_id, &transfer_id, &reason).await });
             }
             Action::RemovePeerAndClose => {
                 self.unpaired = true;
@@ -245,8 +254,13 @@ impl Conn {
                 }
                 self.core.emit(Event::PairingChanged);
             }
-            // A `clipboard` message only goes PC to phone: the receiver answers `unsupported_type` before it gets here.
-            Action::None | Action::ShowErrorOnly | Action::IgnoreDuplicate | Action::CloseOnly | Action::SetClipboard { .. } => {}
+            // `clipboard` and `offer` only go PC to phone: the receiver answers `unsupported_type` before it gets here.
+            Action::None
+            | Action::ShowErrorOnly
+            | Action::IgnoreDuplicate
+            | Action::CloseOnly
+            | Action::SetClipboard { .. }
+            | Action::StartDownload { .. } => {}
         }
         outcome.close.map(|code| End::Close { code, reason: close_reason(code).into() })
     }

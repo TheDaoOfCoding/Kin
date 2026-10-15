@@ -1,5 +1,5 @@
-//! The HTTPS server: TLS 1.3 with a mandatory client certificate, `POST /v1/pair`, `GET /v1/ws` and `404` for the rest
-//! (protocol.md, "Transport", "Pairing" and "Error codes").
+//! The HTTPS server: TLS 1.3 with a mandatory client certificate, `POST /v1/pair`, `GET /v1/ws`, the file endpoints of 1.3
+//! (`fileserver.rs`) and `404` for the rest (protocol.md, "Transport", "Pairing", "Files" and "Error codes").
 //!
 //! axum doesn't hand the client certificate to handlers, so the accept loop below does the TLS handshake itself,
 //! computes the device ID from the leaf certificate and attaches it to every request of that connection as a
@@ -34,9 +34,9 @@ use crate::core::{Core, DEFAULT_PORT, PairFailure, PairRequest, short};
 use crate::json::{non_empty_str, optional_str, parse_object, uint};
 use crate::messages::PROTOCOL;
 use crate::pairing::PairError;
-use crate::{tls, ws};
+use crate::{fileserver, tls, ws};
 
-/// A JSON body (pairing, and later transfers) may be at most 1 MiB.
+/// A JSON body (pairing and `POST /v1/transfers`) may be at most 1 MiB.
 pub const MAX_BODY_BYTES: usize = 1_048_576;
 /// Past the limit a body is read and thrown away up to this many bytes, so the client still gets to read its `413`.
 const DRAIN_LIMIT: usize = 16 * MAX_BODY_BYTES;
@@ -195,7 +195,7 @@ pub fn is_json_content_type(value: &str) -> bool {
 
 /// Reads a body up to `limit` bytes. A longer one is read to the end and thrown away (so the client can read its
 /// `413`), up to a cap, and then reported as `Err`.
-async fn read_limited(mut body: Body, limit: usize) -> std::result::Result<Vec<u8>, ()> {
+pub(crate) async fn read_limited(mut body: Body, limit: usize) -> std::result::Result<Vec<u8>, ()> {
     let mut out = Vec::new();
     let mut total = 0usize;
     while let Some(frame) = body.frame().await {
@@ -317,6 +317,12 @@ pub fn router(core: Arc<Core>) -> Router {
     Router::new()
         .route("/v1/pair", on(MethodFilter::POST, pair).fallback(not_found))
         .route("/v1/ws", on(MethodFilter::GET, websocket).fallback(not_found))
+        .route("/v1/transfers", on(MethodFilter::POST, fileserver::post_transfers).fallback(not_found))
+        .route("/v1/transfers/{id}", on(MethodFilter::DELETE, fileserver::delete_transfer).fallback(not_found))
+        .route(
+            "/v1/transfers/{id}/files/{file_id}",
+            on(MethodFilter::PUT, fileserver::put_file).on(MethodFilter::GET, fileserver::get_file).fallback(not_found),
+        )
         .fallback(not_found)
         .with_state(core)
 }

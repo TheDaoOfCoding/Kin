@@ -96,6 +96,7 @@ Automatic clipboard sync isn't stored in history, for privacy. Explicit sends ar
 - Someone connecting to your PC: they need a paired certificate or a valid, unused, unexpired pairing token.
 - A photographed QR code: the token works once, expires after 5 minutes, and pairing shows a notice with a way to remove the device.
 - Malicious file names: names are cleaned on receipt (see [protocol.md](protocol.md#file-names)).
+- A received file running a program on the PC: every received file carries the Windows Mark of the Web (SmartScreen and Office Protected View apply to it), and a click on a toast opens only an allow-list of safe types (pictures, audio, video, PDF, text, macro-free Office files); any other file is only shown in its folder (see [windows.md](windows.md#what-a-received-file-may-do)).
 
 **Doesn't protect against (MVP):** malware already on either device, or someone who has physically unlocked your phone or PC.
 

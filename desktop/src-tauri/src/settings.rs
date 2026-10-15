@@ -2,13 +2,14 @@
 //! the way to change them (and the tray has a check item for the clipboard sync).
 //!
 //! ```json
-//! { "autoClipboardSync": true, "hotkey": "Ctrl+Alt+Shift+K" }
+//! { "autoClipboardSync": true, "hotkey": "Ctrl+Alt+Shift+K", "receivedFolder": "D:\\Received", "imagesToClipboard": true }
 //! ```
 //!
 //! A missing file or a missing key means the default. A key with the wrong type is ignored (with a log line) and keeps its
 //! default, so one typo doesn't throw away the other settings. `hotkey` takes the accelerator syntax of the Tauri
 //! global-shortcut plugin (`Ctrl+Alt+Shift+K`, `Ctrl+Shift+F9`); an empty string turns the hotkey off. A change of the hotkey
-//! takes effect at the next start.
+//! takes effect at the next start. `receivedFolder` (absent or empty: `Downloads\Kin`) is where files from the phone go, and
+//! `imagesToClipboard` (on by default) puts a received image on the clipboard as well.
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
@@ -37,11 +38,15 @@ pub struct Settings {
     pub auto_clipboard_sync: bool,
     /// The accelerator of the global hotkey that sends the clipboard text as a `text` message. Empty means off.
     pub hotkey: String,
+    /// Where files from the phone go. `None` is `Downloads\Kin`.
+    pub received_folder: Option<String>,
+    /// A received image also goes to the clipboard, so Ctrl+V works at once (on by default, protocol of phase-1-mvp.md).
+    pub images_to_clipboard: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { auto_clipboard_sync: true, hotkey: DEFAULT_HOTKEY.to_string() }
+        Settings { auto_clipboard_sync: true, hotkey: DEFAULT_HOTKEY.to_string(), received_folder: None, images_to_clipboard: true }
     }
 }
 
@@ -65,11 +70,26 @@ impl Settings {
             Some(Value::String(s)) => settings.hotkey = s.trim().to_string(),
             Some(_) => problems.push("hotkey must be a string such as \"Ctrl+Alt+Shift+K\"".to_string()),
         }
+        match obj.get("receivedFolder") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(s)) => settings.received_folder = Some(s.trim().to_string()).filter(|s| !s.is_empty()),
+            Some(_) => problems.push("receivedFolder must be a folder path as a string".to_string()),
+        }
+        match obj.get("imagesToClipboard") {
+            None | Some(Value::Null) => {}
+            Some(Value::Bool(b)) => settings.images_to_clipboard = *b,
+            Some(_) => problems.push("imagesToClipboard must be true or false".to_string()),
+        }
         (settings, problems)
     }
 
     pub fn to_json(&self) -> Value {
-        json!({ "autoClipboardSync": self.auto_clipboard_sync, "hotkey": self.hotkey })
+        json!({
+            "autoClipboardSync": self.auto_clipboard_sync,
+            "hotkey": self.hotkey,
+            "receivedFolder": self.received_folder,
+            "imagesToClipboard": self.images_to_clipboard,
+        })
     }
 
     pub fn path(data_dir: &Path) -> PathBuf {
@@ -152,6 +172,19 @@ mod tests {
     }
 
     #[test]
+    fn the_received_folder_and_images_to_clipboard_settings() {
+        let (s, problems) = Settings::from_json(r#"{ "receivedFolder": "  D:\\Received  ", "imagesToClipboard": false }"#);
+        assert!(problems.is_empty());
+        assert_eq!((s.received_folder.as_deref(), s.images_to_clipboard), (Some("D:\\Received"), false));
+        let (s, _) = Settings::from_json(r#"{ "receivedFolder": "" }"#);
+        assert_eq!(s.received_folder, None, "empty means the default folder");
+        assert!(Settings::default().images_to_clipboard, "on by default");
+        let (s, problems) = Settings::from_json(r#"{ "receivedFolder": 5, "imagesToClipboard": "yes" }"#);
+        assert_eq!(problems.len(), 2);
+        assert_eq!((s.received_folder, s.images_to_clipboard), (None, true));
+    }
+
+    #[test]
     fn a_wrong_type_is_reported_and_only_that_key_falls_back() {
         let (s, problems) = Settings::from_json(r#"{ "autoClipboardSync": "no", "hotkey": "Ctrl+Shift+F9" }"#);
         assert_eq!(problems.len(), 1);
@@ -168,7 +201,12 @@ mod tests {
     fn saves_and_loads_through_the_data_directory() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(Settings::load(dir.path()), Settings::default(), "no file: the defaults");
-        let s = Settings { auto_clipboard_sync: false, hotkey: "Ctrl+Shift+F9".into() };
+        let s = Settings {
+            auto_clipboard_sync: false,
+            hotkey: "Ctrl+Shift+F9".into(),
+            received_folder: Some("D:/Received".into()),
+            images_to_clipboard: false,
+        };
         s.save(dir.path()).unwrap();
         assert_eq!(Settings::load(dir.path()), s);
         // A file written by Notepad starts with a byte order mark.

@@ -19,7 +19,7 @@ foreach ($run in 1..$Runs) {
     Remove-Item $data -Recurse -Force -ErrorAction SilentlyContinue
     $sw = [Diagnostics.Stopwatch]::StartNew()
     # The path is quoted, because Start-Process doesn't quote the arguments of an array for you, and the temp folder can have a space.
-    $p = Start-Process $exe -ArgumentList '--data-dir', ('"{0}"' -f $data), '--dev-bind', '127.0.0.1', '--dev-no-windows' -PassThru
+    $p = Start-Process $exe -ArgumentList '--data-dir', ('"{0}"' -f $data), '--dev-bind', '127.0.0.1', '--dev-received-dir', ('"{0}"' -f (Join-Path $data 'received')), '--dev-no-windows' -PassThru
     Start-Sleep -Seconds ([math]::Max(0, $IdleSeconds - $sw.Elapsed.TotalSeconds))
     $p.Refresh()
     $perf = Get-CimInstance Win32_PerfFormattedData_PerfProc_Process | Where-Object { $_.IDProcess -eq $p.Id }

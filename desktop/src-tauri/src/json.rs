@@ -62,6 +62,11 @@ pub fn valid_id(v: Option<&Value>) -> Option<&str> {
     (1..=MAX_ID_CHARS).contains(&n).then_some(s)
 }
 
+/// A transfer ID or file ID: 1 to 64 characters from `A-Z a-z 0-9 - _`, because it ends up in a URL path (protocol.md, "Message IDs").
+pub fn is_url_safe_id(s: &str) -> bool {
+    (1..=MAX_ID_CHARS).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// A required string of at least one code point.
 pub fn non_empty_str<'a>(map: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     map.get(key)?.as_str().filter(|s| !s.is_empty())

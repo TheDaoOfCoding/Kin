@@ -4,6 +4,7 @@
 //! The protocol and the app's state have no UI in them (`messages`, `server`, `ws`, `core`, ...), so the integration tests
 //! can run them in the test process. The Tauri side is `app`, `tray` and `ui`.
 pub mod app;
+pub mod arrival;
 pub mod cli;
 pub mod clipboard;
 pub mod connections;
@@ -11,18 +12,25 @@ pub mod core;
 mod dpapi;
 pub mod encoding;
 pub mod filelog;
+pub mod filenames;
+pub mod fileserver;
 pub mod identity;
+pub mod images;
 pub mod json;
 pub mod links;
 pub mod mdns;
 pub mod messages;
+pub mod motw;
 pub mod netaddr;
+pub mod outgoing;
 pub mod pairing;
+pub mod paths;
 pub mod server;
 pub mod settings;
 pub mod storage;
 pub mod sync;
 pub mod tls;
+pub mod transfers;
 pub mod tray;
 pub mod ui;
 pub mod ws;

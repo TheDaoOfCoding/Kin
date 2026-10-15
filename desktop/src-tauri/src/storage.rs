@@ -1,5 +1,5 @@
-//! SQLite storage. For milestone 1.1 that is the `devices` table, plus the memory of processed message IDs that
-//! protocol.md asks for ("De-duplication"), which has to survive a restart.
+//! SQLite storage: the `devices` table, the memory of processed message IDs that protocol.md asks for ("De-duplication"), which
+//! has to survive a restart, and (1.3) the `transfers` and `transfer_files` tables of architecture.md ("Storage").
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -53,6 +53,41 @@ CREATE TABLE IF NOT EXISTS seen_messages (
     seen_at    INTEGER NOT NULL,
     PRIMARY KEY (device_id, message_id)
 );
+-- direction: 'in' (phone to PC) or 'out' (PC to phone). status: 'active', 'done', 'failed' or 'canceled' ('queued' comes with 1.4).
+CREATE TABLE IF NOT EXISTS transfers (
+    id          TEXT PRIMARY KEY,
+    device_id   TEXT NOT NULL,
+    direction   TEXT NOT NULL,
+    kind        TEXT NOT NULL DEFAULT 'file',
+    status      TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    finished_at INTEGER,
+    expires_at  INTEGER,
+    total_bytes INTEGER NOT NULL,
+    error_code  TEXT,
+    dest_dir    TEXT
+);
+-- name: the final name of a received file (the one the PC chose), the sender's name for an outgoing one. local_path: the final
+-- path once finalized, else the .part path (in), or the source file (out); NULL once a dropped transfer's .part file has been removed.
+-- finalizing_name: the name the .part file is being moved to (written before the move, cleared when the move is recorded), so a
+-- restart in the middle can tell a finished move from a lost file.
+-- A transfer ID is never reused: rows of finished, canceled and failed transfers are kept, and a new transfer with a used ID is refused.
+CREATE TABLE IF NOT EXISTS transfer_files (
+    transfer_id     TEXT NOT NULL,
+    file_id         TEXT NOT NULL,
+    idx             INTEGER NOT NULL,
+    name            TEXT NOT NULL,
+    mime            TEXT NOT NULL,
+    size            INTEGER NOT NULL,
+    bytes_done      INTEGER NOT NULL DEFAULT 0,
+    local_path      TEXT,
+    finalized       INTEGER NOT NULL DEFAULT 0,
+    source_mtime_ms INTEGER,
+    temp_source     INTEGER NOT NULL DEFAULT 0,
+    finalizing_name TEXT,
+    PRIMARY KEY (transfer_id, file_id)
+);
 ";
 
 impl Db {
@@ -66,6 +101,15 @@ impl Db {
 
     fn init(conn: Connection) -> Result<Db> {
         conn.execute_batch(SCHEMA)?;
+        // A database made before `finalizing_name` existed gets the column.
+        let has_column = conn
+            .prepare("SELECT 1 FROM pragma_table_info('transfer_files') WHERE name = 'finalizing_name'")?
+            .query_row([], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if !has_column {
+            conn.execute_batch("ALTER TABLE transfer_files ADD COLUMN finalizing_name TEXT")?;
+        }
         Ok(Db(Mutex::new(conn)))
     }
 
@@ -159,6 +203,245 @@ impl Db {
     }
 }
 
+/// A row of `transfers`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TransferRow {
+    pub id: String,
+    pub device_id: String,
+    pub direction: String,
+    pub status: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub finished_at: Option<i64>,
+    pub expires_at: Option<i64>,
+    pub total_bytes: i64,
+    pub error_code: Option<String>,
+    pub dest_dir: Option<String>,
+}
+
+/// A row of `transfer_files`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TransferFileRow {
+    pub file_id: String,
+    pub idx: i64,
+    pub name: String,
+    pub mime: String,
+    pub size: i64,
+    pub bytes_done: i64,
+    pub local_path: Option<String>,
+    pub finalized: bool,
+    pub source_mtime_ms: Option<i64>,
+    pub temp_source: bool,
+    /// A received file: the final name its `.part` file was being moved to when the app last wrote to the database.
+    pub finalizing_name: Option<String>,
+}
+
+const SELECT_TRANSFER: &str = "SELECT id, device_id, direction, status, created_at, updated_at, finished_at, expires_at, total_bytes, error_code, dest_dir FROM transfers";
+
+fn read_transfer(r: &rusqlite::Row<'_>) -> rusqlite::Result<TransferRow> {
+    Ok(TransferRow {
+        id: r.get(0)?,
+        device_id: r.get(1)?,
+        direction: r.get(2)?,
+        status: r.get(3)?,
+        created_at: r.get(4)?,
+        updated_at: r.get(5)?,
+        finished_at: r.get(6)?,
+        expires_at: r.get(7)?,
+        total_bytes: r.get(8)?,
+        error_code: r.get(9)?,
+        dest_dir: r.get(10)?,
+    })
+}
+
+fn read_transfer_file(r: &rusqlite::Row<'_>) -> rusqlite::Result<TransferFileRow> {
+    Ok(TransferFileRow {
+        file_id: r.get(0)?,
+        idx: r.get(1)?,
+        name: r.get(2)?,
+        mime: r.get(3)?,
+        size: r.get(4)?,
+        bytes_done: r.get(5)?,
+        local_path: r.get(6)?,
+        finalized: r.get::<_, i64>(7)? != 0,
+        source_mtime_ms: r.get(8)?,
+        temp_source: r.get::<_, i64>(9)? != 0,
+        finalizing_name: r.get(10)?,
+    })
+}
+
+const SELECT_TRANSFER_FILE: &str = "SELECT file_id, idx, name, mime, size, bytes_done, local_path, finalized, source_mtime_ms, temp_source, finalizing_name FROM transfer_files";
+
+fn files_of(conn: &Connection, id: &str) -> Result<Vec<TransferFileRow>> {
+    let mut stmt = conn.prepare(&format!("{SELECT_TRANSFER_FILE} WHERE transfer_id = ?1 ORDER BY idx"))?;
+    Ok(stmt.query_map([id], read_transfer_file)?.collect::<std::result::Result<_, _>>()?)
+}
+
+fn with_files(conn: &Connection, rows: Vec<TransferRow>) -> Result<Vec<(TransferRow, Vec<TransferFileRow>)>> {
+    rows.into_iter()
+        .map(|t| {
+            let files = files_of(conn, &t.id)?;
+            Ok((t, files))
+        })
+        .collect()
+}
+
+impl Db {
+    /// Stores a transfer and its files. A transfer ID is never reused, so an ID that is already there is an error and nothing is
+    /// changed: the old records are never replaced or wiped.
+    pub fn insert_transfer(&self, t: &TransferRow, files: &[TransferFileRow]) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO transfers (id, device_id, direction, status, created_at, updated_at, finished_at, expires_at, total_bytes, error_code, dest_dir)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                t.id,
+                t.device_id,
+                t.direction,
+                t.status,
+                t.created_at,
+                t.updated_at,
+                t.finished_at,
+                t.expires_at,
+                t.total_bytes,
+                t.error_code,
+                t.dest_dir
+            ],
+        )?;
+        for f in files {
+            tx.execute(
+                "INSERT INTO transfer_files (transfer_id, file_id, idx, name, mime, size, bytes_done, local_path, finalized, source_mtime_ms, temp_source, finalizing_name)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    t.id,
+                    f.file_id,
+                    f.idx,
+                    f.name,
+                    f.mime,
+                    f.size,
+                    f.bytes_done,
+                    f.local_path,
+                    f.finalized as i64,
+                    f.source_mtime_ms,
+                    f.temp_source as i64,
+                    f.finalizing_name
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_transfer_status(&self, id: &str, status: &str, now_ms: i64, error: Option<&str>) -> Result<()> {
+        let finished = (status != "active").then_some(now_ms);
+        self.conn().execute(
+            "UPDATE transfers SET status = ?2, updated_at = ?3, finished_at = ?4, error_code = ?5 WHERE id = ?1",
+            params![id, status, now_ms, finished, error],
+        )?;
+        Ok(())
+    }
+
+    /// Notes that something happened to the transfer (a file made progress), so the 24 hour clock of a `.part` file restarts.
+    pub fn touch_transfer(&self, id: &str, now_ms: i64) -> Result<()> {
+        self.conn().execute("UPDATE transfers SET updated_at = ?2 WHERE id = ?1", params![id, now_ms])?;
+        Ok(())
+    }
+
+    pub fn set_file_progress(&self, transfer_id: &str, file_id: &str, bytes_done: u64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE transfer_files SET bytes_done = ?3 WHERE transfer_id = ?1 AND file_id = ?2",
+            params![transfer_id, file_id, bytes_done as i64],
+        )?;
+        Ok(())
+    }
+
+    /// A received file got its final name and path (the `.part` file was moved).
+    pub fn set_file_final(&self, transfer_id: &str, file_id: &str, name: &str, path: &str, bytes_done: u64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE transfer_files SET name = ?3, local_path = ?4, finalized = 1, bytes_done = ?5, finalizing_name = NULL WHERE transfer_id = ?1 AND file_id = ?2",
+            params![transfer_id, file_id, name, path, bytes_done as i64],
+        )?;
+        Ok(())
+    }
+
+    /// A received file's `.part` name (it is created again if it was lost, possibly with another name).
+    pub fn set_file_part(&self, transfer_id: &str, file_id: &str, name: &str, path: &str, bytes_done: u64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE transfer_files SET name = ?3, local_path = ?4, finalized = 0, bytes_done = ?5, finalizing_name = NULL WHERE transfer_id = ?1 AND file_id = ?2",
+            params![transfer_id, file_id, name, path, bytes_done as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The `.part` file of a received file is about to be moved to `final_name` (written before the move; `set_file_final` clears it).
+    pub fn set_file_finalizing(&self, transfer_id: &str, file_id: &str, final_name: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE transfer_files SET finalizing_name = ?3 WHERE transfer_id = ?1 AND file_id = ?2",
+            params![transfer_id, file_id, final_name],
+        )?;
+        Ok(())
+    }
+
+    /// The `.part` file of a dropped transfer is gone: the record no longer points at a path (so nothing ever deletes it again).
+    pub fn clear_file_path(&self, transfer_id: &str, file_id: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE transfer_files SET local_path = NULL, finalizing_name = NULL WHERE transfer_id = ?1 AND file_id = ?2 AND finalized = 0",
+            params![transfer_id, file_id],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a transfer with this ID has ever been recorded, in any state. An ID is never used twice.
+    pub fn transfer_exists(&self, id: &str) -> Result<bool> {
+        Ok(self.conn().query_row("SELECT 1 FROM transfers WHERE id = ?1", [id], |_| Ok(())).optional()?.is_some())
+    }
+
+    pub fn get_transfer(&self, id: &str) -> Result<Option<(TransferRow, Vec<TransferFileRow>)>> {
+        let conn = self.conn();
+        let Some(t) = conn.query_row(&format!("{SELECT_TRANSFER} WHERE id = ?1"), [id], read_transfer).optional()? else {
+            return Ok(None);
+        };
+        let files = files_of(&conn, &t.id)?;
+        Ok(Some((t, files)))
+    }
+
+    /// Transfers that are still going (`active`), and the ones that finished after `since_ms` (so a repeated request for a
+    /// transfer that just ended can still be answered).
+    pub fn load_open_transfers(&self, since_ms: i64) -> Result<Vec<(TransferRow, Vec<TransferFileRow>)>> {
+        let conn = self.conn();
+        let rows: Vec<TransferRow> = {
+            let mut stmt =
+                conn.prepare(&format!("{SELECT_TRANSFER} WHERE status = 'active' OR (status = 'done' AND finished_at >= ?1)"))?;
+            stmt.query_map([since_ms], read_transfer)?.collect::<std::result::Result<_, _>>()?
+        };
+        with_files(&conn, rows)
+    }
+
+    /// The newest transfers, newest first (for `status.json` and, later, the history).
+    pub fn recent_transfers(&self, limit: usize) -> Result<Vec<(TransferRow, Vec<TransferFileRow>)>> {
+        let conn = self.conn();
+        let rows: Vec<TransferRow> = {
+            let mut stmt = conn.prepare(&format!("{SELECT_TRANSFER} ORDER BY created_at DESC, rowid DESC LIMIT ?1"))?;
+            stmt.query_map([limit as i64], read_transfer)?.collect::<std::result::Result<_, _>>()?
+        };
+        with_files(&conn, rows)
+    }
+
+    /// The `.part` files that the database still assigns to a received transfer that is over (done, failed or canceled): what is left
+    /// when the app stopped between ending a transfer and deleting its files. `(transfer ID, file ID, path)`. A path that any record
+    /// has as a *finished* file is never in the list: a phone can send a file that is named like a `.part` file.
+    pub fn leftover_part_files(&self) -> Result<Vec<(String, String, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT f.transfer_id, f.file_id, f.local_path FROM transfer_files f JOIN transfers t ON t.id = f.transfer_id
+             WHERE t.direction = 'in' AND t.status != 'active' AND f.finalized = 0 AND f.local_path IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM transfer_files g WHERE g.finalized = 1 AND g.local_path = f.local_path)",
+        )?;
+        Ok(stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<_, _>>()?)
+    }
+}
+
 const SELECT_DEVICE: &str = "SELECT device_id, name, platform, model, app_version, paired_at, last_seen, last_addresses FROM devices";
 
 fn read_device(r: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
@@ -181,6 +464,29 @@ mod tests {
 
     fn device<'a>(id: &'a str, name: &'a str) -> NewDevice<'a> {
         NewDevice { device_id: id, name, platform: "android", model: Some("Pixel"), app_version: Some("0.1.0") }
+    }
+
+    #[test]
+    fn a_database_from_before_finalizing_name_gets_the_column_and_keeps_its_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE transfers (id TEXT PRIMARY KEY, device_id TEXT NOT NULL, direction TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'file',
+               status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, finished_at INTEGER, expires_at INTEGER,
+               total_bytes INTEGER NOT NULL, error_code TEXT, dest_dir TEXT);
+             CREATE TABLE transfer_files (transfer_id TEXT NOT NULL, file_id TEXT NOT NULL, idx INTEGER NOT NULL, name TEXT NOT NULL,
+               mime TEXT NOT NULL, size INTEGER NOT NULL, bytes_done INTEGER NOT NULL DEFAULT 0, local_path TEXT, finalized INTEGER NOT NULL DEFAULT 0,
+               source_mtime_ms INTEGER, temp_source INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (transfer_id, file_id));
+             INSERT INTO transfers (id, device_id, direction, status, created_at, updated_at, total_bytes) VALUES ('old', 'd', 'in', 'done', 1, 1, 5);
+             INSERT INTO transfer_files (transfer_id, file_id, idx, name, mime, size, finalized) VALUES ('old', 'f', 0, 'a.bin', '', 5, 1);",
+        )
+        .unwrap();
+        let db = Db::init(conn).unwrap();
+        let (_, files) = db.get_transfer("old").unwrap().unwrap();
+        assert_eq!((files[0].name.as_str(), files[0].finalizing_name.clone()), ("a.bin", None));
+        db.set_file_finalizing("old", "f", "b.bin").unwrap();
+        assert_eq!(db.get_transfer("old").unwrap().unwrap().1[0].finalizing_name.as_deref(), Some("b.bin"));
+        // Opening it a second time (the column is there now) is fine too.
+        assert!(db.transfer_exists("old").unwrap());
     }
 
     #[test]
