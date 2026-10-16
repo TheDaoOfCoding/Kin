@@ -15,6 +15,7 @@ type Transfer = {
   status: "active" | "done" | "failed" | "canceled";
   files: number;
   filesDone?: number;
+  filesActive?: number;
   bytesDone: number;
   totalBytes: number;
   speedBps?: number;
@@ -50,7 +51,10 @@ function title(t: Transfer): string {
 function describe(t: Transfer): string {
   if (t.status === "active") {
     const speed = t.speedBps && t.speedBps > 0 ? ` · ${size(t.speedBps)}/s` : "";
-    return `${size(t.bytesDone)} of ${size(t.totalBytes)}${speed}`;
+    // A batch moves several files at once (up to 4): say how far it is and how many are going now.
+    const files = t.files > 1 ? `${t.filesDone ?? 0} of ${t.files} files · ` : "";
+    const parallel = t.filesActive && t.filesActive > 1 ? ` · ${t.filesActive} at once` : "";
+    return `${files}${size(t.bytesDone)} of ${size(t.totalBytes)}${speed}${parallel}`;
   }
   const names: Record<string, string> = { done: "Done", failed: "Failed", canceled: "Canceled" };
   return `${names[t.status] ?? t.status} · ${size(t.totalBytes)}${t.error && t.status !== "done" ? ` (${t.error})` : ""}`;

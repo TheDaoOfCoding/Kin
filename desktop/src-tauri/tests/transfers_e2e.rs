@@ -259,8 +259,9 @@ async fn a_connection_the_pc_has_not_noticed_is_dead_yet_is_taken_over_by_the_ne
     assert_eq!(old.post_transfer("take", &[("f", "x.bin", size)]).await.status, 200);
     // The old connection stalls after 3 MiB and stays open (Wi-Fi switched off, the PC hasn't noticed).
     assert!(old.put("take", "f", 0, size, &pat, Some(3 * MIB)).await.is_none());
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    // The phone is back on a new connection. The POST stops the old writer first, so the answer is exact.
+    // The old writer has been quiet for more than a second (a POST leaves a writer that is still receiving alone).
+    tokio::time::sleep(Duration::from_millis(1_150)).await;
+    // The phone is back on a new connection. The POST stops the quiet old writer first, so the answer is exact.
     let mut new = http(&w).await;
     let r = new.post_transfer("take", &[("f", "x.bin", size)]).await;
     assert_eq!(r.status, 200);

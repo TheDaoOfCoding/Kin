@@ -14,6 +14,9 @@ param(
     [double]$Megapixels = 12,
     [int]$TimeoutSeconds = 60
 )
+# Only one of the Kin scripts (e2e, smoke, capture, check) may run at a time: they share the real clipboard, the Kin.exe slot and the emulator (tools\kin-lock.ps1).
+. (Join-Path $PSScriptRoot '..\tools\kin-lock.ps1'); Enter-KinLock 'check-rotation'
+. (Join-Path $PSScriptRoot '..\tools\kin-dev.ps1')   # a Kin of our own beside the installed one; every command carries --data-dir (kin-dev.ps1)
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 . (Join-Path $here 'clipboard-backup.ps1')
@@ -24,6 +27,7 @@ $data = Join-Path $work 'data'; $recv = Join-Path $work 'received'; $save = Join
 $backup = $null
 $rows = New-Object System.Collections.Generic.List[object]
 $failures = 0
+$p = $null   # the fake phone of the round that is running
 
 function Wait-Until([scriptblock]$Cond, [double]$Seconds = 20) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -31,7 +35,7 @@ function Wait-Until([scriptblock]$Cond, [double]$Seconds = 20) {
     return $false
 }
 function Kin-Log { (Get-Content -LiteralPath (Join-Path $data 'logs\kin.log') -Raw -ErrorAction SilentlyContinue) }
-function Stop-Kin { if (Get-Process Kin -ErrorAction SilentlyContinue) { & $kin --quit; Wait-Until { -not (Get-Process Kin -ErrorAction SilentlyContinue) } 10 | Out-Null } }
+function Stop-Kin { Stop-DevKin 10 }   # --quit to our data directory; a hung process of ours is stopped by its ID
 
 # The four quadrants of the stored picture: red top left, green top right, blue bottom left, yellow bottom right, with noise on every pixel
 # (+-20 per channel) so that the JPEG is as big as a real photo (about 5 MB for 12 MP) and not a few flat blocks.
@@ -91,7 +95,7 @@ $expected = @{
 
 try {
     foreach ($f in $kin, $phoneExe) { if (-not (Test-Path -LiteralPath $f)) { throw "$f is missing: build it first" } }
-    if (Get-Process Kin -ErrorAction SilentlyContinue) { throw 'Kin.exe is already running: quit it first.' }
+    Set-KinDev -Exe $kin -DataDir $data
     New-Item -ItemType Directory -Force -Path $work, $src, $save | Out-Null
     $backup = Save-Clipboard
     Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -109,9 +113,9 @@ try {
         if (Test-Path -LiteralPath $data) { [IO.Directory]::Delete($data, $true) }
         New-Item -ItemType Directory -Force -Path $recv | Out-Null
         Get-ChildItem -LiteralPath $recv | Remove-Item -Force
-        Start-Process $kin -ArgumentList @('--data-dir', ('"{0}"' -f $data), '--dev-bind', '127.0.0.1', '--dev-received-dir', ('"{0}"' -f $recv), '--dev-print-pair-url', '--dev-no-windows') | Out-Null
+        Start-DevKin @('--data-dir', ('"{0}"' -f $data), '--dev-bind', '127.0.0.1', '--dev-received-dir', ('"{0}"' -f $recv), '--dev-print-pair-url', '--dev-no-windows') | Out-Null
         if (-not (Wait-Until { Test-Path -LiteralPath (Join-Path $data 'status.json') } 15)) { throw 'Kin did not start' }
-        & $kin --dev-start-pairing
+        Invoke-Kin --dev-start-pairing
         if (-not (Wait-Until { Test-Path -LiteralPath (Join-Path $data 'pair-url.txt') } 10)) { throw 'no pairing URL' }
         Start-Sleep -Milliseconds 400
         $url = (Get-Content -LiteralPath (Join-Path $data 'pair-url.txt')).Trim()
@@ -156,13 +160,12 @@ try {
     }
 }
 finally {
-    Get-Process fake_phone -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Stop-OwnProcess $p      # the fake phone this script started (by ID, never by name)
     Stop-Kin
-    Get-Process Kin -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     if ($backup) { $ok = Restore-Clipboard $backup; Write-Host ("the clipboard is back as it was (every format): {0}" -f [bool]$ok) }
     Start-Sleep -Milliseconds 300
     if ([IO.Directory]::Exists($work)) { try { [IO.Directory]::Delete($work, $true) } catch { } }
-    Write-Host ("nothing left running: {0}; work folder gone: {1}" -f (-not (Get-Process Kin, fake_phone -ErrorAction SilentlyContinue)), (-not (Test-Path -LiteralPath $work)))
+    Write-Host ("nothing left running: {0}; work folder gone: {1}" -f ((@(Get-DevKinProcesses).Count -eq 0) -and (-not $p -or $p.HasExited)), (-not (Test-Path -LiteralPath $work)))
 }
 Write-Host ''
 $rows | Format-Table -AutoSize | Out-String | Write-Host

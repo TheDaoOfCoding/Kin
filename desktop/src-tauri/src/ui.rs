@@ -49,16 +49,32 @@ pub fn open_pairing_window(app: &AppHandle, fresh: bool) {
     // Building a window blocks until the main thread has made it, so don't do it on the main thread.
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let built = WebviewWindowBuilder::new(&app, PAIRING_WINDOW, WebviewUrl::App("index.html".into()))
-            .title("Pair new phone")
-            .inner_size(380.0, 620.0)
-            .resizable(false)
-            .center()
-            .build();
+        let built = with_instance_data(
+            &app,
+            WebviewWindowBuilder::new(&app, PAIRING_WINDOW, WebviewUrl::App("index.html".into()))
+                .title("Pair new phone")
+                .inner_size(380.0, 620.0)
+                .resizable(false)
+                .center(),
+        )
+        .build();
         if let Err(e) = built {
             log::error!("opening the pairing window failed: {e}");
         }
     });
+}
+
+/// A Kin that runs beside the installed one (its own data directory, `instance.rs`) keeps the data of its web views (cache, storage) in a
+/// folder of that directory, `webview`, so a test copy leaves nothing in the profile of the installed Kin or in `%LOCALAPPDATA%`, and
+/// goes away with its throwaway directory. The installed Kin keeps the default place.
+fn with_instance_data<'a>(
+    app: &AppHandle,
+    builder: WebviewWindowBuilder<'a, tauri::Wry, AppHandle>,
+) -> WebviewWindowBuilder<'a, tauri::Wry, AppHandle> {
+    match app.try_state::<AppState>() {
+        Some(state) if state.core.config.instance_key().is_some() => builder.data_directory(state.core.config.data_dir.join("webview")),
+        _ => builder,
+    }
 }
 
 /// Opens the drop window, or brings it to the front.
@@ -75,12 +91,15 @@ pub fn open_drop_window(app: &AppHandle) {
     }
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let built = WebviewWindowBuilder::new(&app, DROP_WINDOW, WebviewUrl::App("index.html?w=drop".into()))
-            .title("Send to phone")
-            .inner_size(400.0, 520.0)
-            .min_inner_size(360.0, 360.0)
-            .center()
-            .build();
+        let built = with_instance_data(
+            &app,
+            WebviewWindowBuilder::new(&app, DROP_WINDOW, WebviewUrl::App("index.html?w=drop".into()))
+                .title("Send to phone")
+                .inner_size(400.0, 520.0)
+                .min_inner_size(360.0, 360.0)
+                .center(),
+        )
+        .build();
         if let Err(e) = built {
             log::error!("opening the drop window failed: {e}");
         }
@@ -244,12 +263,15 @@ fn open_page(app: &AppHandle, label: &'static str, title: &'static str, size: (f
     }
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let built = WebviewWindowBuilder::new(&app, label, WebviewUrl::App(format!("index.html?w={label}").into()))
-            .title(title)
-            .inner_size(size.0, size.1)
-            .min_inner_size(min.0, min.1)
-            .center()
-            .build();
+        let built = with_instance_data(
+            &app,
+            WebviewWindowBuilder::new(&app, label, WebviewUrl::App(format!("index.html?w={label}").into()))
+                .title(title)
+                .inner_size(size.0, size.1)
+                .min_inner_size(min.0, min.1)
+                .center(),
+        )
+        .build();
         if let Err(e) = built {
             log::error!("opening the {label} window failed: {e}");
         }

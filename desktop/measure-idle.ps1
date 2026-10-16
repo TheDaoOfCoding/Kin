@@ -14,23 +14,26 @@ param(
     [int]$Runs = 3,
     [switch]$OpenWindows
 )
+# Only one of the Kin scripts (e2e, smoke, capture, check) may run at a time: they share the real clipboard, the Kin.exe slot and the emulator (tools\kin-lock.ps1).
+. (Join-Path $PSScriptRoot '..\tools\kin-lock.ps1'); Enter-KinLock 'measure-idle'
+. (Join-Path $PSScriptRoot '..\tools\kin-dev.ps1')   # a Kin of our own beside the installed one; every command carries --data-dir (kin-dev.ps1)
 $ErrorActionPreference = 'Stop'
 $exe = Join-Path $PSScriptRoot 'src-tauri\target\release\Kin.exe'
-if (Get-Process Kin -ErrorAction SilentlyContinue) { throw 'Kin is already running; quit it first' }
+if ($OpenWindows) { Assert-NoGameRunning }   # windows are shown
 
 function Open-AndCloseEveryWindow([string]$exe) {
     # window title -> the command that opens it
     $windows = [ordered]@{ 'Pair new phone' = '--pair'; 'Send to phone' = '--drop'; 'History' = '--history'; 'Settings' = '--settings'; 'Debug' = '--debug-window' }
     foreach ($title in $windows.Keys) {
-        & $exe $windows[$title]
+        Invoke-Kin $windows[$title]
         $deadline = [DateTime]::Now.AddSeconds(15)
-        while ([DateTime]::Now -lt $deadline -and -not (Get-Process Kin | Where-Object { $_.MainWindowTitle -eq $title })) { Start-Sleep -Milliseconds 200 }
+        while ([DateTime]::Now -lt $deadline -and -not (Get-DevKinProcesses | Where-Object { $_.MainWindowTitle -eq $title })) { Start-Sleep -Milliseconds 200 }
         Start-Sleep -Seconds 2   # let the page load and draw
-        $w = Get-Process Kin | Where-Object { $_.MainWindowTitle -eq $title } | Select-Object -First 1
+        $w = Get-DevKinProcesses | Where-Object { $_.MainWindowTitle -eq $title } | Select-Object -First 1   # OUR Kin only
         if (-not $w) { Write-Warning "the '$title' window did not open"; continue }
         [void]$w.CloseMainWindow()
         $deadline = [DateTime]::Now.AddSeconds(10)
-        while ([DateTime]::Now -lt $deadline -and (Get-Process Kin | Where-Object { $_.MainWindowTitle -eq $title })) { Start-Sleep -Milliseconds 200 }
+        while ([DateTime]::Now -lt $deadline -and (Get-DevKinProcesses | Where-Object { $_.MainWindowTitle -eq $title })) { Start-Sleep -Milliseconds 200 }
     }
 }
 
@@ -41,7 +44,8 @@ foreach ($run in 1..$Runs) {
     # The path is quoted, because Start-Process doesn't quote the arguments of an array for you, and the temp folder can have a space.
     $kinArgs = @('--data-dir', ('"{0}"' -f $data), '--dev-bind', '127.0.0.1', '--dev-received-dir', ('"{0}"' -f (Join-Path $data 'received')))
     $kinArgs += $(if ($OpenWindows) { '--dev-no-toasts' } else { '--dev-no-windows' })
-    $p = Start-Process $exe -ArgumentList $kinArgs -PassThru
+    Set-KinDev -Exe $exe -DataDir $data
+    $p = Start-DevKin $kinArgs
     if ($OpenWindows) {
         Start-Sleep -Seconds 3
         Open-AndCloseEveryWindow $exe
@@ -61,8 +65,6 @@ foreach ($run in 1..$Runs) {
         Threads = $p.Threads.Count
         Handles = $p.HandleCount
     } | Format-Table -AutoSize | Out-String
-    Start-Process $exe -ArgumentList '--quit' -Wait | Out-Null
-    [void]$p.WaitForExit(8000)
-    if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
-    Remove-Item $data -Recurse -Force -ErrorAction SilentlyContinue
+    Stop-DevKin 8   # --quit to our data directory (never to the installed Kin); a hung process of ours is stopped by its ID
+    Remove-DevDataDir $data
 }

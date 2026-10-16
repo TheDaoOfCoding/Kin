@@ -48,9 +48,10 @@ desktop/
       localtime.rs         1.4: local time for "last seen" (Windows converts, the wording is plain code)
       app.rs, tray.rs, ui.rs   the Tauri side: start-up, single instance, tray (the menu of windows.md), global hotkey (changed from the settings window), toasts and clicks on them, windows, UI commands
     windows/hooks.nsh      1.5: the installer hooks (the firewall rules, the uninstall steps): `bundle.windows.nsis.installerHooks` in tauri.conf.json
-    tests/                 vectors.rs, transfer_vectors.rs, tls_vectors.rs, fake_phone.rs, transfers_e2e.rs, offers_e2e.rs, review_1_3.rs, server_limits.rs, queue_1_4.rs, review_1_4.rs (+ common/)
+    tests/                 vectors.rs, transfer_vectors.rs, tls_vectors.rs, fake_phone.rs, transfers_e2e.rs, offers_e2e.rs, review_1_3.rs, server_limits.rs, queue_1_4.rs, review_1_4.rs, parallel_files.rs (v0.1.1: 4 files of one transfer at once, both directions) (+ common/)
     examples/fake_phone.rs a fake phone for manual checks and for the scripts
-  clipboard-backup.ps1     save and restore every format of the real clipboard (used by check-1-3.ps1)
+  clipboard-backup.ps1     save and restore every format of the real clipboard (used by the check and e2e scripts). v0.1.1: `Save-Clipboard` keeps an earlier backup that a crashed run left behind instead of overwriting it
+  run-real-clipboard-test.ps1  v0.1.1: runs the one unit test that uses the real clipboard (`clear_if_text`) between Save-Clipboard and Restore-Clipboard
   check-1-3.ps1            the 1.3 checks against the real Kin.exe
   check-rotation.ps1       a 12 MP photo with EXIF rotation (orientations 6, 3 and 8) uploaded to the real Kin.exe: how long the `PUT` and the clipboard take, and the corners of the picture
   check-dragdrop.ps1       a real drag and drop onto the drop window
@@ -81,7 +82,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1    # release build + NSIS ins
 
 **`cargo test --release` (and any `cargo build --release`) overwrites `target\release\Kin.exe` with a dev-server build** (a plain cargo build does not embed the pages: the window would load `http://localhost:1420`). After one, run `build.ps1` again before a script that starts the real app. `check-1-4.ps1` and `tools\e2e-1-*.ps1` refuse an exe that is newer than the installer in `bundle\nsis` (which `tauri build` writes just after the exe); `-Build` rebuilds it.
 
-Outputs: `src-tauri\target\release\Kin.exe` and `src-tauri\target\release\bundle\nsis\Kin_0.1.0_x64-setup.exe` (3.59 MiB, per-machine, unsigned). **Running the installer needs administrator rights, and no script here runs it**: the generated NSIS script is `src-tauri\target\release\nsis\x64\installer.nsi` (the hooks are included from `src-tauri\windows\hooks.nsh`), and an install is checked by hand with `verify-install.ps1` (see docs/TESTING.md). If the bundler's own NSIS download times out, stage NSIS by hand as described in [phase-0-tauri.md](../docs/results/phase-0-tauri.md#snag-the-nsis-download-timed-out).
+Outputs: `src-tauri\target\release\Kin.exe` and `src-tauri\target\release\bundle\nsis\Kin_0.1.1_x64-setup.exe` (3.6 MiB, per-machine, unsigned). **Running the installer needs administrator rights, and no script here runs it**: the generated NSIS script is `src-tauri\target\release\nsis\x64\installer.nsi` (the hooks are included from `src-tauri\windows\hooks.nsh`), and an install is checked by hand with `verify-install.ps1` (see docs/TESTING.md). If the bundler's own NSIS download times out, stage NSIS by hand as described in [phase-0-tauri.md](../docs/results/phase-0-tauri.md#snag-the-nsis-download-timed-out).
 
 **The ignored tests.** `cargo test real_clipboard -- --ignored --test-threads=1` touches the **real clipboard** (it saves the text, uses the clipboard, puts the text back, and does nothing if there is more than plain text on it). The 2 GB runs are ignored because they move 2 GB through the disk (in a temporary folder that is deleted): `cargo test --release --test transfers_e2e large_upload -- --ignored --nocapture` and `cargo test --release --test offers_e2e large_download -- --ignored --nocapture` print `THROUGHPUT` lines.
 
@@ -100,11 +101,36 @@ powershell -STA -ExecutionPolicy Bypass -File check-dragdrop.ps1             # a
 
 `check-1-3.ps1`, `check-1-4.ps1`, `capture-windows.ps1` and `check-rotation.ps1` use the **real clipboard**: `clipboard-backup.ps1` saves every format of it first and puts them back at the end (also after a failure), and `-SkipClipboard` leaves those checks out.
 
+**They run beside the user's installed Kin** (v0.1.1): every script gives its Kin a data directory of its own, so it is a separate instance (below), sends every command with `--data-dir`, and refuses only when a Kin is running on *its own* data directory. `check-dev-beside-installed.ps1` is the proof of that (31 checks: two test Kins beside the installed one, commands routed by data directory, marked clipboard text, the installed Kin unchanged). The shared code is `tools\kin-dev.ps1`; see [tools/README.md](../tools/README.md#kin-devps1).
+
 `bun tauri dev` works too (Vite on `localhost:1420`), but the developer settings below are what you want for anything that listens.
 
 ## Developer and integration settings
 
 Everything here is also available in a release build, so the integration agent can drive the real `Kin.exe` without clicking. **Every setting that has to do with the network is loopback only: with `--dev-bind` or `--dev-qr-address` the app never binds to anything but `127.0.0.1` (or `::1`), and it doesn't start mDNS** (which would open multicast sockets on every interface). No Windows Firewall prompt can appear. **Always give a test run `--data-dir` and `--dev-received-dir`**: without the second, received files go to the real `Downloads\Kin`.
+
+### A test Kin beside the installed one
+
+**An instance is its data directory** (`instance.rs`). The installed Kin's own directory, `%APPDATA%\Kin`, is *the* instance. Any other `--data-dir` (or `KIN_DATA_DIR`) is another instance with a key of its own, a short hash of the directory's normalised path (absolute, `..` resolved, long names, no `\\?\`, lower case: every spelling of one folder has one key, whether or not it exists yet). Everything that Windows would share between two copies of the program is made from the key, so the two never meet:
+
+| Shared thing | What an instance with a key does |
+|---|---|
+| Single-instance lock (mutex, window class and name of `tauri-plugin-single-instance`) | Built from the bundle identifier, which the app replaces at start by `app.kinrelay.desktop.dev-<key>`. A second launch with the same `--data-dir` reaches this instance; a launch with another data directory is another instance (it starts), and a launch with none is the installed Kin's |
+| App user model ID of the process and the origin of toasts (the notification plugin takes the identifier) | The same `app.kinrelay.desktop.dev-<key>`, never the installed Kin's. A copy that runs from `target\release` shows its toasts as "Windows PowerShell" as before (the plugin's rule for a build folder), one that runs from anywhere else under its own name, which Windows doesn't show: use `--dev-no-toasts` or `--dev-no-windows` for a quiet run |
+| Port | Never the default 47821: the one from `--dev-port`, else any free port (a bind to `127.0.0.1:47821` can succeed on Windows beside the installed Kin's bind to every interface and would take loopback traffic) |
+| Bind address | `127.0.0.1` unless `--dev-bind` gives another loopback address (a keyed copy listening on every interface would raise a Windows Firewall prompt for its program file) |
+| mDNS | Never advertised, whatever the other flags say |
+| Hotkey | The default `Ctrl+Alt+Shift+K` is the installed Kin's: an instance with a key does not register it (`status.json` says `registered: false` and no error); another key can be set with `--dev-set hotkey` |
+| "Start with Windows", the Send to shortcut | Already the stand-in file and nothing (a `--data-dir` of its own is never "a normal run") |
+| Web view data (cache, storage) | `<data dir>\webview`, not `%LOCALAPPDATA%\<identifier>`; it goes with the throwaway directory (the helper processes hold it for a moment after Kin quits: delete the directory with a retry, `Remove-DevDataDir` in `tools\kin-dev.ps1`) |
+| The real clipboard | Every text and image the instance writes carries `ExcludeClipboardContentFromMonitorProcessing` (the format an installed Kin, 0.1.0 too, skips: it sends none of it to a phone, and Windows keeps it out of its history and the cloud clipboard) and `KinRelayDevTestContent`, which only an instance with a key reads: it then treats the content as ordinary text (its own sync, hotkey and echo guard behave as for any copy). A real password manager's mark, without the test format, still holds it back |
+
+**Two refusals protect the installed Kin** (both exit with 1 and write the reason to `kin-startup-error.txt` in the temp folder):
+
+- **`--dev-*` settings need a `--data-dir` of their own.** Without it they would run against the profile of the installed Kin (its identity, pairing and history).
+- **A launch with no data directory hands nothing to a running Kin that is another program file.** `Kin.exe --quit` from `target\release` with the installed Kin running would otherwise quit the user's Kin. The program that owns the single-instance window is found the way the second launch finds it (`instance::running_program`) and compared with the launching file: the "Send to" shortcut and the Start Menu shortcut run the same file as the running one, so they are never refused.
+
+To start one by hand: `Kin.exe --data-dir "%LOCALAPPDATA%\Temp\kin-mine" --dev-bind 127.0.0.1 --dev-port 49333 --dev-received-dir "%LOCALAPPDATA%\Temp\kin-mine\received" --dev-print-pair-url --dev-no-windows`, and give every later command the same `--data-dir`: `Kin.exe --data-dir "%LOCALAPPDATA%\Temp\kin-mine" --send a.jpg`, `... --quit`.
 
 ### Settings (first launch)
 
@@ -112,10 +138,10 @@ A flag wins over its environment variable.
 
 | Flag | Environment variable | Meaning |
 |---|---|---|
-| `--data-dir <path>` | `KIN_DATA_DIR` | Use this folder instead of `%APPDATA%\Kin`: a throwaway profile with its own key, database and logs. Quote it if it has a space. If the app can't start (for example it can't create this folder), it writes the reason to `kin-startup-error.txt` in the temp folder and exits with 1 |
+| `--data-dir <path>` | `KIN_DATA_DIR` | Use this folder instead of `%APPDATA%\Kin`: a throwaway profile with its own key, database and logs, **and a separate instance that runs beside the installed Kin** (see above). Every `--dev-*` setting needs it. Quote it if it has a space. If the app can't start (for example it can't create this folder), it writes the reason to `kin-startup-error.txt` in the temp folder and exits with 1 |
 | `--dev-bind <ip>` | `KIN_DEV_BIND` | Bind the HTTPS server to this address. Only a loopback address is accepted, anything else is an error at start |
 | `--dev-qr-address <ipv4>` | `KIN_DEV_QR_ADDRESS` | Put `<ipv4>:<port>` in the QR code and the pairing URL instead of the PC's own addresses (`10.0.2.2` is the PC's loopback as seen from the Android emulator). Implies `--dev-bind 127.0.0.1` when no `--dev-bind` is given |
-| `--dev-port <n>` | `KIN_DEV_PORT` | Port to try first (default 47821). If it is taken, a random port is used. `0` means random. **Read the real port from the URL or from `status.json`** |
+| `--dev-port <n>` | `KIN_DEV_PORT` | Port to try first (default 47821 for the installed Kin's own data directory, **random for any other**). If it is taken, a random port is used. `0` means random. **Read the real port from the URL or from `status.json`** |
 | `--dev-print-pair-url` | `KIN_DEV_PRINT_PAIR_URL=1` | Whenever a pairing starts (tray menu, `--pair` or `--dev-start-pairing`), write the URL to `pair-url.txt` in the data directory and to stdout |
 | `--dev-no-windows` | `KIN_DEV_NO_WINDOWS=1` | Don't create windows and don't show toasts. A toast is written to the log as `toast: ...` instead (for "Text from <phone>" the log has the title and the length of the preview, never the text; for files, the title and the length of the names) |
 | `--dev-received-dir <path>` | `KIN_DEV_RECEIVED_DIR` | **1.3.** Received files go here instead of `Downloads\Kin` (and instead of `receivedFolder` in `settings.json`), so a test never writes to the real Downloads folder. `status.json` has the folder in `transfers.receivedFolder` |
@@ -291,7 +317,7 @@ Get-Content $data\logs\kin.log -Tail 20
 - **Connection limits.** TLS handshake 10 s, request headers 10 s, a JSON body 15 s (a slow client gets `400`), 30 s without a byte on a connection that isn't a WebSocket. 64 connections: 16 for handshaking, 24 for strangers (a client with a certificate of its own that isn't paired yet) and 24 that only a paired device can use, and at most 8 handshaking or unpaired connections per IP address. A flood of strangers can use up its own slots and never the paired phone's.
 - **Identity:** a P-256 key and a self-signed X.509 v3 certificate (CN=Kin, no extensions) made on the first run. The device ID is `base64url(SHA-256(SPKI))`, and the short ID is the first 8 base32 characters.
 - **Server:** TLS 1.3 only, ALPN `http/1.1`, port 47821 or a random one. A client certificate is mandatory in the handshake. The verifier accepts any chain but only an ECDSA P-256 leaf, and always verifies the CertificateVerify signature. Every request carries the device ID computed from the certificate.
-- **Pairing:** "Pair new phone" opens a window with the QR code, the PC name, the short ID and a 5-minute countdown. A token is single use and compared in constant time, and five wrong guesses in 60 seconds kill it. Closing the window ends the pairing. On success the window becomes the "New device paired" notice, with a button to remove the device (and a toast).
+- **Pairing:** "Pair new phone" opens a window with the QR code, the PC name, the short ID and a 5-minute countdown, and a **Copy pairing link** button (the same link as text, for a phone whose camera can't scan; it is taken off the clipboard again once the phone has paired, if it is still there). A token is single use and compared in constant time, and five wrong guesses in 60 seconds kill it. Closing the window ends the pairing. On success the window becomes the "New device paired" notice, with a button to remove the device (and a toast).
 - **Addresses in the QR code:** private (RFC 1918) addresses of adapters that are up, without loopback, link-local, VPN or virtual adapters, except that the address on the default route is never left out. At most 3, the default route first, then physical adapters.
 - **WebSocket:** one per device, a new one replaces the old one (4001). The PC sends `hello` at once. No `hello` in 10 seconds is a 1002 close. A PC `ping` that isn't acked in 5 seconds is "No reply" and the connection is closed. 10 minutes of silence marks the phone offline (the phone's WebSocket ping every 4 minutes keeps it alive). Message IDs are remembered in SQLite, so a repeated `ping` gets the same `ack` and no second toast.
 - **Queue (1.4).** An explicit send is stored as `queued` before it is tried, and goes out after the phone's `hello` in creation order, one item at a time, each under its own ID. An item that gets no `ack` in 5 s stays queued (the PC sends no pings to find out: they would wake the phone's radio). Only an `error` from the phone fails it. Never queued: the automatic clipboard and a `sensitive` text. Details in [docs/windows.md](../docs/windows.md#queue); measured: [phase-1-4-desktop.md](../docs/results/phase-1-4-desktop.md).

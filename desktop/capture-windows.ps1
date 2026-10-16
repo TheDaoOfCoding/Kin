@@ -12,6 +12,9 @@
 # Without -Out and -UpdateScreens the pictures go to an ignored folder in the temp area: a run never overwrites the tracked pictures of
 # docs\results (and an -Out that points there is redirected the same way) unless -UpdateScreens says so.
 param([string]$Out = '', [int]$Width = 560, [switch]$UpdateScreens)
+# Only one of the Kin scripts (e2e, smoke, capture, check) may run at a time: they share the real clipboard, the Kin.exe slot and the emulator (tools\kin-lock.ps1).
+. (Join-Path $PSScriptRoot '..\tools\kin-lock.ps1'); Enter-KinLock 'capture-windows'
+. (Join-Path $PSScriptRoot '..\tools\kin-dev.ps1')   # a Kin of our own beside the installed one; every command carries --data-dir (kin-dev.ps1)
 $ErrorActionPreference = 'Stop'
 $tracked = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\docs\results'))
 $temp = Join-Path $env:LOCALAPPDATA 'Temp\kin-capture-windows'
@@ -51,9 +54,9 @@ function Wait-Until([scriptblock]$Cond, [int]$Seconds = 20) {
     return $false
 }
 function Status { Get-Content -LiteralPath (Join-Path $data 'status.json') -Raw | ConvertFrom-Json }
-# Kin.exe and every process below it (WebView2 starts its own), with their private working sets added up.
+# OUR Kin.exe (never the installed one) and every process below it (WebView2 starts its own), with their private working sets added up.
 function Mem {
-    $root = @(Get-Process Kin -ErrorAction SilentlyContinue | Select-Object -First 1)
+    $root = @(Get-DevKinProcesses | Select-Object -First 1)
     if (-not $root) { return [pscustomobject]@{ Processes = 0; PrivateWorkingSetMB = 0 } }
     $all = @(Get-CimInstance Win32_Process)
     $ids = New-Object System.Collections.Generic.List[int]; $ids.Add([int]$root[0].Id)
@@ -62,7 +65,7 @@ function Mem {
     [pscustomobject]@{ Processes = $ids.Count; PrivateWorkingSetMB = [math]::Round((($perf | Measure-Object WorkingSetPrivate -Sum).Sum) / 1MB, 1) }
 }
 function New-Phone([string[]]$PhoneArgs, [int]$Seconds = 120) {
-    & $kin --dev-start-pairing
+    Invoke-Kin --dev-start-pairing
     if (-not (Wait-Until { (Test-Path -LiteralPath (Join-Path $data 'pair-url.txt')) } 10)) { throw 'no pairing URL' }
     Start-Sleep -Milliseconds 400
     $url = (Get-Content -LiteralPath (Join-Path $data 'pair-url.txt')).Trim()
@@ -75,7 +78,7 @@ function Phone-Log($phone) { (Get-Content -LiteralPath $phone.Log -Raw -ErrorAct
 function Make-File([string]$path, [int]$bytes) { $b = New-Object byte[] $bytes; (New-Object Random 7).NextBytes($b); [IO.File]::WriteAllBytes($path, $b) }
 function Shot([string]$title, [string]$file) {
     $h = [IntPtr]::Zero
-    $found = Wait-Until { $w = Get-Process Kin | Where-Object { $_.MainWindowTitle -eq $title } | Select-Object -First 1; if ($w) { $script:h = $w.MainWindowHandle; $true } else { $false } } 15
+    $found = Wait-Until { $w = Get-DevKinProcesses | Where-Object { $_.MainWindowTitle -eq $title } | Select-Object -First 1; if ($w) { $script:h = $w.MainWindowHandle; $true } else { $false } } 15
     if (-not $found) { throw "no window titled $title" }
     if ($title -ne 'Pair new phone') { Close-Window 'Pair new phone' }   # a pairing opens its "New device paired" notice: keep it out of the picture
     [void][W32]::ShowWindow($script:h, 9); [void][W32]::SetForegroundWindow($script:h)
@@ -92,21 +95,22 @@ function Shot([string]$title, [string]$file) {
     Write-Host ("  {0}: {1}x{2}, {3} KB" -f $file, $small.Width, $small.Height, [math]::Round((Get-Item (Join-Path $Out $file)).Length / 1KB))
 }
 function Close-Window([string]$title) {
-    $w = Get-Process Kin | Where-Object { $_.MainWindowTitle -eq $title } | Select-Object -First 1
+    $w = Get-DevKinProcesses | Where-Object { $_.MainWindowTitle -eq $title } | Select-Object -First 1   # a window of OUR Kin only: the installed Kin may have a window of the same name open
     if ($w) { [void]$w.CloseMainWindow() }
-    Wait-Until { -not (Get-Process Kin | Where-Object { $_.MainWindowTitle -eq $title }) } 8 | Out-Null
+    Wait-Until { -not (Get-DevKinProcesses | Where-Object { $_.MainWindowTitle -eq $title }) } 8 | Out-Null
 }
 
 try {
     foreach ($f in $kin, $phoneExe) { if (-not (Test-Path -LiteralPath $f)) { throw "$f is missing: build it first" } }
-    if (Get-Process Kin -ErrorAction SilentlyContinue) { throw 'Kin.exe is already running: quit it first' }
+    Assert-NoGameRunning   # this script shows windows and brings them to the front
+    Set-KinDev -Exe $kin -DataDir $data
     New-Item -ItemType Directory -Force -Path $work, $src, $save, $Out | Out-Null
     $backup = Save-Clipboard
     Make-File (Join-Path $src 'Holiday photo.jpg') 2400000
     Make-File (Join-Path $src 'Quarterly report.pdf') 800000
     Make-File (Join-Path $src 'notes.txt') 4200
     Make-File (Join-Path $src 'Holiday video.mp4') 5200000
-    Start-Process $kin -ArgumentList '--data-dir', ('"{0}"' -f $data), '--dev-bind', '127.0.0.1', '--dev-qr-address', '10.0.2.2', '--dev-received-dir', ('"{0}"' -f $recv), '--dev-print-pair-url', '--dev-no-toasts' | Out-Null
+    Start-DevKin @('--data-dir', ('"{0}"' -f $data), '--dev-bind', '127.0.0.1', '--dev-qr-address', '10.0.2.2', '--dev-received-dir', ('"{0}"' -f $recv), '--dev-print-pair-url', '--dev-no-toasts') | Out-Null
     if (-not (Wait-Until { Test-Path -LiteralPath (Join-Path $data 'status.json') } 15)) { throw 'Kin did not start' }
     Start-Sleep -Seconds 2
     $before = Mem
@@ -117,44 +121,44 @@ try {
     $p1 = New-Phone @('--send-text', '"Meeting moved to 10:30, room 4"', '--send-text-after', '2', '--upload', ('"{0}"' -f (Join-Path $src 'Holiday photo.jpg')), '--upload-after', '3') 25
     if (-not (Wait-Until { (Phone-Log $p1) -match 'upload done' } 30)) { throw 'the phone did not finish' }
     Start-Sleep -Milliseconds 500
-    & $kin --send (Join-Path $src 'Quarterly report.pdf') (Join-Path $src 'notes.txt')
+    Invoke-Kin --send (Join-Path $src 'Quarterly report.pdf') (Join-Path $src 'notes.txt')
     Wait-Until { (Phone-Log $p1) -match 'downloaded notes.txt' } 20 | Out-Null
-    & $kin --dev-set-clipboard 'Wi-Fi password for the guests: sunflower-42'; Start-Sleep -Milliseconds 700
-    & $kin --send-clipboard
+    Invoke-Kin --dev-set-clipboard 'Wi-Fi password for the guests: sunflower-42'; Start-Sleep -Milliseconds 700
+    Invoke-Kin --send-clipboard
     Wait-Until { (Phone-Log $p1) -match 'received text id=\S+ isUrl=False sensitive=False text=Wi-Fi' } 10 | Out-Null
     Start-Sleep -Seconds 1
     $p1.Process.Kill(); Start-Sleep -Seconds 1
     # a phone that refuses what it is sent (its disk is full): one failed send
     $p2 = New-Phone @('--refuse-offer', 'disk_full') 12
     if (-not (Wait-Until { (Status).state -eq 'phone_connected' } 15)) { throw 'the second phone did not connect' }
-    & $kin --send (Join-Path $src 'Holiday video.mp4')
+    Invoke-Kin --send (Join-Path $src 'Holiday video.mp4')
     Wait-Until { (Phone-Log $p2) -match 'refusing the offer' } 10 | Out-Null
     Start-Sleep -Seconds 1
     $p2.Process.Kill()
     if (-not (Wait-Until { (Status).state -eq 'phone_offline' } 20)) { throw 'the phone is still connected' }
     # the phone is away: a text waits in the queue
-    & $kin --dev-set-clipboard 'See you at the station at 6'; Start-Sleep -Milliseconds 700
-    & $kin --send-clipboard
+    Invoke-Kin --dev-set-clipboard 'See you at the station at 6'; Start-Sleep -Milliseconds 700
+    Invoke-Kin --send-clipboard
     if (-not (Wait-Until { (Status).queue.count -ge 1 } 10)) { throw 'nothing is queued' }
     # connect again so the debug window has a live connection, and a ping for the latency
     $p3 = New-Phone @() 100
     if (-not (Wait-Until { (Status).state -eq 'phone_connected' } 15)) { throw 'the phone did not come back' }
     Start-Sleep -Seconds 3
-    & $kin --ping
+    Invoke-Kin --ping
     Start-Sleep -Seconds 2
     # the phone goes away again, and two sends wait in the queue (a text and a file), so the history shows them as queued
     $p3.Process.Kill()
     if (-not (Wait-Until { (Status).state -eq 'phone_offline' } 20)) { throw 'the phone is still connected' }
-    & $kin --dev-set-clipboard 'Dinner at 8? I booked the corner table'; Start-Sleep -Milliseconds 700
-    & $kin --send-clipboard
-    & $kin --send (Join-Path $src 'notes.txt')
+    Invoke-Kin --dev-set-clipboard 'Dinner at 8? I booked the corner table'; Start-Sleep -Milliseconds 700
+    Invoke-Kin --send-clipboard
+    Invoke-Kin --send (Join-Path $src 'notes.txt')
     if (-not (Wait-Until { (Status).queue.count -ge 2 } 10)) { throw 'two sends are not queued' }
 
     Say 'windows (one at a time: a window is opened, photographed and closed)'
     # the "New device paired" notice that every pairing opens must not be in front of the pictures
     Close-Window 'Pair new phone'
     foreach ($s in @(@('--history', 'History', '01-history.png'), @('--settings', 'Settings', '02-settings.png'), @('--debug-window', 'Debug', '03-debug.png'), @('--drop', 'Send to phone', '04-drop.png'), @('--pair', 'Pair new phone', '05-pairing.png'))) {
-        & $kin $s[0]
+        Invoke-Kin $s[0]
         Shot $s[1] $s[2]
         Close-Window $s[1]
     }
@@ -165,8 +169,8 @@ try {
 }
 finally {
     $phones | ForEach-Object { if (-not $_.Process.HasExited) { $_.Process.Kill() } }
-    if (Get-Process Kin -ErrorAction SilentlyContinue) { & $kin --quit; Wait-Until { -not (Get-Process Kin -ErrorAction SilentlyContinue) } 10 | Out-Null }
+    Stop-DevKin 10   # --quit to our data directory; a hung process of ours is stopped by its ID
     if ($backup) { Restore-Clipboard $backup }
     $env:COMPUTERNAME = $origComputerName
-    Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-DevDataDir $work   # (the web views of the windows hold files in it for a moment after Kin has quit)
 }

@@ -23,6 +23,8 @@ param(
     [string]$Kin,
     [string]$Apk
 )
+# Only one of the Kin scripts (e2e, smoke, capture, check) may run at a time: they share the real clipboard, the Kin.exe slot and the emulator (tools\kin-lock.ps1).
+. (Join-Path $PSScriptRoot 'kin-lock.ps1'); Enter-KinLock 'e2e-1-3'
 $ErrorActionPreference = 'Continue'
 & (Join-Path $PSScriptRoot 'e2e-1-1.ps1') -Milestone 1.3 @PSBoundParameters
 exit $LASTEXITCODE

@@ -31,11 +31,16 @@ pub struct Config {
     pub dev_clock_offset_secs: Option<i64>,
     /// `--data-dir` (or `KIN_DATA_DIR`) was given: this is not the user's own profile, so "Start with Windows" never touches the registry.
     pub data_dir_overridden: bool,
+    /// The data directory of the installed Kin (`%APPDATA%\Kin`), if the environment says where it is. A data directory that is not this
+    /// one makes the app a separate instance (see `instance.rs`). `None` (as in `Config::new`, which the tests use) means no directory is
+    /// the installed one's.
+    pub installed_data_dir: Option<PathBuf>,
 }
 
 impl Config {
     pub fn new(data_dir: PathBuf) -> Config {
         Config {
+            installed_data_dir: None,
             data_dir,
             dev_bind: None,
             dev_qr_address: None,
@@ -56,7 +61,7 @@ impl Config {
     /// script's throwaway profile), get the file stand-in of `autostart.rs` instead. The same rule decides whether the app makes its "Send to"
     /// shortcut (`integration.rs`): only where the Run key is real.
     pub fn autostart_is_real(&self) -> bool {
-        !cfg!(debug_assertions) && !self.dev_hooks_enabled() && !self.data_dir_overridden
+        !cfg!(debug_assertions) && !self.dev_hooks_enabled() && !self.data_dir_overridden && self.instance_key().is_none()
     }
 
     /// Whether the app was started with any developer setting. The developer clipboard commands (`--dev-set-clipboard`,
@@ -73,6 +78,25 @@ impl Config {
             || self.dev_clock_offset_secs.is_some()
     }
 
+    /// The key of this instance (`instance.rs`): `None` for the installed Kin's own data directory, a short hash of the directory for any other.
+    /// A keyed instance runs beside the installed one: its own single-instance lock, toast identity, port and web view data, and no mDNS.
+    pub fn instance_key(&self) -> Option<String> {
+        crate::instance::key_for(&self.data_dir, self.installed_data_dir.as_deref())
+    }
+
+    /// The port to ask for: the one that was given, else the default for the installed Kin. **Another instance never asks for the default
+    /// port** (the installed Kin has it, and on Windows a bind to 127.0.0.1 can succeed beside a bind to every interface and take the
+    /// loopback traffic): it takes any free one, and `status.json` and the pairing URL say which.
+    pub fn preferred_port(&self) -> u16 {
+        self.dev_port.unwrap_or(if self.instance_key().is_some() { 0 } else { crate::core::DEFAULT_PORT })
+    }
+
+    /// Whether the app advertises itself on the local network (mDNS): only the installed Kin's own instance, and not in developer network
+    /// mode. A copy with a data directory of its own never does, so the user's phone can't find it and never pairs with a test run.
+    pub fn advertises_on_lan(&self) -> bool {
+        !self.is_dev_network() && self.instance_key().is_none()
+    }
+
     /// Whether toasts are only written to the log (`--dev-no-windows` or `--dev-no-toasts`).
     pub fn toasts_are_logged_only(&self) -> bool {
         self.dev_no_windows || self.dev_no_toasts
@@ -83,11 +107,14 @@ impl Config {
         self.dev_bind.is_some() || self.dev_qr_address.is_some()
     }
 
-    /// The address to bind to: loopback in dev mode, every interface otherwise.
+    /// The address to bind to: `--dev-bind` if given, else loopback in dev mode, **and loopback for any instance with a key** (a copy with a
+    /// data directory of its own: binding every interface would raise a Windows Firewall prompt for a program file that has no rule; it never
+    /// advertises, so nothing on the network could find it anyway). Every interface only for the installed Kin's own instance.
     pub fn bind_ip(&self) -> IpAddr {
         match (self.dev_bind, self.dev_qr_address) {
             (Some(ip), _) => ip,
             (None, Some(_)) => Ipv4Addr::LOCALHOST.into(),
+            (None, None) if self.instance_key().is_some() => Ipv4Addr::LOCALHOST.into(),
             (None, None) => Ipv4Addr::UNSPECIFIED.into(),
         }
     }
@@ -283,12 +310,14 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
     }
 
     let data_dir_overridden = data_dir.is_some();
+    let installed_data_dir = default_data_dir(env);
     let data_dir = match data_dir {
         Some(d) => d,
-        None => default_data_dir(env)?,
+        None => installed_data_dir.clone()?,
     };
     let mut config = Config::new(data_dir);
     config.data_dir_overridden = data_dir_overridden;
+    config.installed_data_dir = installed_data_dir.ok();
     if let Some(v) = clock_offset {
         config.dev_clock_offset_secs = Some(v.parse().map_err(|_| format!("--dev-clock-offset: {v:?} is not a number of seconds"))?);
     }
@@ -383,6 +412,21 @@ mod tests {
         let p = parse(&args("--data-dir x --dev-qr-address 10.0.2.2"), &no_env).unwrap();
         assert!(p.config.is_dev_network());
         assert_eq!(p.config.bind_ip(), IpAddr::from(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn an_instance_with_its_own_data_directory_binds_loopback_unless_told_another_address() {
+        // Only the installed Kin's own directory listens on every interface (see defaults_to_appdata_kin); a copy beside it would otherwise
+        // raise a firewall prompt for its program file.
+        let own = parse(&args("--data-dir C:\\tmp\\kin"), &appdata).unwrap();
+        assert!(own.config.instance_key().is_some());
+        assert_eq!(own.config.bind_ip(), IpAddr::from(Ipv4Addr::LOCALHOST));
+        assert!(!own.config.is_dev_network(), "no developer network setting: only the default changed");
+        let explicit = parse(&args("--data-dir C:\\tmp\\kin --dev-bind ::1"), &appdata).unwrap();
+        assert_eq!(explicit.config.bind_ip(), "::1".parse::<IpAddr>().unwrap(), "an explicit address is kept");
+        let installed = parse(&args(&format!("--data-dir {}", r"C:\Users\x\AppData\Roaming\Kin")), &appdata).unwrap();
+        assert_eq!(installed.config.instance_key(), None);
+        assert_eq!(installed.config.bind_ip(), IpAddr::from(Ipv4Addr::UNSPECIFIED), "the installed Kin's directory keeps every interface");
     }
 
     #[test]
@@ -487,6 +531,62 @@ mod tests {
         assert!(!parse(&args("--dev-no-windows"), &appdata).unwrap().config.autostart_is_real());
         let env = |k: &str| (k == "KIN_DATA_DIR").then(|| "C:\\tmp\\kin".to_string());
         assert!(!parse(&[], &env).unwrap().config.autostart_is_real(), "KIN_DATA_DIR counts too");
+    }
+
+    // ----- instances beside the installed Kin (instance.rs) --------------------------------------------------------------
+
+    #[test]
+    fn the_default_data_directory_is_the_installed_instance_and_has_no_key() {
+        let p = parse(&[], &appdata).unwrap();
+        assert_eq!(p.config.instance_key(), None);
+        assert_eq!(p.config.preferred_port(), crate::core::DEFAULT_PORT);
+        assert!(p.config.advertises_on_lan());
+        // Saying the same directory by hand is the same instance (it is the same data).
+        let same = parse(&args(r"--data-dir C:\Users\x\AppData\Roaming\KIN"), &appdata).unwrap();
+        assert_eq!(same.config.instance_key(), None, "same directory, other spelling");
+    }
+
+    #[test]
+    fn a_data_directory_of_its_own_is_a_separate_instance_that_never_takes_the_default_port_or_the_lan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dev-kin");
+        let arg = vec!["--data-dir".to_string(), dir.display().to_string(), "--dev-bind".to_string(), "127.0.0.1".to_string()];
+        let p = parse(&arg, &appdata).unwrap();
+        let key = p.config.instance_key().expect("a key");
+        assert_eq!(key.len(), 12);
+        assert_eq!(p.config.preferred_port(), 0, "no --dev-port: any free port, never the installed Kin's");
+        assert!(!p.config.advertises_on_lan());
+        // A port that was asked for is the port.
+        let mut with_port = arg.clone();
+        with_port.extend(args("--dev-port 50123"));
+        assert_eq!(parse(&with_port, &appdata).unwrap().config.preferred_port(), 50123);
+        // The key follows the directory, not the flags and not the spelling of the environment variable.
+        let via_env = |k: &str| match k {
+            "KIN_DATA_DIR" => Some(dir.display().to_string().to_uppercase()),
+            "APPDATA" => Some(r"C:\Users\x\AppData\Roaming".to_string()),
+            _ => None,
+        };
+        assert_eq!(parse(&[], &via_env).unwrap().config.instance_key(), Some(key.clone()));
+        let other = tmp.path().join("dev-kin-2");
+        let other_args = vec!["--data-dir".to_string(), other.display().to_string()];
+        assert_ne!(parse(&other_args, &appdata).unwrap().config.instance_key(), Some(key));
+    }
+
+    #[test]
+    fn a_separate_instance_advertises_nowhere_even_without_developer_network_flags() {
+        let p = parse(&args(r"--data-dir C:\tmp\kin-test-x"), &appdata).unwrap();
+        assert!(p.config.instance_key().is_some());
+        assert!(!p.config.is_dev_network());
+        assert!(!p.config.advertises_on_lan(), "a Kin with its own data directory is never found by the user's phone");
+    }
+
+    #[test]
+    fn developer_settings_with_the_installed_kins_directory_are_refused() {
+        let p = parse(&args("--dev-no-toasts"), &appdata).unwrap();
+        assert!(p.config.dev_hooks_enabled());
+        assert!(crate::instance::dev_settings_refusal(p.config.dev_hooks_enabled(), p.config.instance_key().as_deref()).is_some());
+        let p = parse(&args(r"--data-dir C:\tmp\kin-test-x --dev-no-toasts"), &appdata).unwrap();
+        assert!(crate::instance::dev_settings_refusal(p.config.dev_hooks_enabled(), p.config.instance_key().as_deref()).is_none());
     }
 
     #[test]

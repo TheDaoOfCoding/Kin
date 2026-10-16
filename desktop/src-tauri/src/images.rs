@@ -363,7 +363,9 @@ fn drop_files(path: &Path) -> Vec<u8> {
 }
 
 /// Puts the image in `path` on the clipboard (see the module comment for what is put there). `owner` is the clipboard window.
-pub fn write_clipboard_image(owner: HWND, path: &Path) -> Result<ImageOutcome> {
+/// `quiet`: also write the formats that keep the image out of the installed Kin, Windows' history and the cloud clipboard (an instance
+/// beside the installed Kin: see `clipboard::DEV_TEST_CONTENT`).
+pub fn write_clipboard_image(owner: HWND, path: &Path, quiet: bool) -> Result<ImageOutcome> {
     let (dib, width, height, kind) = match decode(path) {
         Ok(d) => (d.block, d.width, d.height, d.kind),
         Err(why) => return Ok(ImageOutcome::Skipped(why)),
@@ -376,6 +378,7 @@ pub fn write_clipboard_image(owner: HWND, path: &Path) -> Result<ImageOutcome> {
     };
     let png_block = png.as_deref().map(block_of).transpose()?;
     let drop_block = block_of(&drop_files(path))?;
+    let marks = if quiet { Some((block_of(&1u32.to_le_bytes())?, block_of(&1u32.to_le_bytes())?)) } else { None };
 
     // The clipboard may be in use by another app for a moment.
     let mut opened = false;
@@ -401,6 +404,16 @@ pub fn write_clipboard_image(owner: HWND, path: &Path) -> Result<ImageOutcome> {
                 SetClipboardData(RegisterClipboardFormatW(w!("PNG")), Some(HANDLE(block.take().0)))?;
             }
             SetClipboardData(CF_HDROP, Some(HANDLE(drop_block.take().0)))?;
+            if let Some((exclude, test_content)) = marks {
+                SetClipboardData(
+                    RegisterClipboardFormatW(&HSTRING::from(crate::clipboard::EXCLUDE_FROM_MONITOR)),
+                    Some(HANDLE(exclude.take().0)),
+                )?;
+                SetClipboardData(
+                    RegisterClipboardFormatW(&HSTRING::from(crate::clipboard::DEV_TEST_CONTENT)),
+                    Some(HANDLE(test_content.take().0)),
+                )?;
+            }
         }
         Ok(())
     })();

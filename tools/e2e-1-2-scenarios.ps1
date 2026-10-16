@@ -95,7 +95,7 @@ function Ui-Texts { $x = A shell cat /sdcard/kin-e2e-ui.xml | Out-String; @([reg
 function Copy-OnPc([string]$Text, [int]$TimeoutSec = 8) {
     $before = (Get-Status).lastSent.clipboard.id
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    Set-Clipboard -Value $Text
+    Set-QuietClipboardText $Text
     $lc = $null
     Wait-Until { $script:lc = (Get-Status).lastSent.clipboard; $script:lc -and $script:lc.id -ne $before -and $script:lc.result } $TimeoutSec | Out-Null
     $ms = $sw.ElapsedMilliseconds
@@ -112,7 +112,7 @@ function Phone-SeenTexts {
 function Hotkey-Send([int]$TimeoutSec = 8) {
     Phone-SeenTexts
     $before = (Get-Status).lastSent.text.id
-    & $Kin --send-clipboard
+    Invoke-Kin --send-clipboard
     Wait-Until { $script:lt = (Get-Status).lastSent.text; $script:lt -and $script:lt.id -ne $before -and $script:lt.result } $TimeoutSec | Out-Null
     $script:lt
 }
@@ -192,7 +192,7 @@ function Test-ConfirmByTap {
     Say 'scenario 10: confirm by tap'
     $urlFile = Join-Path $Data 'pair-url.txt'
     try { [IO.File]::Delete($urlFile) } catch { }   # the first pairing's URL is still there (Remove-Item trips over the 8.3 %TEMP% path)
-    & $Kin --dev-start-pairing
+    Invoke-Kin --dev-start-pairing
     Wait-Until { Test-Path $urlFile } 10 | Out-Null
     $url = (Get-Content $urlFile -Raw).Trim()
     A shell am start -a android.intent.action.VIEW -d "'$url'" 2>$null | Out-Null
@@ -223,7 +223,7 @@ function Run-Milestone12 {
     foreach ($mark in 'exclude', 'no-cloud') {
         $secret = Use-Text "e2e-$n secret $mark"
         $s0 = Get-Status
-        & $Kin --dev-set-clipboard $secret --dev-clipboard-mark $mark
+        Invoke-Kin --dev-set-clipboard $secret --dev-clipboard-mark $mark
         Start-Sleep -Milliseconds 1500   # debounce 300 ms, then the read
         $s1 = Get-Status
         Check "S2 --dev-clipboard-mark $mark is not sent" ($s1.clipboardSync.sent -eq $s0.clipboardSync.sent -and $s1.clipboardSync.skipped -gt $s0.clipboardSync.skipped -and "$($s1.clipboardSync.lastSkip.reason)" -like 'password_manager:*') "$($s1.clipboardSync.lastSkip.reason)"

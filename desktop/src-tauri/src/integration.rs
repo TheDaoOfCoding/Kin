@@ -34,7 +34,7 @@ use crate::autostart::AutostartStore;
 /// every toast when Kin is installed. With a Start Menu shortcut for the same ID, a toast shows "Kin" with the app's icon instead of
 /// "Windows PowerShell". The process names it too, so the taskbar groups its windows under that shortcut. A unit test keeps this equal
 /// to the identifier in `tauri.conf.json`.
-pub const APP_USER_MODEL_ID: &str = "app.kinrelay.desktop";
+pub const APP_USER_MODEL_ID: &str = crate::instance::BASE_IDENTIFIER;
 
 /// The shortcut in the SendTo folder: Explorer lists it as "Kin".
 pub const SENDTO_NAME: &str = "Kin.lnk";
@@ -47,13 +47,14 @@ pub const FILE_NAME: &str = "integration.json";
 
 // ----- the app user model ID -------------------------------------------------------------------------------------------------------
 
-/// Gives this process the app user model ID. Call it first thing, before any window exists. A failure only costs the grouping of windows
-/// on the taskbar (toasts name the ID on their own), so the caller logs it and carries on.
-pub fn set_process_app_user_model_id() -> Result<(), String> {
+/// Gives this process the app user model ID `id` (`APP_USER_MODEL_ID`, or the one of an instance that runs beside the installed Kin:
+/// `instance::app_user_model_id`). Call it first thing, before any window exists. A failure only costs the grouping of windows on the
+/// taskbar (toasts name the ID on their own), so the caller logs it and carries on.
+pub fn set_process_app_user_model_id(id: &str) -> Result<(), String> {
     use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
     use windows::core::HSTRING;
     // SAFETY: the string is valid for the call, and Windows copies it.
-    unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(APP_USER_MODEL_ID)).map_err(|e| e.to_string()) }
+    unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(id)).map_err(|e| e.to_string()) }
 }
 
 /// The app user model ID this process has now (`None` if it has none), for the tests.
@@ -338,9 +339,9 @@ mod tests {
     #[test]
     fn the_process_gets_the_app_user_model_id() {
         // Every test shares one process, and the ID is the same string for all of them.
-        set_process_app_user_model_id().unwrap();
+        set_process_app_user_model_id(APP_USER_MODEL_ID).unwrap();
         assert_eq!(process_app_user_model_id().as_deref(), Some(APP_USER_MODEL_ID));
-        set_process_app_user_model_id().unwrap(); // twice is fine
+        set_process_app_user_model_id(APP_USER_MODEL_ID).unwrap(); // twice is fine
     }
 
     #[test]
@@ -512,5 +513,32 @@ mod tests {
         assert!(hooks.contains(SENDTO_NAME) && SENDTO_NAME == "Kin.lnk");
         // The installer never writes a Run value of its own: the app does (HKCU of the right user).
         assert!(!hooks.contains("WriteRegStr HKCU"), "the Run value is the app's");
+    }
+
+    /// v0.1.1: "Kin is running, close it?" (which Cancel answers by aborting the uninstall) is asked before the hook removes anything, so
+    /// a person who cancels keeps a working install.
+    #[test]
+    fn the_uninstall_asks_before_it_removes_anything() {
+        let hooks = include_str!("../windows/hooks.nsh");
+        let start = hooks.find("!macro NSIS_HOOK_PREUNINSTALL").expect("the pre-uninstall hook");
+        let body = &hooks[start..hooks[start..].find("!macroend").map(|i| start + i).expect("the end of the hook")];
+        let ask = body.find("!insertmacro CheckIfAppIsRunning").expect("the hook asks whether Kin is running");
+        for removal in ["delete rule", "Delete \"", "RunAsUser", "RmDir", "DeleteReg"] {
+            if let Some(at) = body.find(removal) {
+                assert!(ask < at, "{removal:?} comes before the question whether Kin is running");
+            }
+        }
+    }
+
+    /// v0.1.1 (D12 addendum): both firewall rules only answer the PC's own subnet.
+    #[test]
+    fn the_firewall_rules_answer_only_the_local_subnet() {
+        let hooks = include_str!("../windows/hooks.nsh");
+        let adds: Vec<&str> = hooks.lines().filter(|l| l.contains("add rule name=")).collect();
+        assert_eq!(adds.len(), 2, "the TCP rule and the mDNS rule");
+        for line in adds {
+            assert!(line.contains("remoteip=LocalSubnet"), "{line}");
+            assert!(line.contains("profile=private,public"), "{line}");
+        }
     }
 }

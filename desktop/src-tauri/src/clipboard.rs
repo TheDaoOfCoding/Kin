@@ -39,8 +39,16 @@ pub const CAN_UPLOAD_TO_CLOUD: &str = "CanUploadToCloudClipboard";
 /// more is the safe direction.)
 pub const VIEWER_IGNORE: &str = "Clipboard Viewer Ignore";
 
+/// Written (with `EXCLUDE_FROM_MONITOR`) by a Kin that runs **beside the installed one** (its own data directory, `instance.rs`) on every text
+/// and image it puts on the real clipboard. The installed Kin (0.1.0 too: it skips content that carries `EXCLUDE_FROM_MONITOR`) then leaves
+/// the content alone and nothing of a test reaches the user's phone, Windows' clipboard history or the cloud clipboard. The instance that
+/// wrote it knows its own mark: **only an instance beside the installed one** reads content that carries this format as ordinary content
+/// (`exclusion_in_instance`), so its sync, its hotkey and its echo guard behave as they do for any copy. In the installed Kin the format
+/// means nothing, and the content stays excluded.
+pub const DEV_TEST_CONTENT: &str = "KinRelayDevTestContent";
+
 /// The registered clipboard formats that matter, and nothing else is read from the clipboard besides the text.
-const INTERESTING_FORMATS: [&str; 4] = [EXCLUDE_FROM_MONITOR, CAN_INCLUDE_IN_HISTORY, CAN_UPLOAD_TO_CLOUD, VIEWER_IGNORE];
+const INTERESTING_FORMATS: [&str; 5] = [EXCLUDE_FROM_MONITOR, CAN_INCLUDE_IN_HISTORY, CAN_UPLOAD_TO_CLOUD, VIEWER_IGNORE, DEV_TEST_CONTENT];
 
 /// A clipboard format that is on the clipboard now. `dword` is the first four bytes of its data as a little-endian number,
 /// read only for the two formats that carry a value. `None` means it carried no readable data.
@@ -104,6 +112,15 @@ pub fn exclusion(formats: &[ClipFormat]) -> Option<Exclusion> {
         return Some(Exclusion::ViewerIgnore);
     }
     None
+}
+
+/// [`exclusion`] as an instance sees it. An instance beside the installed Kin (`beside_installed`) treats content that carries
+/// [`DEV_TEST_CONTENT`] (what it wrote itself) as ordinary content, whatever other opt-out formats come with it.
+pub fn exclusion_in_instance(formats: &[ClipFormat], beside_installed: bool) -> Option<Exclusion> {
+    if beside_installed && find(formats, DEV_TEST_CONTENT).is_some() {
+        return None;
+    }
+    exclusion(formats)
 }
 
 // ----- text helpers -----------------------------------------------------------------------------------------------
@@ -302,6 +319,12 @@ pub trait Clipboard: Send + Sync {
     /// of the clipboard history and the cloud clipboard (`ExcludeClipboardContentFromMonitorProcessing`,
     /// `CanIncludeInClipboardHistory` = 0, `CanUploadToCloudClipboard` = 0).
     fn write_text_sensitive(&self, text: &str) -> Result<()>;
+    /// Empties the clipboard, but only if its text is exactly `expected`, checked and done in one go (nothing can be copied in between).
+    /// `true` if it was emptied. Used to take the pairing link off the clipboard once it has been used: a clipboard that holds
+    /// anything else is the user's and is left alone. The default is for clipboards that can't.
+    fn clear_if_text(&self, _expected: &str) -> Result<bool> {
+        Err("this clipboard can't be cleared".into())
+    }
     /// Puts the image in this file on the clipboard (see `images.rs`). The default is for clipboards that can't.
     fn write_image_file(&self, _path: &std::path::Path) -> Result<ImageOutcome> {
         Ok(ImageOutcome::Skipped("this clipboard can't hold images".to_string()))
@@ -399,6 +422,18 @@ impl Clipboard for MemoryClipboard {
         Ok(())
     }
 
+    fn clear_if_text(&self, expected: &str) -> Result<bool> {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.text.as_deref() != Some(expected) {
+                return Ok(false);
+            }
+            *state = ClipSnapshot::default();
+        }
+        self.notify();
+        Ok(true)
+    }
+
     fn write_image_file(&self, path: &std::path::Path) -> Result<ImageOutcome> {
         self.images.lock().unwrap_or_else(|p| p.into_inner()).push(path.to_path_buf());
         *self.state.lock().unwrap_or_else(|p| p.into_inner()) = ClipSnapshot::default();
@@ -478,6 +513,9 @@ mod win {
     pub struct WinClipboard {
         /// The window handle as a number, so the struct is `Send` and `Sync`.
         hwnd: isize,
+        /// Every text and image the app writes carries [`EXCLUDE_FROM_MONITOR`] and [`DEV_TEST_CONTENT`] (see there). On in an instance that
+        /// runs beside the installed Kin.
+        quiet: bool,
     }
 
     impl WinClipboard {
@@ -540,7 +578,13 @@ mod win {
                 }
             })?;
             let hwnd = ready_rx.recv().map_err(|_| "the clipboard listener thread ended at once")??;
-            Ok((WinClipboard { hwnd }, rx))
+            Ok((WinClipboard { hwnd, quiet: false }, rx))
+        }
+
+        /// Writes made through this clipboard are invisible to the installed Kin and to Windows' history (see [`DEV_TEST_CONTENT`]).
+        pub fn quiet(mut self, on: bool) -> WinClipboard {
+            self.quiet = on;
+            self
         }
 
         fn hwnd(&self) -> HWND {
@@ -687,10 +731,12 @@ mod win {
         }
 
         fn write_text(&self, text: &str, mark: Option<Exclusion>) -> Result<()> {
-            let marks: Vec<(&str, u32)> = mark
-                .map(|m| (m.format_name(), if matches!(m, Exclusion::NotInHistory | Exclusion::NotToCloud) { 0 } else { 1 }))
-                .into_iter()
-                .collect();
+            // A mark that a developer hook asks for is written as it is; with none, a quiet clipboard marks the text as test content.
+            let marks: Vec<(&str, u32)> = match mark {
+                Some(m) => vec![(m.format_name(), if matches!(m, Exclusion::NotInHistory | Exclusion::NotToCloud) { 0 } else { 1 })],
+                None if self.quiet => vec![(super::EXCLUDE_FROM_MONITOR, 1), (super::DEV_TEST_CONTENT, 1)],
+                None => Vec::new(),
+            };
             self.write_text_marked(text, &marks)
         }
 
@@ -698,8 +744,22 @@ mod win {
             self.write_text_marked(text, &[(super::EXCLUDE_FROM_MONITOR, 1), (CAN_INCLUDE_IN_HISTORY, 0), (CAN_UPLOAD_TO_CLOUD, 0)])
         }
 
+        fn clear_if_text(&self, expected: &str) -> Result<bool> {
+            // One open of the clipboard for the look and the clearing, so a copy by the user can't land in between.
+            let _open = Open::new(self.hwnd())?;
+            // SAFETY: the clipboard is open for the rest of this function.
+            let has_text = unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) }.is_ok();
+            let text = if has_text { global_bytes(CF_UNICODETEXT, MAX_READ_BYTES).map(|b| text_of(&b)) } else { None };
+            if text.as_deref() != Some(expected) {
+                return Ok(false);
+            }
+            // SAFETY: the clipboard is open, and this window owns it from here on.
+            unsafe { EmptyClipboard() }?;
+            Ok(true)
+        }
+
         fn write_image_file(&self, path: &std::path::Path) -> Result<super::ImageOutcome> {
-            crate::images::write_clipboard_image(self.hwnd(), path)
+            crate::images::write_clipboard_image(self.hwnd(), path, self.quiet)
         }
     }
 }
@@ -751,6 +811,9 @@ mod tests {
     #[test]
     fn format_names_match_without_regard_to_case() {
         assert_eq!(exclusion(&[f("excludeclipboardcontentfrommonitorprocessing")]), Some(Exclusion::ExcludeFromMonitor));
+        // The mark of a test copy beside the installed Kin changes nothing for the plain rule: the installed Kin must skip it.
+        assert_eq!(exclusion(&[f(EXCLUDE_FROM_MONITOR), f(DEV_TEST_CONTENT)]), Some(Exclusion::ExcludeFromMonitor));
+        assert_eq!(exclusion(&[f(DEV_TEST_CONTENT)]), None, "the test mark alone excludes nothing");
         assert_eq!(exclusion(&[ClipFormat::with_dword("CANINCLUDEINCLIPBOARDHISTORY", 0)]), Some(Exclusion::NotInHistory));
     }
 
@@ -936,11 +999,13 @@ mod tests {
     /// The real clipboard. It's the user's, so this test is `#[ignore]`d and has to be asked for:
     /// `cargo test real_clipboard -- --ignored --test-threads=1`. It saves the text that is on the clipboard (and does nothing
     /// if there is more than plain text there, such as an image, files or rich text, which it couldn't put back), uses it,
-    /// and puts the text back. An empty clipboard stays empty.
+    /// and puts the text back. An empty clipboard stays empty. **Every write is quiet** (`DEV_TEST_CONTENT` and the opt-out format of password
+    /// managers): a Kin that is installed on this PC, with its automatic sync on, skips it and sends none of the test text to a phone.
     #[test]
     #[ignore = "touches the real clipboard"]
     fn real_clipboard_round_trip_and_password_manager_formats() {
         let (clipboard, mut changes) = WinClipboard::start().unwrap();
+        let clipboard = clipboard.quiet(true);
         let other = other_formats();
         if !other.is_empty() {
             eprintln!("skipped: the clipboard holds more than plain text ({other:?}), which this test couldn't restore exactly");
@@ -953,7 +1018,8 @@ mod tests {
         clipboard.write_text(text, None).unwrap();
         let got = clipboard.read().unwrap();
         assert_eq!(got.text.as_deref(), Some(text));
-        assert_eq!(exclusion(&got.formats), None);
+        assert_eq!(exclusion(&got.formats), Some(Exclusion::ExcludeFromMonitor), "an installed Kin skips it: {:?}", got.formats);
+        assert_eq!(exclusion_in_instance(&got.formats, true), None, "the instance that wrote it reads it as ordinary text");
         assert!(changes.blocking_recv().is_some(), "a change event for our own write");
 
         // Each opt-out format is seen when it is there.
@@ -964,8 +1030,36 @@ mod tests {
             assert_eq!(exclusion(&got.formats), Some(mark), "{mark:?}: {:?}", got.formats);
         }
 
-        // Back to what the user had.
+        // Back to what the user had (quiet too: an installed Kin must not send the user's own text to the phone a second time).
         clipboard.write_text(&restore, None).unwrap();
+    }
+
+    /// `clear_if_text` on the real clipboard (the pairing link is taken off it once the phone has paired). It replaces whatever is on the
+    /// clipboard, so only a run that saved every format first (`clipboard-backup.ps1`) and restores them afterwards may use it:
+    /// `Save-Clipboard; cargo test real_clipboard_clear -- --ignored; Restore-Clipboard`.
+    #[test]
+    #[ignore = "replaces the real clipboard: run it between Save-Clipboard and Restore-Clipboard"]
+    fn real_clipboard_clear_if_text_clears_only_the_exact_text() {
+        let (clipboard, _changes) = WinClipboard::start().unwrap();
+        let link = "kinrelay://pair?v=1&a=10.0.2.2:1&id=x&tk=TEST&n=PC";
+        clipboard.write_text_sensitive(link).unwrap();
+        assert_eq!(clipboard.read().unwrap().text.as_deref(), Some(link));
+        // Anything but exactly the link: nothing happens.
+        assert!(!clipboard.clear_if_text("kinrelay://pair?v=1&a=10.0.2.2:1&id=x&tk=OTHER&n=PC").unwrap());
+        assert!(!clipboard.clear_if_text(&format!("{link} ")).unwrap());
+        assert_eq!(clipboard.read().unwrap().text.as_deref(), Some(link), "left alone");
+        // Exactly the link: emptied, with its opt-out formats.
+        assert!(clipboard.clear_if_text(link).unwrap());
+        let after = clipboard.read().unwrap();
+        assert_eq!(after.text, None);
+        assert!(after.formats.is_empty(), "{:?}", after.formats);
+        // An empty clipboard: nothing to do.
+        assert!(!clipboard.clear_if_text(link).unwrap());
+        // Other text: not touched. (Marked as a password manager would, so that a Kin that is running on this PC with its automatic sync on
+        // does not send the test text to a phone.)
+        clipboard.write_text("Dinner at 8?", Some(Exclusion::ExcludeFromMonitor)).unwrap();
+        assert!(!clipboard.clear_if_text(link).unwrap());
+        assert_eq!(clipboard.read().unwrap().text.as_deref(), Some("Dinner at 8?"));
     }
 
     /// Puts the image in the file named by `KIN_TEST_IMAGE` on the real clipboard, the way the app does for a received image, and
@@ -976,6 +1070,7 @@ mod tests {
     fn real_clipboard_image_for_the_script() {
         let path = std::env::var("KIN_TEST_IMAGE").expect("KIN_TEST_IMAGE is the path of the image to put on the clipboard");
         let (clipboard, _changes) = WinClipboard::start().unwrap();
+        let clipboard = clipboard.quiet(true);
         let outcome = clipboard.write_image_file(std::path::Path::new(&path)).unwrap();
         println!("IMAGE_OUTCOME {outcome:?}");
     }

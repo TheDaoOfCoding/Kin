@@ -26,8 +26,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use http_body_util::BodyExt;
@@ -59,6 +59,18 @@ const STOP_FRAME_WAIT: Duration = Duration::from_millis(30);
 const STOP_GRACE: Duration = Duration::from_millis(150);
 /// How many finished transfers `status.json` lists.
 const RECENT_KEPT: usize = 10;
+/// A `POST` for a transfer that already exists stops the writer of a file only if no byte of the body has reached it for this long (a
+/// request of a phone whose connection died and was not noticed). A writer that is still receiving is left alone: up to 4 files of one
+/// transfer are written at the same time (protocol.md, "Files: phone -> PC"), and one file's retry must not stop the other three.
+const TAKEOVER_IDLE_MS: u64 = 1_000;
+/// ... and a `POST` waits this long for the writers that are not quiet to finish (see `stop_idle_writers`).
+const SETTLE_WAIT: Duration = Duration::from_millis(250);
+
+/// Milliseconds on a clock that only moves forward (the time since the first call).
+fn mono_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -173,6 +185,20 @@ pub struct FileShared {
     pub finalizer: AsyncMutex<()>,
     /// Bumped to tell the current writer to stop.
     pub stop: watch::Sender<u64>,
+    /// How many requests are moving this file right now (an upload being written, a download being served): the drop window says how
+    /// many files of a transfer are going at once.
+    pub active: AtomicUsize,
+    /// In: when a byte of the body last reached the writer ([`mono_ms`]).
+    last_byte_ms: AtomicU64,
+}
+
+/// Counts one request as active on a file for as long as it lives.
+pub struct ActiveGuard(Arc<FileShared>);
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// A file of an offer (`done` starts at 0).
@@ -192,7 +218,23 @@ impl FileShared {
             writer: AsyncMutex::new(()),
             finalizer: AsyncMutex::new(()),
             stop: watch::channel(0).0,
+            active: AtomicUsize::new(0),
+            last_byte_ms: AtomicU64::new(0),
         })
+    }
+
+    /// Marks a request as moving this file until the guard is dropped.
+    pub fn begin(self: &Arc<Self>) -> ActiveGuard {
+        self.active.fetch_add(1, Ordering::Relaxed);
+        ActiveGuard(self.clone())
+    }
+
+    fn touch(&self) {
+        self.last_byte_ms.store(mono_ms(), Ordering::Relaxed);
+    }
+
+    fn idle_ms(&self) -> u64 {
+        mono_ms().saturating_sub(self.last_byte_ms.load(Ordering::Relaxed))
     }
 
     pub fn data(&self) -> FileData {
@@ -306,8 +348,11 @@ impl Entry {
 
     /// Notes that `n` more bytes moved, for the speed.
     pub fn note_moved(&self, n: u64) {
+        // The total is taken under the lock that the speed is kept under: files of one transfer move at the same time, and a total taken
+        // outside it could reach the samples out of order.
+        let mut meta = lock(&self.meta);
         let total = self.moved.fetch_add(n, Ordering::Relaxed) + n;
-        lock(&self.meta).speed.add(Instant::now(), total);
+        meta.speed.add(Instant::now(), total);
     }
 
     fn set_status(&self, status: Status, now_ms: u64, error: Option<&str>) {
@@ -391,6 +436,9 @@ pub struct Hooks {
     /// Test hook: finishing a file (the move to its final name) waits this many milliseconds first, so a test can drop the request or
     /// change the file while the finish is under way. Zero (the default) outside tests.
     pub finalize_delay_ms: AtomicU64,
+    /// How long a writer must have been quiet before a `POST` stops it (`TAKEOVER_IDLE_MS`); a test makes it long so that a writer it
+    /// has paused is never taken for a dead connection on a slow machine.
+    pub takeover_idle_ms: AtomicU64,
 }
 
 impl Default for Hooks {
@@ -400,6 +448,7 @@ impl Default for Hooks {
             max_file_bytes: AtomicU64::new(DEFAULT_MAX_FILE_BYTES),
             fail_internal: AtomicBool::new(false),
             finalize_delay_ms: AtomicU64::new(0),
+            takeover_idle_ms: AtomicU64::new(TAKEOVER_IDLE_MS),
         }
     }
 }
@@ -464,6 +513,8 @@ pub struct TransferView {
     pub status: &'static str,
     pub files: usize,
     pub files_done: usize,
+    /// How many files are moving at this moment (up to 4 with the 0.1.1 phone app).
+    pub files_active: usize,
     pub bytes_done: u64,
     pub total_bytes: u64,
     pub speed_bps: f64,
@@ -664,15 +715,23 @@ impl Core {
                 }
                 // A resumed POST is checked again, on the stored sizes: names, sizes and types in the request are ignored.
                 self.check_too_large(e.files.iter().map(|f| f.size))?;
-                self.stop_writers(&e).await;
+                // A request that is moving a file keeps going (its file counts for what it has stored so far): up to 4 files of one
+                // transfer are written at once, and this `POST` may come from one file's retry. Only a writer that has gone quiet
+                // (a connection that died unnoticed) is stopped, so the offset it leaves behind is exact.
+                self.stop_idle_writers(&e).await;
                 let mut missing = 0u64;
                 for file in &e.files {
-                    missing += file.size.saturating_sub(self.stored_now(&e, file).await);
+                    missing += match file.writer.try_lock() {
+                        Ok(_writer) => file.size.saturating_sub(self.stored_now(&e, file).await),
+                        Err(_) => file.size.saturating_sub(file.done()),
+                    };
                 }
                 self.check_space_async(&e.dest_dir, missing).await?;
                 // Anything that was complete but never got its final name (the move was cut short).
                 for file in &e.files {
-                    let _writer = file.writer.lock().await;
+                    let Ok(_writer) = file.writer.try_lock() else {
+                        continue; // its request finishes it
+                    };
                     if file.done() == file.size && !file.data().finalized && e.status() == Status::Active {
                         self.finalize_file(&e, file, None).await?;
                     }
@@ -844,7 +903,35 @@ impl Core {
         }
     }
 
-    /// Stops the writers of every file of the transfer and waits until each has let go.
+    /// Stops the writer of every file of the transfer that has received no byte for [`TAKEOVER_IDLE_MS`], and waits until it has let go.
+    /// A writer that is still receiving is not touched.
+    ///
+    /// A writer whose connection has just closed is still finishing (it writes what had arrived and records it, which takes milliseconds), and
+    /// the offset a `POST` reports has to include that. So a writer that is not quiet is waited for, for at most [`SETTLE_WAIT`]; one that is
+    /// still receiving after that is live, and its file is reported at what it has stored.
+    async fn stop_idle_writers(&self, entry: &Entry) {
+        let mut stopping = Vec::new();
+        let mut busy = Vec::new();
+        for file in &entry.files {
+            if file.writer.try_lock().is_err() {
+                if file.idle_ms() >= self.hooks.takeover_idle_ms.load(Ordering::Relaxed) {
+                    file.ask_to_stop();
+                    stopping.push(file);
+                } else {
+                    busy.push(file);
+                }
+            }
+        }
+        for file in stopping {
+            let _guard = file.writer.lock().await;
+        }
+        let deadline = Instant::now() + SETTLE_WAIT;
+        while Instant::now() < deadline && busy.iter().any(|f| f.writer.try_lock().is_err()) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Stops the writers of every file of the transfer and waits until each has let go (a cancel).
     async fn stop_writers(&self, entry: &Entry) {
         for file in &entry.files {
             file.ask_to_stop();
@@ -903,6 +990,9 @@ impl Core {
         if !matches!(entry.status(), Status::Active | Status::Done) || entry.canceled.load(Ordering::Relaxed) {
             return Err(Failure::not_found());
         }
+        // From here this request counts as moving the file (the drop window shows how many files are going at once).
+        let _active = file.begin();
+        file.touch();
         let stored = self.stored_now(&entry, &file).await;
         if offset != stored {
             return Err(offset_mismatch(stored));
@@ -944,6 +1034,8 @@ impl Core {
             handle = outcome.handle;
             match outcome.end {
                 WriteEnd::Complete => {}
+                // Stopped by a newer request for the file, or by a cancel of the whole transfer (which the phone is told with `404`).
+                WriteEnd::Stopped if entry.canceled.load(Ordering::Relaxed) => return Err(Failure::not_found()),
                 WriteEnd::Stopped => return Err(offset_mismatch(file.done())),
                 WriteEnd::BodyError => {
                     log::info!(
@@ -1332,6 +1424,11 @@ impl Core {
             status: status.as_str(),
             files: entry.files.len(),
             files_done,
+            files_active: if status == Status::Active {
+                entry.files.iter().filter(|f| f.active.load(Ordering::Relaxed) > 0).count()
+            } else {
+                0
+            },
             bytes_done: entry.files.iter().map(|f| if f.data().finalized { f.size } else { f.done().min(f.size) }).sum(),
             total_bytes: entry.total_bytes(),
             speed_bps: if status == Status::Active { meta.speed.bps(Instant::now()) } else { 0.0 },
@@ -1619,6 +1716,7 @@ impl Pipeline<'_> {
     /// hands a full buffer to the disk.
     async fn accept(&mut self, data: &[u8], missing: u64, taken: &mut u64) -> Result<(), std::io::Error> {
         let take = (data.len() as u64).min(missing - *taken) as usize;
+        self.file.touch();
         self.buffer.extend_from_slice(&data[..take]);
         *taken += take as u64;
         if self.buffer.len() >= WRITE_PIECE { self.flush().await } else { Ok(()) }

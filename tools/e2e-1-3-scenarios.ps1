@@ -140,18 +140,18 @@ function Wait-PcActive([string]$Dir, [long]$MinBytes, [int]$Sec = 60) {
     Wait-Until { $s = Get-Status; $script:pac = @($s.transfers.active) | Where-Object { $_ -and $_.direction -eq $Dir -and $_.bytesDone -ge $MinBytes } | Select-Object -First 1; [bool]$script:pac } $Sec | Out-Null
     $script:pac
 }
-function Pc-Send([string[]]$Paths) { & $Kin --send @Paths }
+function Pc-Send([string[]]$Paths) { Invoke-Kin --send @Paths }
 function Restart-Kin([string[]]$Extra = @()) {
     $port = (Get-Status).port
-    & $Kin --quit 2>$null
-    Wait-Until { -not (Get-Process Kin -ErrorAction SilentlyContinue) } 15 | Out-Null
+    Invoke-Kin --quit 2>$null
+    Wait-Until { -not (Get-DevKinProcesses) } 15 | Out-Null
     Start-Sleep -Milliseconds 700
-    Start-Process $Kin -ArgumentList ($KinArgs + @('--dev-port', "$port") + $Extra) | Out-Null
+    Start-DevKin ($KinArgs + @('--dev-port', "$port") + $Extra) | Out-Null
     Wait-Until { (Get-Status).state -in 'phone_offline', 'phone_connected' } 30 | Out-Null
     Phone-Cmd 'CONNECT' | Out-Null   # the phone is in its backoff after the close: connect now
     Wait-Until { (Get-Status).state -eq 'phone_connected' } 60
 }
-function Set-PcClip([string]$Text) { Set-Clipboard -Value $Text; Start-Sleep -Milliseconds 700 }
+function Set-PcClip([string]$Text) { Set-QuietClipboardText $Text; Start-Sleep -Milliseconds 700 }
 
 # Android allows an app 50 notifications at once and silently drops the next ones (seen on API 29 after a long run: a text from the PC got no
 # notification). A force-stop removes them all; the service is started again and the phone connects at once.
@@ -370,7 +370,7 @@ function Run-Milestone13 {
         Share-Files 'e2e-cancel7b.bin'
         $a = Wait-PcActive 'in' 3MB 90
         Check 'S7b the upload is running' ($null -ne $a)
-        & $Kin --cancel-transfers
+        Invoke-Kin --cancel-transfers
         $t = Wait-NewPcTransfer $before 'in' 30
         Check 'S7b PC: canceled' ($t -and $t.status -eq 'canceled') "$($t.status) $($t.error)"
         $pt = Phone-NewTransfer $pbefore 'up' 30
@@ -383,7 +383,7 @@ function Run-Milestone13 {
         Pc-Send @($p)
         $a = Wait-PcActive 'out' 3MB 90
         Check 'S7c the download is running' ($null -ne $a)
-        & $Kin --cancel-transfers
+        Invoke-Kin --cancel-transfers
         $t = Wait-NewPcTransfer $before 'out' 30
         Check 'S7c PC: canceled' ($t -and $t.status -eq 'canceled') "$($t.status) $($t.error)"
         $pt = Phone-NewTransfer $pbefore 'down' 30
@@ -554,7 +554,7 @@ function Run-Milestone13 {
         Reset-PhoneNotifications
         # a. sensitive, PC -> phone
         $secA = Use-Text "e2e-$n s3cretpcphone words here"
-        & $Kin --dev-set-clipboard $secA --dev-clipboard-mark exclude
+        Invoke-Kin --dev-set-clipboard $secA --dev-clipboard-mark exclude
         Start-Sleep -Milliseconds 1500
         $textsBefore = Phone-LogCount "(?<!sensitive )text from '"
         $tx = Hotkey-Send
@@ -584,7 +584,7 @@ function Run-Milestone13 {
         Use-Text ($line + ' ' + $line) | Out-Null
         Set-PcClip $crlf
         $pbefore = Phone-Ids
-        & $Kin --send-clipboard
+        Invoke-Kin --send-clipboard
         $pt = Phone-NewTransfer $pbefore 'down' 60
         Check 'S10c PC -> phone: a 200 KiB text came as a file download' ($pt -and $pt.Status -eq 'done' -and $pt.Files -eq 1) "$($pt.Status) $($pt.Names) err=$($pt.Err)"
         if (-not ($pt -and $pt.Status -eq 'done')) { Show-PhoneTransferLog }

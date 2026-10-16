@@ -29,6 +29,11 @@ param(
     [string]$Kin = (Join-Path $PSScriptRoot '..\desktop\src-tauri\target\release\Kin.exe'),
     [string]$Apk = (Join-Path $PSScriptRoot '..\android\app\build\outputs\apk\debug\app-debug.apk')
 )
+# Only one of the Kin scripts (e2e, smoke, capture, check) may run at a time: they share the real clipboard, the Kin.exe slot and the emulator (tools\kin-lock.ps1).
+. (Join-Path $PSScriptRoot 'kin-lock.ps1'); Enter-KinLock 'e2e-1-1'
+# The Kin of this run runs BESIDE the user's installed Kin (own data directory, own single-instance lock, port and toast identity), and every command goes to it
+# with --data-dir. The installed Kin is never started, stopped, asked or killed from here (tools\kin-dev.ps1).
+. (Join-Path $PSScriptRoot 'kin-dev.ps1')
 # Kin takes the PC's name from COMPUTERNAME and shows it on the phone, so every picture of a notification or a pairing screen would carry the real
 # name of this computer. A neutral name for the run (put back at the end).
 $script:OrigComputerName = $env:COMPUTERNAME
@@ -127,14 +132,23 @@ try {
     if (-not $installer -or (Get-Item $Kin).LastWriteTime -gt $installer.LastWriteTime.AddSeconds(30)) {
         throw 'Kin.exe is not from `tauri build` (the installer in bundle\nsis is missing or older: `cargo test --release` replaces the exe with a dev-server build). Run with -Build, or desktop\build.ps1.'
     }
-    if (Get-Process Kin -ErrorAction SilentlyContinue) { throw 'Kin.exe is already running; quit it first (a dev instance and a normal one share the single-instance slot).' }
+    # Only a Kin on THIS run's data directory would be in the way (the user's installed Kin is not: it has its own).
+    Set-KinDev -Exe $Kin -DataDir $Data
+    Assert-NoDevKinOnDataDir
 
     # ---- emulator, install, permission
     Say "starting $Avd"
     $started.Emulator = $true
-    if (-not (Invoke-EmuScript 'start.ps1' @('-Avd', $Avd)) -or ((A shell getprop sys.boot_completed | Out-String).Trim() -ne '1')) { throw "emulator $Avd did not start (see tools\emulator\emulator-$Avd.log)" }
+    # The adb server that start.ps1 leaves behind sometimes shows the new emulator as "offline" (seen on 2026-10-17): restart the server once, then look again.
+    $emuUp = Invoke-EmuScript 'start.ps1' @('-Avd', $Avd)
+    $isBooted = { ((A shell getprop sys.boot_completed 2>$null | Out-String).Trim() -eq '1') }
+    if ($emuUp -and -not (& $isBooted)) { & $Adb kill-server 2>$null | Out-Null; Start-Sleep -Seconds 2; & $Adb start-server 2>$null | Out-Null; Wait-Until $isBooted 60 | Out-Null }
+    if (-not $emuUp -or -not (& $isBooted)) { throw "emulator $Avd did not start (see tools\emulator\emulator-$Avd.log)" }
     # The emulator boots from the snapshot the last run left, and a run that died with Wi-Fi switched off (scenarios turn it off on purpose) left it off.
     A shell svc wifi enable | Out-Null
+    # start.ps1 reuses whatever emulator is running: the AVD asked for must be the one running
+    $runningAvd = ((A emu avd name | Out-String) -split "`r?`n" | Where-Object { $_ } | Select-Object -First 1)
+    if ($runningAvd -and $runningAvd.Trim() -ne $Avd) { throw "the emulator that is running is '$($runningAvd.Trim())', not ${Avd}: stop it first (tools\emulator\stop.ps1)" }
     $sdk = [int](A shell getprop ro.build.version.sdk | Out-String).Trim()
     Say "API $sdk"
     # Files of an earlier install stay in Pictures/Kin, Movies/Kin and Download/Kin but the new install can't see (or replace) them, and a same-named
@@ -165,13 +179,13 @@ content delete --uri content://media/external/file --where "_data LIKE '/storage
     $started.Kin = $true
     # --dev-received-dir: received files never go to the real Downloads\Kin
     $KinArgs = @('--data-dir', ('"{0}"' -f $Data), '--dev-bind', '127.0.0.1', '--dev-qr-address', '10.0.2.2', '--dev-received-dir', ('"{0}"' -f (Join-Path $Data 'received')), '--dev-print-pair-url', '--dev-no-windows')
-    Start-Process $Kin -ArgumentList $KinArgs | Out-Null
+    Start-DevKin $KinArgs | Out-Null
     Check 'desktop started' (Wait-Until { (Get-Status).state -eq 'not_paired' } 30)
     $pc = Get-Status
     Check 'desktop listens on loopback' ($pc.bind -eq '127.0.0.1') "port $($pc.port)"
 
     # ---- pair
-    & $Kin --dev-start-pairing
+    Invoke-Kin --dev-start-pairing
     $urlFile = Join-Path $Data 'pair-url.txt'
     Wait-Until { Test-Path $urlFile } 10 | Out-Null
     $url = (Get-Content $urlFile -Raw).Trim()
@@ -199,7 +213,7 @@ content delete --uri content://media/external/file --where "_data LIKE '/storage
     $rtt = Parse-Rtt (Phone-Cmd 'PING')
     Check 'ping phone -> PC' ($null -ne $rtt) ("{0:N1} ms" -f $rtt)
     $before = if ($pc.lastPing) { $pc.lastPing.at } else { 0 }
-    & $Kin --ping
+    Invoke-Kin --ping
     Check 'ping PC -> phone' (Wait-Until { $lp = (Get-Status).lastPing; $lp -and $lp.at -gt $before -and $null -ne $lp.rttMs } 15) ("{0:N1} ms" -f (Get-Status).lastPing.rttMs)
     $pcLog = Get-Content (Join-Path $Data 'logs\kin.log') -Raw
     Check 'PC shows "Ping from" the phone' ($pcLog -match 'toast: Ping from ')
@@ -230,11 +244,7 @@ finally {
     if ($Milestone -in '1.3', '1.4' -and $started.Emulator -and ((A get-state | Out-String) -match 'device')) { try { Clear-Phone13 } catch { Say "could not clean the phone: $_" } }   # the test files, before the emulator goes
     if (-not $KeepRunning) {
         Say 'tearing down'
-        if ($started.Kin) {
-            & $Kin --quit 2>$null
-            $p = Get-Process Kin -ErrorAction SilentlyContinue
-            if ($p -and -not (Wait-Until { -not (Get-Process Kin -ErrorAction SilentlyContinue) } 10)) { Stop-Process -Name Kin -Force -ErrorAction SilentlyContinue }
-        }
+        if ($started.Kin) { Stop-DevKin 10 }   # --quit to our data directory; if it hangs, only our own process (path and data directory checked), by ID
         if ($started.Emulator) { Invoke-EmuScript 'stop.ps1' @('-All') 120 | Out-Null }
         & $Adb kill-server 2>$null | Out-Null
     }

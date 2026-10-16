@@ -58,6 +58,8 @@ The cases have a `to` role, and a receiver of that role has to answer them: `tex
 
 `check-vectors.ts` checks that every name above matches a case (the `scope-1.4` group).
 
+**v0.1.1 (several files of one transfer at once).** One new sequence in `http.json`, on top of everything above: `batch-files-of-one-transfer-are-independent-and-a-resume-leaves-the-others-alone` (changelog 53). Both sides run it like any other sequence. The sequential format can't interleave requests, so the concurrency itself (4 `PUT`s or 4 `GET`s of one transfer at once, a resume of one file while the others go on, a cancel in the middle, small files pipelined on one connection) is tested with real connections: the Windows app in `desktop/src-tauri/tests/parallel_files.rs`, the phone in its own tests. `check-vectors.ts` checks the sequence (the `scope-0.1.1` group).
+
 ## Common format
 
 Every file is one JSON object. It starts with `description`, `specVersion` (the protocol version, `1`) and sometimes `howToRead`, then one or more arrays of cases. Every case has a `name` that is unique inside its array, and some have a `note` explaining why the case exists.

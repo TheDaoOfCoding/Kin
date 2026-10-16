@@ -3,12 +3,14 @@
 #   .\start.ps1                    headless kin_api37 (no window, no audio)
 #   .\start.ps1 -Avd kin_api29     the minSdk (API 29) image
 #   .\start.ps1 -Window            show the emulator window
+#   .\start.ps1 -WipeData          factory-reset the data partition first (repair: adb "offline" in a loop after the emulator was killed hard)
 #
 # Exit code 0 = booted and ready. The last output line is the serial. Stop it with .\stop.ps1.
 # Cold boot every time (no snapshots), so each run starts from a clean device.
 param(
     [string]$Avd = 'kin_api37',
     [switch]$Window,
+    [switch]$WipeData,   # factory-reset the AVD's data partition once (a device whose adb keeps going offline after an unclean kill)
     [int]$Port = 5554,
     [int]$TimeoutSec = 300
 )
@@ -31,6 +33,7 @@ if (-not (& $Emulator -list-avds | Where-Object { $_ -eq $Avd })) { throw "No AV
 $log = Join-Path $PSScriptRoot "emulator-$Avd.log"
 $emuArgs = @('-avd', $Avd, '-port', $Port, '-no-snapshot', '-no-boot-anim', '-no-metrics', '-gpu', 'swiftshader_indirect')
 if (-not $Window) { $emuArgs += '-no-window', '-no-audio' }
+if ($WipeData) { $emuArgs += '-wipe-data' }
 
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $env:ANDROID_HOME = $Sdk

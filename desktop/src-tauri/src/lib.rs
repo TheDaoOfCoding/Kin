@@ -19,6 +19,7 @@ pub mod fileserver;
 pub mod history;
 pub mod identity;
 pub mod images;
+pub mod instance;
 pub mod integration;
 pub mod json;
 pub mod links;

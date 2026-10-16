@@ -6,7 +6,15 @@
 #   cd desktop; powershell -STA -ExecutionPolicy Bypass -File check-dragdrop.ps1
 #
 # Loopback only, a throwaway profile and received folder under %LOCALAPPDATA%\Temp; everything it starts is stopped and deleted.
-param()
+#
+# **It moves the mouse pointer and presses the button (OS input injection), so it does nothing unless it is run with -AllowMouse by a person who is
+# not using the PC** (the agents' rules forbid input injection). It runs beside the user's installed Kin like the other scripts (own data directory),
+# and looks only at windows of its own Kin process, never at a window of the installed one.
+param([switch]$AllowMouse)
+if (-not $AllowMouse) { Write-Host 'check-dragdrop.ps1 moves the mouse pointer and presses the button for about a second. It is not run unless you pass -AllowMouse (and are not using the PC).'; exit 2 }
+# Only one of the Kin scripts (e2e, smoke, capture, check) may run at a time: they share the real clipboard, the Kin.exe slot and the emulator (tools\kin-lock.ps1).
+. (Join-Path $PSScriptRoot '..\tools\kin-lock.ps1'); Enter-KinLock 'check-dragdrop'
+. (Join-Path $PSScriptRoot '..\tools\kin-dev.ps1')   # a Kin of our own beside the installed one; every command carries --data-dir (kin-dev.ps1)
 $ErrorActionPreference = 'Stop'
 if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') { throw 'run it with powershell -STA (OLE drag and drop needs a single-threaded apartment)' }
 $here = $PSScriptRoot
@@ -16,6 +24,13 @@ if (-not (Test-Path $phoneExe)) { $phoneExe = Join-Path $here 'src-tauri\target\
 $work = Join-Path $env:LOCALAPPDATA ('Temp\kin13-dnd-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 $data = Join-Path $work 'data'; $recv = Join-Path $work 'received'; $save = Join-Path $work 'phone-saved'
 $ok = $true
+$kinProc = $null; $phoneProc = $null
+# A window of OUR Kin process with this title (the installed Kin may have a window of the same name open: it is never found).
+function Our-Window-Condition([string]$Name) {
+    $c1 = New-Object Windows.Automation.PropertyCondition ([Windows.Automation.AutomationElement]::NameProperty), $Name
+    $c2 = New-Object Windows.Automation.PropertyCondition ([Windows.Automation.AutomationElement]::ProcessIdProperty), ([int]$script:kinProc.Id)
+    New-Object Windows.Automation.AndCondition -ArgumentList $c1, $c2
+}
 function Check([string]$n, [bool]$c) { Write-Host ("  [{0}] {1}" -f $(if ($c) { 'ok' } else { 'FAIL' }), $n); if (-not $c) { $script:ok = $false } }
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing, UIAutomationClient, UIAutomationTypes
 Add-Type -TypeDefinition @'
@@ -30,25 +45,25 @@ public static class Mouse6 {
 '@
 try {
     [IO.Directory]::CreateDirectory($work) | Out-Null
-    if (Get-Process Kin -ErrorAction SilentlyContinue) { throw 'Kin.exe is already running: quit it first' }
-    Start-Process $kin -ArgumentList '--data-dir', ('"{0}"' -f $data), '--dev-bind', '127.0.0.1', '--dev-received-dir', ('"{0}"' -f $recv), '--dev-print-pair-url'
+    Set-KinDev -Exe $kin -DataDir $data
+    $kinProc = Start-DevKin @('--data-dir', ('"{0}"' -f $data), '--dev-bind', '127.0.0.1', '--dev-received-dir', ('"{0}"' -f $recv), '--dev-print-pair-url')
     for ($i = 0; $i -lt 50 -and -not (Test-Path -LiteralPath (Join-Path $data 'status.json')); $i++) { Start-Sleep -Milliseconds 200 }
-    & $kin --dev-start-pairing; Start-Sleep -Seconds 1
+    Invoke-Kin --dev-start-pairing; Start-Sleep -Seconds 1
     $url = (Get-Content -LiteralPath (Join-Path $data 'pair-url.txt')).Trim()
     $log = Join-Path $work 'phone.log'
-    Start-Process $phoneExe -ArgumentList $url, '--host', '127.0.0.1', '--seconds', '90', '--save-dir', ('"{0}"' -f $save) -RedirectStandardOutput $log -NoNewWindow
+    $phoneProc = Start-Process $phoneExe -ArgumentList $url, '--host', '127.0.0.1', '--seconds', '90', '--save-dir', ('"{0}"' -f $save) -RedirectStandardOutput $log -NoNewWindow -PassThru
     for ($i = 0; $i -lt 50 -and -not ((Get-Content -LiteralPath (Join-Path $data 'status.json') -Raw) -match 'phone_connected'); $i++) { Start-Sleep -Milliseconds 200 }
     # Pairing opens the "New device paired" window in the middle of the screen, where the drop window opens too. Close it, so that the drop
     # lands on the drop window.
     Start-Sleep -Seconds 2
-    $paired = [Windows.Automation.AutomationElement]::RootElement.FindFirst([Windows.Automation.TreeScope]::Children, (New-Object Windows.Automation.PropertyCondition ([Windows.Automation.AutomationElement]::NameProperty), 'Pair new phone'))
+    $paired = [Windows.Automation.AutomationElement]::RootElement.FindFirst([Windows.Automation.TreeScope]::Children, (Our-Window-Condition 'Pair new phone'))
     if ($paired) { $paired.GetCurrentPattern([Windows.Automation.WindowPattern]::Pattern).Close(); Start-Sleep -Milliseconds 800 }
     $file = Join-Path $work 'dropped.txt'
     [IO.File]::WriteAllText($file, "dropped on the drop window`n")
-    & $kin --drop
+    Invoke-Kin --drop
     $win = $null
     for ($i = 0; $i -lt 40 -and -not $win; $i++) {
-        $win = [Windows.Automation.AutomationElement]::RootElement.FindFirst([Windows.Automation.TreeScope]::Children, (New-Object Windows.Automation.PropertyCondition ([Windows.Automation.AutomationElement]::NameProperty), 'Send to phone'))
+        $win = [Windows.Automation.AutomationElement]::RootElement.FindFirst([Windows.Automation.TreeScope]::Children, (Our-Window-Condition 'Send to phone'))
         if (-not $win) { Start-Sleep -Milliseconds 250 }
     }
     Check 'the drop window is open' ([bool]$win)
@@ -96,9 +111,8 @@ try {
     Check 'the downloaded bytes are the file''s' ((Test-Path (Join-Path $save 'dropped.txt')) -and ((Get-FileHash $file).Hash -eq (Get-FileHash (Join-Path $save 'dropped.txt')).Hash))
 }
 finally {
-    Get-Process fake_phone -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    if (Get-Process Kin -ErrorAction SilentlyContinue) { & $kin --quit; Start-Sleep -Seconds 2 }
-    Get-Process Kin, fake_phone -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    if ([IO.Directory]::Exists($work)) { try { [IO.Directory]::Delete($work, $true) } catch { } }
+    Stop-OwnProcess $phoneProc          # the fake phone this script started (by ID, never by name)
+    Stop-DevKin 10                      # --quit to our data directory; a hung process of ours is stopped by its ID
+    Remove-DevDataDir $work   # (the web view of the drop window holds files in it for a moment after Kin has quit)
 }
 if (-not $ok) { Write-Host 'FAILED'; exit 1 } else { Write-Host 'all checks passed' }

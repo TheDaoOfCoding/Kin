@@ -132,6 +132,9 @@ struct Session {
     svg: Option<String>,
     /// The `kinrelay://pair?...` link the QR code encodes, for the "Copy pairing link" button. It holds the token: memory only, never logged.
     url: Option<String>,
+    /// "Copy pairing link" was pressed for this code, so the link may be on the clipboard: once the phone has paired, it is taken off again
+    /// (if the clipboard still holds exactly it). Without the button the clipboard is never looked at.
+    link_copied: bool,
     paired: Option<DeviceRow>,
 }
 
@@ -394,7 +397,7 @@ impl Core {
         let session = if addresses.is_empty() {
             lock(&self.pairing).end(now);
             log::warn!("pairing: no private network address found, no QR code");
-            Session { expires_ms: 0, svg: None, url: None, paired: None }
+            Session { expires_ms: 0, svg: None, url: None, link_copied: false, paired: None }
         } else {
             let token = lock(&self.pairing).begin(now);
             let url = pairing::pair_url(&addresses, &self.identity.device_id, &token, Some(&self.pc_name()));
@@ -404,6 +407,7 @@ impl Core {
                 expires_ms: unix_ms() + pairing::TOKEN_TTL.as_millis() as u64,
                 svg: Some(pairing::qr_svg(&url)),
                 url: Some(url),
+                link_copied: false,
                 paired: None,
             }
         };
@@ -488,6 +492,9 @@ impl Core {
         let clipboard = self.clipboard.clone();
         match tokio::task::spawn_blocking(move || clipboard.write_text_sensitive(&url)).await {
             Ok(Ok(())) => {
+                if let Some(s) = lock(&self.session).as_mut() {
+                    s.link_copied = true;
+                }
                 log::info!("pairing link copied to the clipboard (kept out of the history and the sync)");
                 Ok(())
             }
@@ -547,8 +554,41 @@ impl Core {
         log::info!("pairing attempt from {remote}, device {}: {outcome}", short(device_id));
         if result.is_ok() {
             self.device_paired(device_id);
+            self.clear_pairing_link_from_clipboard();
         }
         result
+    }
+
+    /// The phone has paired: the link that "Copy pairing link" put on the clipboard is dead now, and it held a token, so it is taken off
+    /// the clipboard again, but only if the clipboard still holds exactly that link (the check and the clearing are one step: a copy
+    /// the user made in the meantime is never touched). Nothing happens if the button was not used for this code.
+    fn clear_pairing_link_from_clipboard(&self) {
+        let url = {
+            let mut session = lock(&self.session);
+            match session.as_mut() {
+                Some(s) if s.link_copied => {
+                    s.link_copied = false;
+                    s.url.clone()
+                }
+                _ => None,
+            }
+        };
+        let Some(url) = url else {
+            return;
+        };
+        let clipboard = self.clipboard.clone();
+        let work = move || match clipboard.clear_if_text(&url) {
+            Ok(true) => log::info!("the pairing link was taken off the clipboard (the phone is paired)"),
+            Ok(false) => log::info!("the pairing link is not on the clipboard any more: the clipboard was left alone"),
+            Err(e) => log::warn!("taking the pairing link off the clipboard failed: {e}"),
+        };
+        // The clipboard can be busy for a moment, so it is not touched on the thread that answers the phone.
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(work);
+            }
+            Err(_) => work(),
+        }
     }
 
     fn device_paired(&self, device_id: &str) {

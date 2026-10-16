@@ -127,8 +127,13 @@ function Check-Rule([string]$name, [string]$protocol, [string]$localPort) {
     if ($port.Protocol -ne $protocol) { $problems += "protocol is $($port.Protocol)" }
     if ($localPort -and $port.LocalPort -ne $localPort) { $problems += "local port is $($port.LocalPort)" }
     if (-not (Same-Path $app $Exe)) { $problems += "it is for $app and not for $Exe" }
+    # Since v0.1.1 the rules only answer the PC's own subnet (D12 addendum). A rule that says Any is from an older installer: it works, so WARN.
+    $remote = (($rule | Get-NetFirewallAddressFilter).RemoteAddress | ForEach-Object { "$_" }) -join ','
     if ($problems.Count) { Report 'FAIL' "Firewall rule `"$name`" is wrong" ($problems -join '; ') }
-    else { Report 'PASS' "Firewall rule `"$name`"" "inbound, allow, $protocol$(if ($localPort) { " $localPort" }), profiles $profiles, for $app" }
+    else {
+        Report 'PASS' "Firewall rule `"$name`"" "inbound, allow, $protocol$(if ($localPort) { " $localPort" }), profiles $profiles, remote $remote, for $app"
+        if ($remote -ne 'LocalSubnet') { Report 'WARN' "Firewall rule `"$name`" answers $remote, not only the local subnet" 'rules from before v0.1.1 do; reinstall to get remoteip=LocalSubnet (a phone on another subnet than the PC needs this rule widened by hand)' }
+    }
 }
 try {
     Check-Rule 'Kin Relay' 'TCP' ''

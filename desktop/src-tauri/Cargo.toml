@@ -1,6 +1,6 @@
 [package]
 name = "kin"
-version = "0.1.0"
+version = "0.1.1"
 description = "Kin Relay desktop app"
 authors = ["Kin Relay"]
 edition = "2024"
@@ -73,4 +73,5 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Registry",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
 ] }

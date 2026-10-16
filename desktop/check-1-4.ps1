@@ -12,6 +12,9 @@
 # a failure). A second PowerShell holds one hotkey for a moment, to make a conflict. Everything it started is stopped, and its folders are
 # deleted. -SkipClipboard leaves out the checks that put text on the clipboard.
 param([switch]$Build, [switch]$SkipClipboard)
+# Only one of the Kin scripts (e2e, smoke, capture, check) may run at a time: they share the real clipboard, the Kin.exe slot and the emulator (tools\kin-lock.ps1).
+. (Join-Path $PSScriptRoot '..\tools\kin-lock.ps1'); Enter-KinLock 'check-1-4'
+. (Join-Path $PSScriptRoot '..\tools\kin-dev.ps1')   # a Kin of our own beside the installed one; every command carries --data-dir (kin-dev.ps1)
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 . (Join-Path $here 'clipboard-backup.ps1')
@@ -39,15 +42,14 @@ function Wait-Until([scriptblock]$Cond, [int]$Seconds = 20) {
 function Status { Get-Content -LiteralPath (Join-Path $data 'status.json') -Raw -Encoding UTF8 | ConvertFrom-Json }
 function Kin-Log { (Get-Content -LiteralPath (Join-Path $data 'logs\kin.log') -Raw -ErrorAction SilentlyContinue) }
 function Start-Kin([string[]]$Extra = @()) {
-    if (Get-Process Kin -ErrorAction SilentlyContinue) { throw 'Kin.exe is already running: quit it first (a dev instance and a normal one share the single-instance slot).' }
     $a = @('--data-dir', ('"{0}"' -f $data), '--dev-bind', '127.0.0.1', '--dev-received-dir', ('"{0}"' -f $recv), '--dev-print-pair-url', '--dev-no-windows') + $Extra
-    Start-Process $kin -ArgumentList $a | Out-Null
+    Start-DevKin $a | Out-Null
     if (-not (Wait-Until { Test-Path -LiteralPath (Join-Path $data 'status.json') } 15)) { throw 'Kin did not start' }
 }
-function Stop-Kin { if (Get-Process Kin -ErrorAction SilentlyContinue) { & $kin --quit; Wait-Until { -not (Get-Process Kin -ErrorAction SilentlyContinue) } 10 | Out-Null } }
+function Stop-Kin { Stop-DevKin 10 }   # --quit to our data directory; a hung process of ours is stopped by its ID
 # A fake phone with a key that stays the same between runs (--identity-file). The first one pairs; with -Paired it just connects.
 function New-Phone([string[]]$PhoneArgs, [int]$Seconds = 60, [switch]$Paired) {
-    & $kin --dev-start-pairing
+    Invoke-Kin --dev-start-pairing
     if (-not (Wait-Until { (Test-Path -LiteralPath (Join-Path $data 'pair-url.txt')) } 10)) { throw 'no pairing URL' }
     Start-Sleep -Milliseconds 400
     $url = (Get-Content -LiteralPath (Join-Path $data 'pair-url.txt')).Trim()
@@ -68,7 +70,7 @@ function Make-File([string]$path, [int]$bytes) { $b = New-Object byte[] $bytes; 
 function View([string]$name) {
     $file = Join-Path $data "view-$name.json"
     Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
-    & $kin --dev-dump-view $name
+    Invoke-Kin --dev-dump-view $name
     if (-not (Wait-Until { Test-Path -LiteralPath $file } 10)) { throw "no view-$name.json" }
     Start-Sleep -Milliseconds 100
     Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -81,14 +83,15 @@ function Dev-Result([string]$file, [scriptblock]$Action) {
     Start-Sleep -Milliseconds 100
     Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
 }
-function Dev-Set([string]$key, [string]$value) { Dev-Result 'dev-set-result.json' { & $kin --dev-set $key $value }.GetNewClosure() }
+function Dev-Set([string]$key, [string]$value) { Dev-Result 'dev-set-result.json' { Invoke-Kin --dev-set $key $value }.GetNewClosure() }
 # The text goes to the clipboard and --send-clipboard reads it when Kin gets to the command (a few tens of ms later), so wait until Kin has
 # done it before the clipboard is changed again.
 function Send-Clip([string]$text) {
     $t0 = (Status).lastSent.text.at
-    Set-Clipboard -Value $text; Start-Sleep -Milliseconds 600; & $kin --send-clipboard
+    Set-QuietClipboardText $text; Start-Sleep -Milliseconds 600; Invoke-Kin --send-clipboard
     Wait-Until { (Status).lastSent.text.at -ne $t0 } 10 | Out-Null
 }
+function Run-KeyText { (@(Run-Key | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join '|') }
 function Run-Key { (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -ErrorAction SilentlyContinue).PSObject.Properties | Where-Object { $_.Name -match 'Kin' } }
 
 try {
@@ -98,14 +101,16 @@ try {
         powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'build.ps1') | Out-Null
     }
     foreach ($f in $kin, $phoneExe) { if (-not (Test-Path -LiteralPath $f)) { throw "$f is missing: build it first (or pass -Build)" } }
+    Set-KinDev -Exe $kin -DataDir $data
     # `cargo test --release` replaces target\release\Kin.exe with a dev-server build; `tauri build` writes the installer just after the exe.
     $installer = Get-ChildItem (Join-Path (Split-Path $kin) 'bundle\nsis') -Filter 'Kin_*_x64-setup.exe' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1
     if (-not $installer -or (Get-Item $kin).LastWriteTime -gt $installer.LastWriteTime.AddSeconds(30)) { throw 'Kin.exe is not from `tauri build` (`cargo test --release` replaces it with a dev-server build): pass -Build' }
     New-Item -ItemType Directory -Force -Path $work, $src, $save | Out-Null
     if (-not $SkipClipboard) { $backup = Save-Clipboard }
     Say "work folder $work"
-    $runBefore = Run-Key
-    Check 'the Run key has no Kin value before the run' ($null -eq $runBefore)
+    # The installed Kin has its own value in the Run key (start with Windows). A developer run must leave the key exactly as it is.
+    $runBefore = Run-KeyText
+    Write-Host ('  the Run key has {0} Kin value(s) before the run (the installed Kin''s own, if it has one: only compared at the end)' -f @(Run-Key).Count)
 
     # ---------------------------------------------------------------- the queue
     Say 'queue: the phone goes away, the PC sends a text, files and a second text, the phone comes back'
@@ -120,7 +125,7 @@ try {
     Check 'the tray says "Phone offline - last seen <time>"' ($tray -match ('^Phone offline ' + $dash + ' last seen \d\d:\d\d')) $tray
     if (-not $SkipClipboard) {
         Send-Clip 'queued text one'
-        & $kin --send (Join-Path $src 'photo.jpg') (Join-Path $src 'notes.txt')
+        Invoke-Kin --send (Join-Path $src 'photo.jpg') (Join-Path $src 'notes.txt')
         Send-Clip 'queued text two'
         Check 'three sends are waiting in the queue' (Wait-Until { (Status).queue.count -eq 3 } 10) "count $((Status).queue.count)"
         Check 'the tray shows how many are waiting' ((Status).tray.status -match '3 queued') (Status).tray.status
@@ -171,7 +176,7 @@ try {
         Send-Clip 'canceled before it left'
         Check 'it is queued' (Wait-Until { (Status).queue.count -eq 1 } 10)
         $id = (View 'history').items[0].id
-        $res = Dev-Result 'dev-history-result.json' { & $kin --dev-history cancel $id }.GetNewClosure()
+        $res = Dev-Result 'dev-history-result.json' { Invoke-Kin --dev-history cancel $id }.GetNewClosure()
         Check 'cancel worked' ($res.ok -eq $true) ($res | ConvertTo-Json -Compress)
         Check 'the queue is empty and the history says canceled' (((Status).queue.count -eq 0) -and ((View 'history').items[0].status -eq 'canceled'))
         $c = New-Phone @() 12 -Paired
@@ -240,7 +245,7 @@ Start-Sleep -Seconds 25
 
     $r = Dev-Set 'startWithWindows' 'true'
     Check 'start with Windows is switched on in the stand-in file' (($r.ok -eq $true) -and ((Get-Content -LiteralPath (Join-Path $data 'autostart-mock.json') -Raw | ConvertFrom-Json).enabled -eq $true))
-    Check 'the registry Run key has no Kin value (a developer run never touches it)' ($null -eq (Run-Key))
+    Check 'the registry Run key is as it was (a developer run never touches it)' ((Run-KeyText) -eq $runBefore)
     Check 'the settings view says the switch is not the real one' ((View 'settings').startWithWindowsIsReal -eq $false)
     [void](Dev-Set 'startWithWindows' 'false')
     Stop-Phones
@@ -248,7 +253,7 @@ Start-Sleep -Seconds 25
     # ---------------------------------------------------------------- export
     Say 'export logs: a zip with the logs and a redacted status.json'
     $zip = Join-Path $work 'export.zip'
-    & $kin --dev-export-logs $zip
+    Invoke-Kin --dev-export-logs $zip
     Check 'the zip was written' (Wait-Until { Test-Path -LiteralPath $zip } 10)
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $z = [IO.Compression.ZipFile]::OpenRead($zip)
@@ -270,7 +275,7 @@ Start-Sleep -Seconds 25
         $st = $z.GetEntry('status.json'); $rd = New-Object IO.StreamReader($st.Open()); $stj = $rd.ReadToEnd() | ConvertFrom-Json; $rd.Dispose()
         Check 'the device ID is cut to 8 characters' ($stj.deviceId.Length -eq 8)
     } finally { $z.Dispose() }
-    Check 'the Run key still has no Kin value at the end' ($null -eq (Run-Key))
+    Check 'the Run key is still as it was at the end' ((Run-KeyText) -eq $runBefore)
 }
 finally {
     Stop-Phones

@@ -32,7 +32,7 @@ function Pc-LogLines([string]$Pattern) { @((Pc-Log) -split "`r?`n" | Where-Objec
 function Pc-View([string]$Name) {
     $file = Join-Path $Data "view-$Name.json"
     [IO.File]::Delete($file)
-    & $Kin --dev-dump-view $Name
+    Invoke-Kin --dev-dump-view $Name
     if (-not (Wait-Until { Test-Path -LiteralPath $file } 10)) { return $null }
     Start-Sleep -Milliseconds 150
     Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -43,7 +43,7 @@ function Pc-HistoryItem([string]$Id) { Pc-History | Where-Object { $_.id -eq $Id
 function Pc-HistoryCmd([string]$Verb, [string]$Id) {
     $path = Join-Path $Data 'dev-history-result.json'
     [IO.File]::Delete($path)
-    & $Kin --dev-history $Verb $Id
+    Invoke-Kin --dev-history $Verb $Id
     if (-not (Wait-Until { Test-Path -LiteralPath $path } 10)) { return $null }
     Start-Sleep -Milliseconds 150
     Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -52,27 +52,27 @@ function Pc-QueueIds { @((Get-Status).queue.items | ForEach-Object { $_.id }) }
 function Short([string]$Id) { $Id.Substring($Id.Length - 8) }   # the PC log and status.json call a transfer by the last 8 characters of its id
 
 function Stop-Kin14 {
-    & $Kin --quit 2>$null
-    Wait-Until { -not (Get-Process Kin -ErrorAction SilentlyContinue) } 15 | Out-Null
+    Invoke-Kin --quit 2>$null
+    Wait-Until { -not (Get-DevKinProcesses) } 15 | Out-Null
     Start-Sleep -Milliseconds 700
 }
 function Start-Kin14([string[]]$Extra = @()) {
     $port = (Get-Status).port
-    Start-Process $Kin -ArgumentList ($KinArgs + @('--dev-port', "$port") + $Extra) | Out-Null
+    Start-DevKin ($KinArgs + @('--dev-port', "$port") + $Extra) | Out-Null
     Wait-Until { (Get-Status).state -in 'phone_offline', 'phone_connected', 'not_paired' } 30 | Out-Null
 }
 # The phone is in its backoff after the PC went away: connect now
 function Connect-Phone14 { Phone-Cmd 'CONNECT' | Out-Null }
 
 $script:FrozenKin = $null
-function Freeze-Kin14 { $p = Get-Process Kin -ErrorAction SilentlyContinue | Select-Object -First 1; if ($p) { [void][Kin14.Native]::NtSuspendProcess($p.Handle); $script:FrozenKin = $p } }
+function Freeze-Kin14 { $p = Get-DevKinProcesses | Select-Object -First 1; if ($p) { [void][Kin14.Native]::NtSuspendProcess($p.Handle); $script:FrozenKin = $p } }
 function Resume-Kin14 { if ($script:FrozenKin) { try { [void][Kin14.Native]::NtResumeProcess($script:FrozenKin.Handle) } catch { }; $script:FrozenKin = $null } }
 
 # The phone goes away from the PC's point of view: Wi-Fi off, and the PC finds out the way it does in life (a send gets no ack), here with a ping
 function Phone-Away14 {
     Wifi $false
     Start-Sleep -Milliseconds 800
-    & $Kin --ping
+    Invoke-Kin --ping
     Wait-Until { (Get-Status).state -eq 'phone_offline' } 25
 }
 function Phone-Back14([int]$Sec = 45) { Wifi $true; Wait-Until { (Get-Status).state -eq 'phone_connected' } $Sec }
@@ -80,15 +80,15 @@ function Phone-Back14([int]$Sec = 45) { Wifi $true; Wait-Until { (Get-Status).st
 # The explicit send of the hotkey (--send-clipboard), after the text is on the clipboard. Waits until Kin has read it (see check-1-4.ps1).
 function Pc-SendText14([string]$Text, [int]$Sec = 20) {
     $t0 = (Get-Status).lastSent.text.at
-    Set-Clipboard -Value $Text; Start-Sleep -Milliseconds 650
-    & $Kin --send-clipboard
+    Set-QuietClipboardText $Text; Start-Sleep -Milliseconds 650
+    Invoke-Kin --send-clipboard
     Wait-Until { $x = (Get-Status).lastSent.text; $x -and $x.at -ne $t0 } $Sec | Out-Null
     (Get-Status).lastSent.text
 }
 # --send a file and return the history item that appeared for it
 function Pc-OfferFile14([string]$Path) {
     $known = @(Pc-History | ForEach-Object { $_.id })
-    & $Kin --send $Path
+    Invoke-Kin --send $Path
     Wait-Until { $script:nf = Pc-History | Where-Object { $_.direction -eq 'out' -and $_.kind -eq 'file' -and $_.id -notin $known } | Select-Object -First 1; [bool]$script:nf } 20 | Out-Null
     $script:nf
 }
@@ -291,7 +291,7 @@ function Run-Milestone14 {
         $tx = Use-Text "e2e14-$n s2 text from the phone"
         $ids0 = @(Phone-TextIds); $tids0 = @(Phone-Ids)
         Stop-Kin14
-        Check 'S2 Kin.exe is stopped' (-not (Get-Process Kin -ErrorAction SilentlyContinue))
+        Check 'S2 Kin.exe is stopped' (-not (Get-DevKinProcesses))
         Check 'S2 the phone notices (not connected)' (Wait-Until { (Phone-State)['link'] -notlike 'Connected*' } 20)
         $res = Phone-SendText14 $tx
         Check 'S2 SEND_TEXT answers Queued(...) with the PC away' ($res -match 'result=Queued\(') $res
@@ -586,7 +586,7 @@ function Run-Milestone14 {
         $up = @(Phone-Transfers) | Where-Object { $_.Id -notin $tids0 -and $_.Dir -eq 'up' } | Select-Object -First 1
         Wifi $false
         Start-Sleep -Seconds 1
-        & $Kin --cancel-transfers
+        Invoke-Kin --cancel-transfers
         $pcT = Wait-NewPcTransfer $pcIds0 'in' 40
         Check 'S7a the PC canceled the transfer (the phone is offline)' ($pcT -and $pcT.status -eq 'canceled') "$($pcT.status) $($pcT.error)"
         $script:Seen14[$up.Id] = 'S7a'
@@ -662,10 +662,10 @@ function Run-Milestone14 {
         Check 'S8 the phone is away' (Phone-Away14)
         $ids0 = @(Phone-TextIds)
         $q0 = (Get-Status).queue.count
-        & $Kin --dev-set-clipboard $secPc --dev-clipboard-mark exclude
+        Invoke-Kin --dev-set-clipboard $secPc --dev-clipboard-mark exclude
         Start-Sleep -Milliseconds 1200
         $t0 = (Get-Status).lastSent.text.at
-        & $Kin --send-clipboard
+        Invoke-Kin --send-clipboard
         Wait-Until { $x = (Get-Status).lastSent.text; $x -and $x.at -ne $t0 } 15 | Out-Null
         $r = (Get-Status).lastSent.text
         Check 'S8 PC: the sensitive text was not sent and not queued (result phone_offline, sensitive true, queued false)' ($r -and $r.sensitive -eq $true -and $r.result -eq 'phone_offline' -and -not $r.queued) "$($r.result) sensitive=$($r.sensitive) queued=$($r.queued)"
@@ -711,7 +711,7 @@ function Run-Milestone14 {
         Check 'S9 the phone is away' (Phone-Away14)
         $q0 = (Get-Status).queue.count; $s0 = Get-Status
         $ids0 = @(Phone-TextIds)
-        Set-Clipboard -Value $auto
+        Set-QuietClipboardText $auto
         Start-Sleep -Milliseconds 2500
         $s1 = Get-Status
         Check 'S9 the copy was not queued (queue.count unchanged), and nothing is in the history' ($s1.queue.count -eq $q0 -and @(Pc-History | Where-Object { $_.text -eq $auto }).Count -eq 0) "queue $q0 -> $($s1.queue.count)"
@@ -784,7 +784,7 @@ function Run-Milestone14 {
         # the transfer storm: BurstFiles single-file offers, back to back
         $before = @(Phone-Ids)
         $files = 1..$BurstFiles | ForEach-Object { $p = Join-Path $script:W14 ('e2e14-storm-{0:D2}.bin' -f $_); Make-PcFile $p 20000 (80 + $_); $script:Names.Add((Split-Path $p -Leaf)); $p }
-        foreach ($p in $files) { & $Kin --send $p }
+        foreach ($p in $files) { Invoke-Kin --send $p }
         Check "S11 the phone downloaded all $BurstFiles files" (Wait-Until { @(Phone-Transfers | Where-Object { $_.Id -notin $before -and $_.Dir -eq 'down' -and $_.Status -eq 'done' }).Count -ge $BurstFiles } 120) "$(@(Phone-Transfers | Where-Object { $_.Id -notin $before -and $_.Status -eq 'done' }).Count)"
         Start-Sleep -Seconds 3
         $recs = @(Phone-AppRecords)
@@ -849,7 +849,7 @@ function Run-Milestone14 {
 
         # PC: Export logs (the developer hook does what the button does, without the dialog)
         $zip = Join-Path $script:W14 'pc-logs.zip'
-        & $Kin --dev-export-logs $zip
+        Invoke-Kin --dev-export-logs $zip
         Wait-Until { Test-Path -LiteralPath $zip } 15 | Out-Null
         Start-Sleep -Milliseconds 500
         Check 'S13 PC: Export logs wrote a zip' (Test-Path -LiteralPath $zip) "$zip"

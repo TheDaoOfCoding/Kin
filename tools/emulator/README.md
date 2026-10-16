@@ -21,6 +21,7 @@ tools\emulator\start.ps1 -Avd kin_api29     # the API 29 AVD
 tools\emulator\start.ps1 -Window            # with a visible window
 tools\emulator\install.ps1                  # installs android\app\build\outputs\apk\debug\app-debug.apk and launches Kin
 tools\emulator\install.ps1 -Apk path\to.apk
+tools\emulator\start.ps1 -WipeData          # factory-reset the data partition first (repair only: adb "offline" in a loop after a hard kill)
 tools\emulator\screenshot.ps1               # saves tools\emulator\screenshot-<time>.png and prints the path
 tools\emulator\screenshot.ps1 -Out C:\temp\a.png
 tools\emulator\stop.ps1                     # stops the Kin emulators (AVDs named kin_*) and, if none is left, the adb server
@@ -47,6 +48,8 @@ tools\emulator\stop.ps1 -All                # stops every emulator, also ones of
 The API 37 image raises the guest RAM to 4096 MB by itself ("Increasing RAM size to 4096MB" in the log), whatever `hw.ramSize` says. API 29 respects the 2.5 GB setting.
 
 ## adb and Unity
+
+The e2e, smoke and bench scripts (`tools\kin-lock.ps1`) set `ANDROID_ADB_SERVER_PORT=5038`, so they and the emulator they start use an adb server of their own and never meet Unity's or an IDE's on 5037 (two adb servers on one emulator take it "offline" every few seconds); with that variable set, `Initialize-Adb` does not stop other adb processes. The text below is for the scripts run by hand without it.
 
 Unity ships its own `adb.exe` (under `D:\Unity\...\PlaybackEngines\AndroidPlayer\SDK\platform-tools`), and a different version. Two adb versions fight over port 5037. Every script here calls `Initialize-Adb` in `_common.ps1`, which kills any adb server that is not ours and starts our own.
 

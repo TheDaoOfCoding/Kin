@@ -12,6 +12,7 @@ use crate::cli::{self, Command, Parsed};
 use crate::clipboard::{MonotonicClock, WinClipboard};
 use crate::core::{Core, Event, Services, computer_name, short};
 use crate::identity::Identity;
+use crate::instance;
 use crate::links::ShellOpener;
 use crate::mdns::Advertiser;
 use crate::server::{self, ServerHandle};
@@ -30,8 +31,25 @@ pub struct AppState {
 }
 
 pub fn run(parsed: Parsed) {
-    // Before any window exists: the process is "Kin" (app.kinrelay.desktop) to Windows, like the Start Menu shortcut of the installer.
-    let aumid = crate::integration::set_process_app_user_model_id();
+    // Which Kin this is (instance.rs): the installed one's own data directory, or a separate instance with a key of its own, which runs beside
+    // it. Everything that Windows would share between two copies of the program (the single-instance lock, the toast identity) is made from it.
+    let key = parsed.config.instance_key();
+    if let Some(why) = instance::dev_settings_refusal(parsed.config.dev_hooks_enabled(), key.as_deref()) {
+        fatal(&why);
+    }
+    let identifier = instance::identifier(key.as_deref());
+    // A launch with no data directory of its own hands its command line to the installed Kin. That is for the installed program only.
+    if let Ok(mine) = std::env::current_exe()
+        && let Some(why) = instance::forwarding_refusal(key.as_deref(), &mine, &instance::running_program(&identifier))
+    {
+        fatal(&why);
+    }
+    // Before any window exists: the process is "Kin" to Windows (app.kinrelay.desktop, like the Start Menu shortcut of the installer), or a
+    // name of its own for an instance that runs beside it.
+    let aumid = crate::integration::set_process_app_user_model_id(&instance::app_user_model_id(key.as_deref()));
+    let mut context = tauri::generate_context!();
+    // The single-instance plugin and the notification plugin read the identifier from here.
+    context.config_mut().identifier = identifier;
     let built = tauri::Builder::default()
         // Must be the first plugin. A second launch (`kin.exe --ping`, later Explorer's "Send to") runs this callback in the
         // running instance with its arguments, and exits.
@@ -94,7 +112,7 @@ pub fn run(parsed: Parsed) {
                 state.core.end_pairing();
             }
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .unwrap_or_else(|e| fatal(&e));
 
     built.run(|app, event| match event {
@@ -128,11 +146,13 @@ fn setup(app: &mut tauri::App, parsed: Parsed, aumid: std::result::Result<(), St
     filelog::init(&config.data_dir.join("logs"))?;
     filelog::install_panic_hook();
     log::info!(
-        "Kin {} started (pid {}), data dir {}{}",
+        "Kin {} started (pid {}), data dir {}{}, instance {}, app user model ID and single-instance name {}",
         crate::core::APP_VERSION,
         std::process::id(),
         config.data_dir.display(),
-        if config.is_dev_network() { ", developer network settings on: loopback only" } else { "" }
+        if config.is_dev_network() { ", developer network settings on: loopback only" } else { "" },
+        config.instance_key().map_or_else(|| "installed".to_string(), |k| format!("dev-{k} (beside the installed Kin)")),
+        instance::identifier(config.instance_key().as_deref())
     );
     if !unknown.is_empty() {
         log::warn!("ignoring unknown arguments: {unknown:?}");
@@ -158,13 +178,16 @@ fn setup(app: &mut tauri::App, parsed: Parsed, aumid: std::result::Result<(), St
     // A message-only window listens for clipboard changes (`AddClipboardFormatListener`). It also owns the clipboard when the app
     // writes to it.
     let (win_clipboard, clipboard_changes) = WinClipboard::start()?;
+    // An instance beside the installed Kin writes everything it puts on the clipboard so that the installed Kin skips it (clipboard.rs).
+    let win_clipboard = win_clipboard.quiet(config.instance_key().is_some());
     let services = Services { clipboard: Arc::new(win_clipboard), opener: Arc::new(ShellOpener), clock: Arc::new(MonotonicClock::new()) };
     let core = Arc::new(Core::new(config, loaded.identity, db, computer_name(), events_tx, services));
 
     let server = tauri::async_runtime::block_on(server::start(core.clone()))?;
-    // mDNS opens multicast sockets on every interface, which developer mode (loopback only) must not do.
-    let advertiser = if core.config.is_dev_network() {
-        log::info!("mDNS: not advertising in developer network mode");
+    // mDNS opens multicast sockets on every interface, which developer mode (loopback only) must not do, and a copy that runs beside the
+    // installed Kin (its own data directory) must not either: the user's phone would find it.
+    let advertiser = if !core.config.advertises_on_lan() {
+        log::info!("mDNS: not advertising (developer network mode, or an instance beside the installed Kin)");
         None
     } else {
         Advertiser::start(&core.identity.short_id, server.local_addr.port()).map_err(|e| log::error!("mDNS advertising failed: {e}")).ok()
@@ -436,6 +459,9 @@ fn register_hotkey(app: &AppHandle, core: &Core) {
     let mut status = HotkeyStatus { accelerator: accelerator.clone(), registered: false, error: None };
     if accelerator.is_empty() {
         log::info!("hotkey: turned off in settings.json");
+    } else if core.config.instance_key().is_some() && is_the_installed_hotkey(&accelerator) {
+        // The installed Kin has this key. Registering it here would fail (and, if this copy got there first, take it from the installed one).
+        log::info!("hotkey: {accelerator} is the installed Kin's, not registered by an instance beside it");
     } else {
         let outcome = crate::settings::parse_hotkey(&accelerator).and_then(|shortcut| {
             app.global_shortcut()
@@ -616,6 +642,9 @@ pub fn change_hotkey(app: &AppHandle, core: &Core, accelerator: &str) -> std::re
         return Ok(serde_json::json!({ "accelerator": "", "registered": false }));
     }
     let shortcut = crate::settings::parse_hotkey(accelerator)?;
+    if core.config.instance_key().is_some() && is_the_installed_hotkey(accelerator) {
+        return Err(format!("{accelerator} is the installed Kin's hotkey, and this instance runs beside it: it can't take it"));
+    }
     // The old one goes first, so that choosing the same key again (or a key that only differs in spelling) is not a conflict with itself.
     if let Some(o) = old_shortcut {
         let _ = shortcuts.unregister(o);
@@ -637,6 +666,14 @@ pub fn change_hotkey(app: &AppHandle, core: &Core, accelerator: &str) -> std::re
                 if old.is_empty() { "off".to_string() } else { old }
             ))
         }
+    }
+}
+
+/// Whether this is the default hotkey, which the installed Kin registers: an instance beside it must never register it.
+fn is_the_installed_hotkey(accelerator: &str) -> bool {
+    match (crate::settings::parse_hotkey(accelerator), crate::settings::parse_hotkey(crate::settings::DEFAULT_HOTKEY)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => accelerator.trim().eq_ignore_ascii_case(crate::settings::DEFAULT_HOTKEY),
     }
 }
 

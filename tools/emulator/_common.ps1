@@ -18,8 +18,13 @@ foreach ($p in $Adb, $Emulator) {
 # Unity's) is killed and replaced. Unity may restart its own server later and take the port back;
 # running any of these scripts again takes it over again.
 function Initialize-Adb {
+    # Our own adb server port, even when a script runs without tools\kin-lock.ps1: another program's adb (Unity's) on 5037 is never ours to stop.
+    if (-not $env:ANDROID_ADB_SERVER_PORT) { $env:ANDROID_ADB_SERVER_PORT = '5038' }
     $ours = (Resolve-Path $Adb).Path
     $foreign = @(Get-Process adb -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -ne $ours })
+    # With an adb server port of our own (ANDROID_ADB_SERVER_PORT, set by tools\kin-lock.ps1) another adb belongs to somebody else's server on the default
+    # port: it is none of our business and is never stopped.
+    if ($env:ANDROID_ADB_SERVER_PORT -and $env:ANDROID_ADB_SERVER_PORT -ne '5037') { $foreign = @() }
     if ($foreign) {
         & $Adb kill-server 2>$null | Out-Null   # works across versions: it just asks whoever listens on 5037 to quit
         Start-Sleep -Milliseconds 500

@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 use crate::core::{Core, short_transfer};
 use crate::json::{MAX_SAFE_INT, parse_object, uint};
 use crate::server::{ApiError, Limits, MAX_BODY_BYTES, Peer, is_json_content_type, read_limited};
-use crate::transfers::{Entry, Failure, FileShared, FileSpec, PutParams, UploadRequest, parse_strict_u64};
+use crate::transfers::{ActiveGuard, Entry, Failure, FileShared, FileSpec, PutParams, UploadRequest, parse_strict_u64};
 
 /// Files are read from disk in pieces of this size, one piece ahead of the network.
 const READ_PIECE: usize = 1 << 20;
@@ -305,12 +305,15 @@ struct FileBody {
     /// Where in the file this body started, and how much it has handed over.
     start: u64,
     sent: u64,
+    /// Counts this body as moving the file until it is dropped (finished, canceled or abandoned by the phone).
+    _active: ActiveGuard,
 }
 
 impl FileBody {
     /// `file` is already at byte `start`.
     fn new(file: std::fs::File, start: u64, length: u64, entry: Arc<Entry>, shared: Arc<FileShared>) -> FileBody {
-        let mut body = FileBody { file: Some(file), remaining: length, pending: None, entry, shared, start, sent: 0 };
+        let _active = shared.begin();
+        let mut body = FileBody { file: Some(file), remaining: length, pending: None, entry, shared, start, sent: 0, _active };
         body.shared.done.store(start, std::sync::atomic::Ordering::Relaxed);
         body.read_ahead();
         body

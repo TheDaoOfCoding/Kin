@@ -30,7 +30,7 @@ use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
 
 use crate::Result;
-use crate::core::{Core, DEFAULT_PORT, PairFailure, PairRequest, short};
+use crate::core::{Core, PairFailure, PairRequest, short};
 use crate::json::{non_empty_str, optional_str, parse_object, uint};
 use crate::messages::PROTOCOL;
 use crate::pairing::PairError;
@@ -362,7 +362,7 @@ pub async fn start(core: Arc<Core>) -> Result<ServerHandle> {
 /// [`start`] with other limits (the tests use short timeouts and few slots).
 pub async fn start_with(core: Arc<Core>, limits: Limits) -> Result<ServerHandle> {
     let tls_config = tls::server_config(&core.identity)?;
-    let listener = bind(core.config.bind_ip(), core.config.dev_port.unwrap_or(DEFAULT_PORT)).await?;
+    let listener = bind(core.config.bind_ip(), core.config.preferred_port()).await?;
     let local_addr = listener.local_addr()?;
     core.set_port(local_addr.port());
     log::info!("listening on {local_addr} (TLS 1.3, client certificate required)");

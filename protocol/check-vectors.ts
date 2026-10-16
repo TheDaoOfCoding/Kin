@@ -1386,6 +1386,29 @@ function receiverModel(frame: any) {
   console.log(`milestone 1.4 scope: ${inScope} sequences in messages.json and http.json`);
 }
 
+// ---- v0.1.1 scope (several files of one transfer at once). The sequential vector format can't interleave requests, so this one pins what
+// is checkable per file: independent offsets, a resume POST in the middle of a batch that lists every file, and a file cut off half way.
+{
+  const g = "scope-0.1.1";
+  const http = load("http.json");
+  const name = "batch-files-of-one-transfer-are-independent-and-a-resume-leaves-the-others-alone";
+  const s = http.sequences.find((s: any) => s.name === name);
+  check(g, `${name}: exists`, s !== undefined);
+  if (s) {
+    const posts = s.steps.filter((st: any) => st.request?.method === "POST");
+    const puts = s.steps.filter((st: any) => st.request?.method === "PUT");
+    check(g, `${name}: a POST at the start, one in the middle and one at the end`, posts.length === 3, () => String(posts.length));
+    check(g, `${name}: one PUT is cut off`, puts.filter((st: any) => st.response === null && st.interruptedAfterBytes > 0).length === 1);
+    // the middle POST reports the complete file complete, the cut one at what arrived, and the untouched one at 0
+    const mid = posts[1].response.body.files;
+    check(g, `${name}: the resume POST reports f1 complete, f2 at the cut and f3 at 0`, mid[0].offset === 5 && mid[1].offset === puts.find((st: any) => st.response === null).interruptedAfterBytes && mid[2].offset === 0);
+    check(g, `${name}: every PUT that has a body continues from the offset its URL says`, puts.every((st: any) => st.request.headers["Content-Length"] === String(st.request.bodyBytes)));
+    const last = posts[2].response.body.files.map((f: any) => f.offset);
+    check(g, `${name}: the last POST says every file is complete`, last[0] === 5 && last[1] === 2097152 && last[2] === 7, () => last.join(","));
+  }
+  console.log("v0.1.1 scope: 1 sequence in http.json");
+}
+
 // ---- fixtures/: DER certificates for the negative tls[] cases (made by fixtures/make-fixtures.ts)
 {
   const g = "fixtures";

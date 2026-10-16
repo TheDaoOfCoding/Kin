@@ -458,6 +458,97 @@ async fn copy_pairing_link_puts_the_qr_link_on_the_clipboard_as_sensitive_text()
     assert!(exclusion(&snapshot.formats).is_some(), "Kin's own clipboard sync skips it");
 }
 
+fn clipboard_formats(w: &World) -> Vec<ClipFormat> {
+    use kin_lib::clipboard::Clipboard;
+    w.env.clipboard.read().unwrap().formats
+}
+
+/// The phone pairs with `token` (a plain `POST /v1/pair`) and the answer is 200.
+async fn pair_with(w: &World, token: &str) {
+    let mut stream = w.tls().await;
+    let body = pair_body(token, PHONE_NAME);
+    let r = request(&mut stream, "POST", "/v1/pair", &[("Content-Type", "application/json; charset=utf-8")], &body).await.unwrap();
+    assert_eq!(r.status, 200, "{:?}", r.json());
+}
+
+/// The clearing runs in a task of its own, after the phone has its answer: waits (up to 5 s) for the clipboard text to be `want`.
+async fn wait_for_clipboard_text(w: &World, want: Option<&str>) {
+    for _ in 0..200 {
+        if w.env.clipboard.text().as_deref() == want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(w.env.clipboard.text().as_deref(), want, "the clipboard never got there");
+}
+
+#[tokio::test]
+async fn the_copied_pairing_link_is_taken_off_the_clipboard_when_the_phone_has_paired() {
+    let mut w = World::new().await;
+    let token = start_pairing_and_read_token(&w.env);
+    let url = std::fs::read_to_string(w.env.dir.path().join("pair-url.txt")).unwrap().trim().to_string();
+    w.core().copy_pairing_link().await.unwrap();
+    assert_eq!(w.env.clipboard.text().as_deref(), Some(url.as_str()));
+
+    pair_with(&w, &token).await;
+
+    wait_for_clipboard_text(&w, None).await;
+    assert!(clipboard_formats(&w).is_empty(), "the sensitive-text formats went with it");
+    // Taken off once: the same code can't be used twice, and the clipboard is the user's again.
+    w.env.clipboard.user_copy("something the user copied later", vec![]);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(w.env.clipboard.text().as_deref(), Some("something the user copied later"));
+    drain(&mut w.env.events);
+}
+
+#[tokio::test]
+async fn the_clipboard_is_left_alone_after_pairing_when_it_no_longer_holds_the_link() {
+    let mut w = World::new().await;
+    let token = start_pairing_and_read_token(&w.env);
+    w.core().copy_pairing_link().await.unwrap();
+    // The user copied something else before the phone paired (or an older link: anything that isn't exactly this one).
+    w.env.clipboard.user_copy("Dinner at 8?", vec![]);
+
+    pair_with(&w, &token).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    assert_eq!(w.env.clipboard.text().as_deref(), Some("Dinner at 8?"), "someone else's clipboard is not cleared");
+    drain(&mut w.env.events);
+}
+
+#[tokio::test]
+async fn the_clipboard_is_not_even_looked_at_after_pairing_when_the_copy_button_was_not_used() {
+    let mut w = World::new().await;
+    let token = start_pairing_and_read_token(&w.env);
+    let url = std::fs::read_to_string(w.env.dir.path().join("pair-url.txt")).unwrap().trim().to_string();
+    // The link is on the clipboard, but Kin did not put it there (the user typed it from the screen, say): not Kin's to clear.
+    w.env.clipboard.user_copy(&url, vec![]);
+
+    pair_with(&w, &token).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    assert_eq!(w.env.clipboard.text().as_deref(), Some(url.as_str()));
+    drain(&mut w.env.events);
+}
+
+#[tokio::test]
+async fn a_failed_pairing_leaves_the_copied_link_on_the_clipboard() {
+    let mut w = World::new().await;
+    let token = start_pairing_and_read_token(&w.env);
+    let url = std::fs::read_to_string(w.env.dir.path().join("pair-url.txt")).unwrap().trim().to_string();
+    w.core().copy_pairing_link().await.unwrap();
+    // A wrong code: the pairing fails, the code is still good, so the link still works and stays where it is.
+    let mut stream = w.tls().await;
+    let wrong = pair_body("ZZZZZZZZZZZZZZZZZZZZZZ", PHONE_NAME);
+    let r = request(&mut stream, "POST", "/v1/pair", &[("Content-Type", "application/json; charset=utf-8")], &wrong).await.unwrap();
+    assert_eq!(r.status, 401);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(w.env.clipboard.text().as_deref(), Some(url.as_str()));
+    pair_with(&w, &token).await;
+    wait_for_clipboard_text(&w, None).await;
+    drain(&mut w.env.events);
+}
+
 #[tokio::test]
 async fn copy_pairing_link_is_refused_when_the_code_is_locked_expired_or_used() {
     let mut w = World::new().await;
@@ -598,6 +689,89 @@ async fn clipboard_content_marked_by_a_password_manager_is_not_sent() {
     w.env.clipboard.user_copy("an ordinary copy", vec![ClipFormat::with_dword(CAN_INCLUDE_IN_HISTORY, 1)]);
     let frame = next_json(&mut ws).await;
     assert_eq!((frame["type"].clone(), frame["text"].clone()), (json!("clipboard"), json!("an ordinary copy")));
+}
+
+/// A [`World`] whose data directory is, or is not, the installed Kin's own (`instance.rs`): the first is the installed Kin, the second a copy
+/// that runs beside it.
+async fn world_as(installed: bool) -> World {
+    let pc_identity = kin_lib::identity::Identity::generate().unwrap();
+    let pc = TestKey {
+        pkcs8: pc_identity.key_der.clone(),
+        cert: pc_identity.cert_der.clone(),
+        device_id: pc_identity.device_id.clone(),
+        short_id: pc_identity.short_id.clone(),
+    };
+    let phone_identity = kin_lib::identity::Identity::generate().unwrap();
+    let phone = TestKey {
+        pkcs8: phone_identity.key_der,
+        cert: phone_identity.cert_der,
+        device_id: phone_identity.device_id,
+        short_id: phone_identity.short_id,
+    };
+    let env = test_core_with(pc_identity, "Desk PC", |c| {
+        if installed {
+            c.installed_data_dir = Some(c.data_dir.clone());
+        }
+    });
+    assert_eq!(env.core.config.instance_key().is_none(), installed);
+    let server = start(&env.core).await;
+    World { env, server, pc, phone }
+}
+
+#[tokio::test]
+async fn content_that_a_copy_beside_the_installed_kin_marked_as_test_content_is_ordinary_to_it_and_excluded_for_the_installed_kin() {
+    use kin_lib::clipboard::DEV_TEST_CONTENT;
+    let test_content = || vec![ClipFormat::named(EXCLUDE_FROM_MONITOR), ClipFormat::named(DEV_TEST_CONTENT)];
+
+    // The copy beside the installed Kin: it wrote the mark itself, so its sync sends the text as for any copy.
+    let w = world_as(false).await;
+    let mut ws = w.connected().await;
+    w.env.clipboard.user_copy("test text from the dev copy", test_content());
+    let frame = next_json(&mut ws).await;
+    assert_eq!((frame["type"].clone(), frame["text"].clone()), (json!("clipboard"), json!("test text from the dev copy")));
+    send_json(&mut ws, &json!({ "type": "ack", "ref": frame["id"] })).await;
+    // A real password manager's mark (without the test mark) still holds it back there.
+    w.env.clipboard.user_copy("hunter2 (a password)", vec![ClipFormat::named(EXCLUDE_FROM_MONITOR)]);
+    assert_silent(&mut ws, 600).await;
+    assert_eq!(
+        w.core().status_json()["clipboardSync"]["lastSkip"]["reason"],
+        "password_manager:ExcludeClipboardContentFromMonitorProcessing"
+    );
+    // The hotkey path reads the test content as plain text too (it is not sent as `sensitive`).
+    w.env.clipboard.user_copy("explicit test text", test_content());
+    let core = w.env.core.clone();
+    let sending = tokio::spawn(async move { core.send_clipboard_text("hotkey", kin_lib::sync::Tap::now()).await });
+    let frame = next_json(&mut ws).await;
+    assert_eq!((frame["type"].clone(), frame["text"].clone()), (json!("text"), json!("explicit test text")));
+    assert!(frame.get("sensitive").is_none_or(|s| s == &json!(false)), "{frame}");
+    send_json(&mut ws, &json!({ "type": "ack", "ref": frame["id"] })).await;
+    assert!(matches!(sending.await.unwrap(), SendResult::Acked { .. }));
+
+    // The installed Kin (its own data directory) has no use for the test mark: the content stays excluded, and nothing goes to the phone.
+    let w = world_as(true).await;
+    let mut ws = w.connected().await;
+    w.env.clipboard.user_copy("test text from the dev copy", test_content());
+    assert_silent(&mut ws, 600).await;
+    assert_eq!(
+        w.core().status_json()["clipboardSync"]["lastSkip"]["reason"],
+        "password_manager:ExcludeClipboardContentFromMonitorProcessing"
+    );
+    assert_eq!(w.core().status_json()["clipboardSync"]["sent"], 0);
+}
+
+#[tokio::test]
+async fn text_that_the_phone_sent_to_a_copy_beside_the_installed_kin_is_still_recognised_as_an_echo_when_it_carries_the_test_mark() {
+    use kin_lib::clipboard::DEV_TEST_CONTENT;
+    let w = world_as(false).await;
+    let mut ws = w.connected().await;
+    send_json(&mut ws, &text_message("t1", "from the phone", false)).await;
+    next_json(&mut ws).await;
+    let clipboard = w.env.clipboard.clone();
+    wait_until("the clipboard to be set", || clipboard.text().is_some()).await;
+    // What the real clipboard of a quiet copy would hold after that write: the text, the exclusion for the installed Kin and the test mark.
+    w.env.clipboard.user_copy("from the phone", vec![ClipFormat::named(EXCLUDE_FROM_MONITOR), ClipFormat::named(DEV_TEST_CONTENT)]);
+    assert_silent(&mut ws, 700).await;
+    assert_eq!(w.core().status_json()["clipboardSync"]["lastSkip"]["reason"], "echo_of_phone_text");
 }
 
 #[tokio::test]

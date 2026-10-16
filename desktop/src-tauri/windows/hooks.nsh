@@ -25,8 +25,10 @@
   nsExec::Exec 'netsh advfirewall firewall delete rule name="Kin Relay mDNS"'
   Pop $0
   ; The phone connects to the app over TCP. Private and Public both (decision D12: Windows 11 marks a new network Public by default, and every
-  ; request is authenticated).
-  nsExec::ExecToLog 'netsh advfirewall firewall add rule name="Kin Relay" dir=in action=allow program="$INSTDIR\${MAINBINARYNAME}.exe" enable=yes profile=private,public protocol=TCP'
+  ; request is authenticated). Since v0.1.1 only from the local subnet (remoteip=LocalSubnet, D12 addendum): the phone is on the same Wi-Fi or
+  ; router as the PC, and a rule that answers the whole internet is not needed. If a router puts the phone on another subnet than the PC, edit
+  ; or delete this rule's "Remote addresses" in Windows Defender Firewall with Advanced Security.
+  nsExec::ExecToLog 'netsh advfirewall firewall add rule name="Kin Relay" dir=in action=allow program="$INSTDIR\${MAINBINARYNAME}.exe" enable=yes profile=private,public protocol=TCP remoteip=LocalSubnet'
   Pop $0
   ${If} $0 != "0"
     DetailPrint "The firewall rule could not be added (netsh said: $0)"
@@ -34,7 +36,7 @@
   ${EndIf}
   ; The phone finds the PC again by its mDNS name when the PC's address changes; those queries come in over UDP port 5353. (Not in the
   ; original plan, which had TCP only: without it the Windows Firewall drops them for this program. See docs/windows.md.)
-  nsExec::ExecToLog 'netsh advfirewall firewall add rule name="Kin Relay mDNS" dir=in action=allow program="$INSTDIR\${MAINBINARYNAME}.exe" enable=yes profile=private,public protocol=UDP localport=5353'
+  nsExec::ExecToLog 'netsh advfirewall firewall add rule name="Kin Relay mDNS" dir=in action=allow program="$INSTDIR\${MAINBINARYNAME}.exe" enable=yes profile=private,public protocol=UDP localport=5353 remoteip=LocalSubnet'
   Pop $0
   ${If} $0 != "0"
     DetailPrint "The mDNS firewall rule could not be added (netsh said: $0)"
@@ -42,6 +44,12 @@
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
+  ; **Ask first, remove after** (v0.1.1). Tauri's template asks "Kin is running, close it?" right after this hook, and Cancel there aborts the
+  ; uninstall. With the rules and shortcuts removed above that question, a person who cancelled kept an installed Kin with no firewall rule. So
+  ; the same check runs here, before anything is removed; if the person cancels, the uninstall aborts with nothing touched (the template's
+  ; own check after this hook then finds Kin closed and says nothing). It also runs for /UPDATE, as the template's does.
+  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+
   ; /UPDATE is the updater's call: nothing is removed then.
   ${If} $UpdateMode <> 1
     DetailPrint "Removing the Windows Firewall rules for Kin Relay"

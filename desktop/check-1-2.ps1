@@ -6,24 +6,29 @@
 #   1. Set-Clipboard on the PC             -> the phone gets a `clipboard` message, acked; arrival time in status.json
 #   2. a password-manager copy             -> not sent (status.json says why)
 #   3. kin.exe --send-clipboard            -> the phone gets a `text` message
-#   4. the global hotkey, pressed for real -> the phone gets a `text` message (skipped with -SkipHotkeyPress)
+#   4. the global hotkey                   -> NOT pressed any more (see below); it checks that this Kin does not register the installed Kin's hotkey
 #   5. the phone sends `text`              -> the PC clipboard is set, with \r\n line ends, and nothing is sent back
 #   6. the phone sends a link              -> status.json says it is openable (the toast is off, so nothing opens)
 #   7. a phone that never acks             -> after 5 s: no_reply, and the PC shows the phone as offline
 #
-# YOUR CLIPBOARD: it is saved first and put back at the end (also when something fails). If it holds anything but plain text
-# (an image, files, rich text), the script refuses to run, because it couldn't put that back exactly.
-# The hotkey step presses Ctrl+Alt+Shift+K on your keyboard: it only does that when Kin reports the hotkey as registered, so the
-# keys are taken by Kin and go nowhere else. Don't touch the keyboard for the few seconds it takes.
+# YOUR CLIPBOARD: every format of it is saved first (clipboard-backup.ps1) and put back at the end (also when something fails). The text this script
+# puts on it is quiet (an installed Kin skips it), and the restore is too.
+# **The hotkey is not pressed.** The installed Kin owns Ctrl+Alt+Shift+K, and a (synthetic) key press would make *that* Kin send the clipboard to the
+# user's real phone, and the agents' rules forbid input injection anyway. A Kin that runs beside the installed one (its own --data-dir) does not register
+# that key; step 3 (`Kin.exe --send-clipboard`) runs the same code as the hotkey. -SkipHotkeyPress is kept so old command lines work and does nothing.
+# It runs beside the user's installed Kin like the other scripts (kin-dev.ps1): own data directory, every command with --data-dir, clipboard text quiet.
 # Nothing is left running: Kin and the fake phone are stopped, and the profile in %TEMP% is deleted.
 param(
     [string]$Kin = (Join-Path $PSScriptRoot 'src-tauri\target\release\Kin.exe'),
     [switch]$SkipHotkeyPress
 )
+# Only one of the Kin scripts (e2e, smoke, capture, check) may run at a time: they share the real clipboard, the Kin.exe slot and the emulator (tools\kin-lock.ps1).
+. (Join-Path $PSScriptRoot '..\tools\kin-lock.ps1'); Enter-KinLock 'check-1-2'
+. (Join-Path $PSScriptRoot '..\tools\kin-dev.ps1')   # a Kin of our own beside the installed one; every command carries --data-dir (kin-dev.ps1)
+. (Join-Path $PSScriptRoot 'clipboard-backup.ps1')   # Set-QuietClipboardText
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '_env.ps1')
 Add-Type -AssemblyName System.Windows.Forms
-Add-Type -Namespace Kin -Name Keys -MemberDefinition '[DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);'
 
 $failures = 0
 function Check([string]$what, [bool]$ok, [string]$detail = '') {
@@ -41,11 +46,8 @@ function PhoneLog { if (Test-Path $phoneOut) { Get-Content $phoneOut -Raw -Encod
 # This file has no non-ASCII characters in it (Windows PowerShell reads a file without a BOM as ANSI), so they are built from code points.
 $uniWord = 'n' + [char]0xFC + [char]0xEF + 'code ' + [char]0x2713
 
-# ----- the clipboard: save it, or refuse --------------------------------------------------------------------------
-$formats = @([Windows.Forms.Clipboard]::GetDataObject().GetFormats($false))
-$plain = @('UnicodeText', 'Text', 'OEMText', 'Locale')
-if ($formats | Where-Object { $plain -notcontains $_ }) { throw "The clipboard holds more than plain text ($($formats -join ', ')). Copy some text, then run this again." }
-$savedClipboard = Get-Clipboard -Raw -ErrorAction SilentlyContinue   # $null when it is empty
+# ----- the clipboard: save every format ------------------------------------------------------------------------------
+$savedClipboard = Save-Clipboard | Select-Object -Last 1
 
 $data = Join-Path ([IO.Path]::GetFullPath($env:TEMP)) "kin-check-1-2-$PID"
 $phoneOut = Join-Path $data 'fake-phone.out.txt'
@@ -63,9 +65,10 @@ try {
     Pop-Location
     $fake = Join-Path $PSScriptRoot 'src-tauri\target\debug\examples\fake_phone.exe'
     if (-not (Test-Path $Kin)) { throw "No $Kin. Build it first: desktop\build.ps1" }
+    Set-KinDev -Exe $Kin -DataDir $data
 
     Write-Host "Starting Kin (data dir $data, loopback only)"
-    $kinProc = Start-Process $Kin -ArgumentList '--data-dir', ('"{0}"' -f $data), '--dev-bind', '127.0.0.1', '--dev-print-pair-url', '--dev-no-windows' -PassThru
+    $kinProc = Start-DevKin @('--data-dir', ('"{0}"' -f $data), '--dev-bind', '127.0.0.1', '--dev-print-pair-url', '--dev-no-windows')
     $procs += $kinProc
     if (-not (WaitUntil { (Test-Path (Join-Path $data 'status.json')) } 15)) { throw 'Kin did not start' }
     $s = Status
@@ -74,7 +77,7 @@ try {
 
     # ----- 0. five wrong codes shut the pairing code down (carry-forward item (a) of the 1.1 review) --------------------------
     Write-Host '0. five wrong pairing codes'
-    & $Kin --dev-start-pairing
+    Invoke-Kin --dev-start-pairing
     if (-not (WaitUntil { Test-Path (Join-Path $data 'pair-url.txt') } 10)) { throw 'no pairing URL' }
     Check 'a pairing is active in status.json' (WaitUntil { (Status).pairing.active -eq $true } 5)
     $goodUrl = (Get-Content (Join-Path $data 'pair-url.txt')).Trim()
@@ -86,7 +89,7 @@ try {
     Check 'the log says the code no longer works' (WaitUntil { (KinLog) -match 'too many wrong codes' } 5)
 
     # ----- pair the fake phone ------------------------------------------------------------------------------------
-    & $Kin --dev-start-pairing
+    Invoke-Kin --dev-start-pairing
     Check 'a new code is active again' (WaitUntil { (Status).pairing.active -eq $true } 5)
     Start-Sleep -Milliseconds 300
     $url = (Get-Content (Join-Path $data 'pair-url.txt')).Trim()
@@ -101,7 +104,7 @@ try {
 
     # ----- 1. automatic sync --------------------------------------------------------------------------------------
     Write-Host '1. Set-Clipboard on the PC -> clipboard message'
-    Set-Clipboard -Value ('copied on the PC: ' + $uniWord)
+    Set-QuietClipboardText ('copied on the PC: ' + $uniWord)
     Check 'the phone received a clipboard message' (WaitUntil { (PhoneLog) -match 'received clipboard id=.* text=copied on the PC' } 5)
     Check 'status.json has the ack and the arrival time' (WaitUntil { (Status).lastSent.clipboard.result -eq 'acked' } 5)
     $sent = (Status).lastSent.clipboard
@@ -111,7 +114,7 @@ try {
     # ----- 2. password manager ------------------------------------------------------------------------------------
     Write-Host '2. a password-manager copy -> not sent'
     $before = [regex]::Matches((PhoneLog), 'received clipboard').Count
-    & $Kin --dev-set-clipboard 'hunter2-secret' --dev-clipboard-mark exclude
+    Invoke-Kin --dev-set-clipboard 'hunter2-secret' --dev-clipboard-mark exclude
     Check 'it is skipped, with the reason' (WaitUntil { (Status).clipboardSync.lastSkip.reason -like 'password_manager:*' } 5)
     Start-Sleep -Milliseconds 800
     Check 'the phone got nothing' (([regex]::Matches((PhoneLog), 'received clipboard').Count) -eq $before)
@@ -119,33 +122,23 @@ try {
 
     # ----- 3. kin.exe --send-clipboard ----------------------------------------------------------------------------
     Write-Host '3. kin.exe --send-clipboard -> text message'
-    Set-Clipboard -Value 'sent with --send-clipboard'
+    Set-QuietClipboardText 'sent with --send-clipboard'
     Start-Sleep -Milliseconds 700   # let the automatic sync finish first, so the two messages are not mixed up
-    & $Kin --send-clipboard
-    Check 'the phone received a text message' (WaitUntil { (PhoneLog) -match 'received text id=.* isUrl=false text=sent with --send-clipboard' } 5)
+    Invoke-Kin --send-clipboard
+    Check 'the phone received a text message' (WaitUntil { (PhoneLog) -match 'received text id=.* isUrl=false sensitive=false text=sent with --send-clipboard' } 5)
     Check 'status.json has the explicit send' (WaitUntil { (Status).lastSent.text.result -eq 'acked' } 5)
     Write-Host ("    tap to ack {0} ms, round trip {1} ms" -f (Status).lastSent.text.tapToAckMs, (Status).lastSent.text.rttMs)
 
     # ----- 4. the real hotkey -------------------------------------------------------------------------------------
-    if ($SkipHotkeyPress) { Write-Host '4. (hotkey press skipped)' }
-    elseif (-not (Status).hotkey.registered) { Write-Host '4. the hotkey is not registered on this PC; not pressing it'; Check 'the hotkey is registered' $false "(error: $((Status).hotkey.error))" }
-    else {
-        Write-Host '4. pressing Ctrl+Alt+Shift+K'
-        Set-Clipboard -Value 'sent with the hotkey'
-        Start-Sleep -Milliseconds 700
-        $keys = 0x11, 0x12, 0x10, 0x4B   # Ctrl, Alt, Shift, K
-        foreach ($k in $keys) { [Kin.Keys]::keybd_event($k, 0, 0, [UIntPtr]::Zero) }
-        foreach ($k in ($keys | Sort-Object -Descending { [array]::IndexOf($keys, $_) })) { [Kin.Keys]::keybd_event($k, 0, 2, [UIntPtr]::Zero) }
-        Check 'the phone received a text message from the hotkey' (WaitUntil { (PhoneLog) -match 'received text id=.* isUrl=false text=sent with the hotkey' } 5)
-        Check 'status.json says it was the hotkey' ((Status).lastSent.text.trigger -eq 'hotkey')
-    }
+    Write-Host '4. the hotkey: not pressed (the installed Kin owns Ctrl+Alt+Shift+K; --send-clipboard in step 3 runs the same code)'
+    Check 'a Kin beside the installed one does not register the installed Kin''s hotkey' (((Status).hotkey.registered -eq $false) -and (-not (Status).hotkey.error)) "registered=$((Status).hotkey.registered) error=$((Status).hotkey.error)"
 
     # ----- 5 and 6. the phone sends text --------------------------------------------------------------------------
     Write-Host '5. the phone sends text -> PC clipboard (no echo)'
     $clipboardMessages = [regex]::Matches((PhoneLog), 'received clipboard').Count
     Check 'the phone sent its text and it was acked' (WaitUntil { (PhoneLog) -match 'ack for text fake-text-1' } 40)
     Check 'the PC clipboard has the text, with Windows line ends' (WaitUntil { (Get-Clipboard -Raw) -eq "from the phone`r`nsecond line" } 5) "got: $([string](Get-Clipboard -Raw))"
-    & $Kin --dev-get-clipboard
+    Invoke-Kin --dev-get-clipboard
     Check '--dev-get-clipboard writes the same text' (WaitUntil { (Test-Path (Join-Path $data 'dev-clipboard.txt')) -and ((Get-Content (Join-Path $data 'dev-clipboard.txt') -Raw -Encoding UTF8) -eq "from the phone`r`nsecond line") } 5)
     Start-Sleep -Milliseconds 1000
     Check 'nothing was sent back to the phone' (([regex]::Matches((PhoneLog), 'received clipboard').Count) -eq $clipboardMessages)
@@ -163,17 +156,17 @@ try {
     Write-Host '7. a phone that never acks'
     Stop-Process -Id $phone.Id -Force -ErrorAction SilentlyContinue
     Check 'the first phone is gone' (WaitUntil { (Status).state -eq 'phone_offline' } 10)
-    & $Kin --dev-start-pairing
+    Invoke-Kin --dev-start-pairing
     Start-Sleep -Milliseconds 300
     $url2 = (Get-Content (Join-Path $data 'pair-url.txt')).Trim()
     $phone2 = Start-Process $fake -ArgumentList ('"{0}"' -f $url2), '--host', '127.0.0.1', '--name', '"Silent Phone"', '--seconds', '40', '--no-ack' `
         -PassThru -RedirectStandardOutput $phone2Out -RedirectStandardError (Join-Path $data 'fake-phone2.err.txt')
     $procs += $phone2
     Check 'the second phone connects' (WaitUntil { (Status).state -eq 'phone_connected' } 15)
-    Set-Clipboard -Value 'nobody acks this'
+    Set-QuietClipboardText 'nobody acks this'
     Check 'it got the message' (WaitUntil { (Get-Content $phone2Out -Raw -Encoding UTF8) -match 'received clipboard' } 5)
     Check 'after 5 s the send is no_reply and the phone is offline' (WaitUntil { (Status).lastSent.clipboard.result -eq 'no_reply' -and (Status).state -eq 'phone_offline' } 9)
-    & $Kin --send-clipboard
+    Invoke-Kin --send-clipboard
     Check 'a send while the phone is offline fails with a visible notice (in the log, the toast is off)' (WaitUntil { (Status).lastSent.text.result -eq 'phone_offline' } 5)
     $log = KinLog
     Check 'the log has the toast line' ($log -match "toast: The phone isn't connected")
@@ -184,13 +177,11 @@ try {
 }
 finally {
     if ((Get-Location).Path -like '*src-tauri') { Pop-Location }
-    if ($kinProc -and -not $kinProc.HasExited) {
-        & $Kin --quit
-        [void]$kinProc.WaitForExit(8000)
-    }
+    Stop-DevKin 8   # --quit to our data directory; a hung process of ours is stopped by its ID
     foreach ($p in $procs) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
     # Put the clipboard back.
-    if ($null -eq $savedClipboard) { Set-Clipboard -Value $null } else { Set-Clipboard -Value $savedClipboard }
+    # Every format back (marked so that an installed Kin does not send the user's own text to the phone again: clipboard-backup.ps1).
+    if ($savedClipboard) { $restored = Restore-Clipboard $savedClipboard; Write-Host ('the clipboard is back as it was (every format): {0}' -f [bool]$restored) }
     Remove-Item $data -Recurse -Force -ErrorAction SilentlyContinue
 }
 if ($failures) { Write-Host "`n$failures check(s) FAILED" -ForegroundColor Red; exit 1 } else { Write-Host "`nAll checks passed" -ForegroundColor Green }

@@ -10,6 +10,9 @@ param(
     [string]$Exe = (Join-Path $PSScriptRoot 'src-tauri\target\release\Kin.exe'),
     [string]$Screenshot = ''
 )
+# Only one of the Kin scripts (e2e, smoke, capture, check) may run at a time: they share the real clipboard, the Kin.exe slot and the emulator (tools\kin-lock.ps1).
+. (Join-Path $PSScriptRoot '..\tools\kin-lock.ps1'); Enter-KinLock 'check-copy-link'
+. (Join-Path $PSScriptRoot '..\tools\kin-dev.ps1')   # Assert-NoGameRunning, Stop-OwnProcess (a Kin of our own beside the installed one: it has its own --data-dir in every command)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'clipboard-backup.ps1')
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Drawing, System.Windows.Forms
@@ -19,6 +22,7 @@ function Check([string]$name, [bool]$ok, [string]$detail = '') {
     if ($ok) { Write-Host "PASS  $name" } else { Write-Host "FAIL  $name  $detail"; $script:failures++ }
 }
 
+Assert-NoGameRunning   # this script opens the pairing window of its own Kin
 $dataDir = Join-Path $env:LOCALAPPDATA ('Temp\kin-copylink-' + [guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($dataDir) | Out-Null
 $backup = Save-Clipboard
@@ -53,7 +57,8 @@ try {
     if ($null -eq $button) { throw 'no button' }
 
     # Something else on the clipboard first, so a pass can't be what was already there.
-    [Windows.Forms.Clipboard]::SetText('not the link')
+    # (Quietly: text on the clipboard that an installed Kin with its automatic sync on would send to the user's phone must be marked. clipboard-backup.ps1)
+    Set-QuietClipboardText 'not the link'
     $button.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
 
     $expected = (Get-Content $urlFile -Raw).Trim()
@@ -110,9 +115,9 @@ try {
     Check 'the clipboard was put back as it was' ([bool]$restored)
     if ($proc) {
         Start-Process -FilePath $Exe -ArgumentList @('--quit', '--data-dir', ('"' + $dataDir + '"'), '--dev-bind', '127.0.0.1') -WindowStyle Hidden | Out-Null
-        if (-not $proc.WaitForExit(15000)) { Stop-Process -Id $proc.Id -Force; $proc.WaitForExit() }
+        if (-not $proc.WaitForExit(15000)) { Stop-OwnProcess $proc; $proc.WaitForExit() }   # the process this script started, by ID
     }
-    if ([IO.Directory]::Exists($dataDir)) { [IO.Directory]::Delete($dataDir, $true) }
+    Remove-DevDataDir $dataDir   # (the web view of the pairing window holds files in it for a moment after Kin has quit)
 }
 if ($failures) { Write-Host "$failures check(s) failed"; exit 1 }
 Write-Host 'all checks passed'

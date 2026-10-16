@@ -8,6 +8,9 @@
 # The real clipboard is saved first, in every format (clipboard-backup.ps1), and put back at the end (also after a failure). Everything
 # it started is stopped, and its folders are deleted. -SkipClipboard leaves out the checks that put things on the clipboard.
 param([switch]$Build, [switch]$SkipClipboard)
+# Only one of the Kin scripts (e2e, smoke, capture, check) may run at a time: they share the real clipboard, the Kin.exe slot and the emulator (tools\kin-lock.ps1).
+. (Join-Path $PSScriptRoot '..\tools\kin-lock.ps1'); Enter-KinLock 'check-1-3'
+. (Join-Path $PSScriptRoot '..\tools\kin-dev.ps1')   # a Kin of our own beside the installed one; every command carries --data-dir (kin-dev.ps1)
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 . (Join-Path $here 'clipboard-backup.ps1')
@@ -32,15 +35,14 @@ function Wait-Until([scriptblock]$Cond, [int]$Seconds = 20) {
 function Status { Get-Content -LiteralPath (Join-Path $data 'status.json') -Raw | ConvertFrom-Json }
 function Kin-Log { (Get-Content -LiteralPath (Join-Path $data 'logs\kin.log') -Raw -ErrorAction SilentlyContinue) }
 function Start-Kin([string[]]$Extra = @()) {
-    if (Get-Process Kin -ErrorAction SilentlyContinue) { throw 'Kin.exe is already running: quit it first (a dev instance and a normal one share the single-instance slot).' }
     $args = @('--data-dir', ('"{0}"' -f $data), '--dev-bind', '127.0.0.1', '--dev-received-dir', ('"{0}"' -f $recv), '--dev-print-pair-url', '--dev-no-windows') + $Extra
-    Start-Process $kin -ArgumentList $args | Out-Null
+    Start-DevKin $args | Out-Null
     if (-not (Wait-Until { Test-Path -LiteralPath (Join-Path $data 'status.json') } 15)) { throw 'Kin did not start' }
 }
-function Stop-Kin { if (Get-Process Kin -ErrorAction SilentlyContinue) { & $kin --quit; Wait-Until { -not (Get-Process Kin -ErrorAction SilentlyContinue) } 10 | Out-Null } }
+function Stop-Kin { Stop-DevKin 10 }   # --quit to our data directory; a hung process of ours is stopped by its ID
 # Pairs a new fake phone (a new identity every time) and returns it. The phone's output goes to a log file next to the others.
 function New-Phone([string[]]$PhoneArgs, [int]$Seconds = 60) {
-    & $kin --dev-start-pairing
+    Invoke-Kin --dev-start-pairing
     if (-not (Wait-Until { (Test-Path -LiteralPath (Join-Path $data 'pair-url.txt')) } 10)) { throw 'no pairing URL' }
     Start-Sleep -Milliseconds 400
     $url = (Get-Content -LiteralPath (Join-Path $data 'pair-url.txt')).Trim()
@@ -64,6 +66,7 @@ try {
         powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'build.ps1') | Out-Null
     }
     foreach ($f in $kin, $phoneExe) { if (-not (Test-Path -LiteralPath $f)) { throw "$f is missing: build it first (or pass -Build)" } }
+    Set-KinDev -Exe $kin -DataDir $data
     New-Item -ItemType Directory -Force -Path $work, $src, $save | Out-Null
     if (-not $SkipClipboard) { $backup = Save-Clipboard }
     Say "work folder $work"
@@ -96,7 +99,7 @@ try {
     $down = New-Phone @('--download-cut', '900000') 90
     Check 'the phone is connected' (Wait-Until { (Status).state -eq 'phone_connected' } 15)
     Push-Location $src
-    & $kin --send photo.jpg empty.txt album
+    Invoke-Kin --send photo.jpg empty.txt album
     Pop-Location
     Check 'the phone got the offer and downloaded the files' (Wait-Phone $down 'downloaded empty.txt' 40)
     $log = Phone-Log $down
@@ -110,15 +113,15 @@ try {
     # ---------------------------------------------------------------- the sensitive flag, and a long text
     if (-not $SkipClipboard) {
         Say 'text: a password-manager copy with the hotkey is sent as sensitive, and a text over 128 KiB goes as Text.txt'
-        & $kin --dev-set-clipboard 'hunter2-secret' --dev-clipboard-mark exclude
+        Invoke-Kin --dev-set-clipboard 'hunter2-secret' --dev-clipboard-mark exclude
         Start-Sleep -Milliseconds 700
-        & $kin --send-clipboard
+        Invoke-Kin --send-clipboard
         Check 'the phone got a text marked sensitive' (Wait-Phone $down 'received text id=\S+ isUrl=False sensitive=True text=hunter2-secret' 15)
         Check 'the log has no trace of the text' (-not ((Kin-Log) -match 'hunter2'))
         $long = ('a long line of text' + [char]13 + [char]10) * 9000
-        Set-Clipboard -Value $long
+        Set-QuietClipboardText $long
         Start-Sleep -Milliseconds 700
-        & $kin --send-clipboard
+        Invoke-Kin --send-clipboard
         Check 'the long text was offered as a file' (Wait-Phone $down 'downloaded Text.txt' 20)
         $saved = Get-ChildItem -LiteralPath $save -Filter 'Text*.txt' | Select-Object -First 1
         $wire = ('a long line of text' + [char]10) * 9000
@@ -189,10 +192,9 @@ finally {
     Stop-Phones
     Stop-Kin
     if ($backup) { $ok = Restore-Clipboard $backup; Check 'the clipboard is back as it was' ([bool]$ok) }
-    Get-Process Kin, fake_phone -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 300
     if ([IO.Directory]::Exists($work)) { try { [IO.Directory]::Delete($work, $true) } catch { } }
-    Check 'nothing is left running' (-not (Get-Process Kin, fake_phone -ErrorAction SilentlyContinue))
+    Check 'nothing of ours is left running' ((@(Get-DevKinProcesses).Count -eq 0) -and -not @($phones | Where-Object { -not $_.Process.HasExited }))
     Check 'the work folder is gone' (-not (Test-Path -LiteralPath $work))
 }
 $failed = @($results | Where-Object { -not $_.Ok })

@@ -113,7 +113,16 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Re
 
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
-        Db::init(Connection::open(path)?)
+        let conn = Connection::open(path)?;
+        // v0.1.1: write-ahead log, and no fsync at every commit (`synchronous = NORMAL`: the log is synced when it is checkpointed). A received
+        // file used to cost the database four commits of two fsyncs each, one after the other behind one lock, on threads of the async runtime:
+        // with 4 files arriving at once that was the slowest part of a photo batch (50 photos over loopback: 1.2 s, 0.3 to 0.6 s with this).
+        // What it gives up: after a power cut the last moments of progress may be missing from the database (never a corrupt database). That is
+        // safe here: a resume trusts the smaller of the database and the `.part` file on disk, so a progress that is short only makes the
+        // phone send a little again, and the final move of a file is recorded after the file is already `fsync`ed. (The worst case: a file that
+        // was being moved to its final name at the moment of the power cut arrives a second time, under the next free name.)
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+        Db::init(conn)
     }
 
     pub fn open_in_memory() -> Result<Db> {

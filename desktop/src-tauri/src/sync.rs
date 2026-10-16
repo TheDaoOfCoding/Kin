@@ -215,6 +215,11 @@ impl Core {
         self.emit(Event::StateChanged);
     }
 
+    /// This is an instance that runs beside the installed Kin (its own data directory): it reads its own test content as ordinary content.
+    fn beside_installed(&self) -> bool {
+        self.config.instance_key().is_some()
+    }
+
     pub fn hotkey_accelerator(&self) -> String {
         lock(&self.settings).hotkey.clone()
     }
@@ -239,7 +244,10 @@ impl Core {
             tokio::task::spawn_blocking(move || clipboard.read()).await
         };
         let (text, sensitive) = match read {
-            Ok(Ok(snapshot)) => (snapshot.text.filter(|t| !t.is_empty()), clipboard::exclusion(&snapshot.formats).is_some()),
+            Ok(Ok(snapshot)) => (
+                snapshot.text.filter(|t| !t.is_empty()),
+                clipboard::exclusion_in_instance(&snapshot.formats, self.beside_installed()).is_some(),
+            ),
             Ok(Err(e)) => {
                 log::warn!("{trigger}: reading the clipboard failed: {e}");
                 self.emit(Event::Toast("Couldn't read the clipboard. Try again.".into()));
@@ -515,7 +523,7 @@ impl Core {
             }
         };
         // Password managers and other apps that opt out: nothing is sent, and the text is not even looked at.
-        if let Some(why) = clipboard::exclusion(&snapshot.formats) {
+        if let Some(why) = clipboard::exclusion_in_instance(&snapshot.formats, self.beside_installed()) {
             log::info!("clipboard changed: not sent, the source app marked it {}", why.format_name());
             self.skip(&format!("password_manager:{}", why.format_name()));
             return;
