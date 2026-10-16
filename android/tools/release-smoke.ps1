@@ -1,22 +1,36 @@
-# Smoke test of the SIGNED RELEASE APK (milestone 1.5) on an emulator against the real Windows app (Kin.exe, developer mode, loopback only).
+# Smoke test of the SIGNED, R8-minified release build (milestone 1.5) on an emulator against the real Windows app (Kin.exe, developer mode, loopback only).
 # The release build has no debug hooks, so everything goes through what a user (or `adb`) can do: a pairing link opened with `am start`,
 # a tap on Confirm found with uiautomator, the share intent, and the notifications. Checks: the camera permission flow of "Scan code",
-# pairing, ping (PC -> phone), text both ways, a file both ways, and that logcat shows no crash of the app (R8 problems show up here).
+# pairing, ping (PC -> phone), text both ways, a file both ways, a small batch (3 files) both ways (phone -> PC through share-source), and that logcat shows no crash of the app
+# (R8 problems show up here).
+#
+# Since v0.1.1 the real release APK is ARM-only and does not install on the x86_64 emulators. So by default this script builds the SMOKE APK:
+# `gradlew assembleSmoke -PkinSmokeAbis=x86_64` = the release build type (same R8, shrinking, proguard rules and signing) plus x86_64, written to
+# app\build\outputs\apk\smoke\app-smoke.apk. It is for this test only and never replaces app-release.apk. `-Apk` tests any other APK (no build).
 #
 #   android\tools\release-smoke.ps1                    # kin_api37
 #   android\tools\release-smoke.ps1 -Avd kin_api29
 #   android\tools\release-smoke.ps1 -KeepRunning       # leave the emulator and Kin up
+#   android\tools\release-smoke.ps1 -NoBuild           # use the smoke APK that is already built
 #
-# Exits 0 when every check passed. Needs the release APK (gradlew assembleRelease, with signing set up), and
+# Exits 0 when every check passed. Needs signing set up (README, "Release build"; an unsigned APK can't be installed), and
 # desktop\src-tauri\target\release\Kin.exe. A copy of Kin.exe is run from %TEMP%, so a desktop rebuild in the meantime does not matter.
 # Kin runs only with --dev-bind 127.0.0.1 and a throwaway data directory; the PC clipboard is saved and put back.
 param(
     [string]$Avd = 'kin_api37',
     [switch]$KeepRunning,
-    [string]$Apk = (Join-Path $PSScriptRoot '..\app\build\outputs\apk\release\app-release.apk'),
+    [string]$Apk = '',
+    [switch]$NoBuild,
     [string]$Kin = (Join-Path $PSScriptRoot '..\..\desktop\src-tauri\target\release\Kin.exe'),
     [string]$ScreenshotDir = ''
 )
+# Only one of the Kin scripts (e2e, smoke, capture, check) may run at a time: they share the real clipboard, the Kin.exe slot and the emulator (tools\kin-lock.ps1).
+. (Join-Path $PSScriptRoot '..\..\tools\kin-lock.ps1'); Enter-KinLock 'release-smoke'
+. (Join-Path $PSScriptRoot '..\..\tools\kin-dev.ps1')   # a Kin of our own beside the installed one; every command carries --data-dir (kin-dev.ps1)
+if ($Apk -eq '') {
+    $Apk = Join-Path $PSScriptRoot '..\app\build\outputs\apk\smoke\app-smoke.apk'
+    $buildSmoke = -not $NoBuild
+} else { $buildSmoke = $false }
 $script:OrigComputerName = $env:COMPUTERNAME
 $env:COMPUTERNAME = 'DESK-PC'   # Kin shows the PC's name on the phone; a neutral one for the run
 $ErrorActionPreference = 'Continue'
@@ -76,6 +90,7 @@ function Shot([string]$Name) {
     Invoke-EmuScript 'screenshot.ps1' @('-Out', ('"{0}"' -f (Join-Path $ScreenshotDir "$Name.png"))) 60 | Out-Null
 }
 function Phone-Notifs { A shell dumpsys notification --noredact | Out-String }
+function New-RandomFile([string]$Path, [int]$Size, [int]$Seed) { $b = New-Object byte[] $Size; (New-Object Random $Seed).NextBytes($b); [IO.File]::WriteAllBytes($Path, $b) }
 function Sha-Pc([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLower() }
 
 if (-not (Test-Path (Join-Path $Repo 'desktop\clipboard-backup.ps1'))) { throw 'desktop\clipboard-backup.ps1 is missing' }
@@ -85,12 +100,19 @@ $started = @{ Emulator = $false; Kin = $false }
 $clip = $null
 $KinCopy = $null
 try {
+    if ($buildSmoke) {
+        Say 'building the smoke APK (release build type + x86_64)'
+        $gOut = & (Join-Path $PSScriptRoot '..\gradlew.bat') -p (Join-Path $PSScriptRoot '..') assembleSmoke -PkinSmokeAbis=x86_64 --console=plain 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) { throw "assembleSmoke failed: $($gOut.Substring([Math]::Max(0, $gOut.Length - 1500)))" }
+        if ($gOut -match 'built UNSIGNED') { throw 'no signing setup: the smoke APK is unsigned and cannot be installed (README, "Release build")' }
+    }
     $Apk = (Resolve-Path $Apk -ErrorAction Stop).Path
     & $Adb start-server 2>&1 | Out-Null
     if (@(& $Adb devices | Select-String '^emulator-\d+\s').Count -gt 0) { throw 'An emulator is already running (somebody else may be using it). Not touching it.' }
     New-Item -ItemType Directory -Force $Work | Out-Null
     $KinCopy = Join-Path $Work 'Kin.exe'
     Copy-Item (Resolve-Path $Kin -ErrorAction Stop).Path $KinCopy
+    Set-KinDev -Exe $KinCopy -DataDir $Data
 
     Say "starting $Avd"
     $started.Emulator = $true
@@ -105,9 +127,9 @@ try {
     A uninstall $Pkg 2>&1 | Out-Null
     A shell rm -rf /sdcard/Download/Kin | Out-Null
     $out = (& $Adb -s $Serial install -r $Apk 2>&1 | Out-String)
-    Check 'install the release APK' ($out -match 'Success') ($out.Trim())
+    Check 'install the release-build APK' ($out -match 'Success') ($out.Trim())
     $pkgDump = A shell dumpsys package $Pkg | Out-String
-    Check 'the app is not debuggable' ($pkgDump -notmatch 'DEBUGGABLE' -and $pkgDump -match 'versionName=0\.1\.0' -and $pkgDump -match 'versionCode=1 ') ("versionName=" + ([regex]::Match($pkgDump, 'versionName=\S+').Value))
+    Check 'the app is not debuggable' ($pkgDump -notmatch 'DEBUGGABLE' -and $pkgDump -match 'versionName=0\.1\.1' -and $pkgDump -match 'versionCode=2 ') ("versionName=" + ([regex]::Match($pkgDump, 'versionName=\S+').Value))
     Check 'no CAMERA permission granted before "Scan code"' ($pkgDump -notmatch 'android.permission.CAMERA: granted=true')
     A logcat -c | Out-Null
 
@@ -143,14 +165,15 @@ try {
     New-Item -ItemType Directory $Data | Out-Null
     $clip = Save-Clipboard | Select-Object -Last 1
     $KinArgs = @('--data-dir', ('"{0}"' -f $Data), '--dev-bind', '127.0.0.1', '--dev-qr-address', '10.0.2.2', '--dev-received-dir', ('"{0}"' -f (Join-Path $Data 'received')), '--dev-print-pair-url', '--dev-no-windows')
-    # A Kin that somebody else started in the meantime would hold the single-instance slot: wait for it to go, never kill it.
-    if (-not (Wait-Until { -not (Get-Process Kin -ErrorAction SilentlyContinue) } 300)) { throw 'Another Kin.exe is running (not ours); gave up waiting for it.' }
+    # Only a Kin on THIS run's data directory would be in the way; the user's installed Kin (its own data directory, lock, port and toast identity) is not.
+    Assert-NoDevKinOnDataDir
     $started.Kin = $true
-    Start-Process $KinCopy -ArgumentList $KinArgs | Out-Null
+    # The process of the Kin we start is remembered: the teardown stops that one, never another Kin.exe (the user's installed one, say).
+    $script:KinProc = Start-DevKin $KinArgs
     Check 'desktop started' (Wait-Until { (Get-Status).state -eq 'not_paired' } 30)
     $pc = Get-Status
     Check 'desktop listens on loopback only' ($pc.bind -eq '127.0.0.1') "port $($pc.port)"
-    & $KinCopy --dev-start-pairing
+    Invoke-Kin --dev-start-pairing
     $urlFile = Join-Path $Data 'pair-url.txt'
     Wait-Until { Test-Path $urlFile } 10 | Out-Null
     $url = (Get-Content $urlFile -Raw).Trim()
@@ -174,7 +197,7 @@ try {
 
     # ---- ping PC -> phone
     $before = if ($pc.lastPing) { $pc.lastPing.at } else { 0 }
-    & $KinCopy --ping
+    Invoke-Kin --ping
     Check 'ping PC -> phone' (Wait-Until { $lp = (Get-Status).lastPing; $lp -and $lp.at -gt $before -and $null -ne $lp.rttMs } 15) ("{0} ms" -f (Get-Status).lastPing.rttMs)
 
     # ---- text phone -> PC (the share intent) and PC -> phone (--send-clipboard)
@@ -185,10 +208,10 @@ try {
     Check 'the PC clipboard holds that text' (Wait-Until { (Get-Clipboard -Raw) -ceq $t1 } 5) ''
     A shell input keyevent KEYCODE_HOME | Out-Null
     $t2 = "release smoke reply $Run"
-    Set-Clipboard -Value $t2
+    Set-QuietClipboardText $t2
     Start-Sleep -Milliseconds 800
     $beforeSent = (Get-Status).lastSent.text.id
-    & $KinCopy --send-clipboard
+    Invoke-Kin --send-clipboard
     Check 'text PC -> phone acked' (Wait-Until { $s = (Get-Status).lastSent.text; $s -and $s.id -ne $beforeSent -and $s.result } 10) "$((Get-Status).lastSent.text.result)"
     Check 'the phone shows a notification for it' (Wait-Until { (Phone-Notifs) -match 'Text from DESK-PC' } 10)
 
@@ -196,7 +219,7 @@ try {
     $f1 = Join-Path $Work "kin-smoke-down-$Run.bin"
     $bytes = New-Object byte[] 700000; (New-Object Random 42).NextBytes($bytes); [IO.File]::WriteAllBytes($f1, $bytes)
     $h1 = Sha-Pc $f1
-    & $KinCopy --send $f1
+    Invoke-Kin --send $f1
     $name1 = Split-Path $f1 -Leaf
     $got = Wait-Until { ((A shell "ls /sdcard/Download/Kin/ 2>/dev/null" | Out-String) -match [regex]::Escape($name1)) } 40
     Check 'file PC -> phone: it is in Download/Kin' $got
@@ -227,6 +250,38 @@ try {
         Check 'file phone -> PC: the SHA-256 matches' ((Test-Path -LiteralPath $recv) -and (Sha-Pc $recv) -eq $h2)
     }
 
+    # ---- a small batch both ways (3 files of different sizes: the parallel-files path of v0.1.1)
+    $batch = 1..3 | ForEach-Object { Join-Path $Work ("kin-smoke-batch-$Run-$_.bin") }
+    for ($i = 0; $i -lt 3; $i++) { New-RandomFile $batch[$i] (30000 + 170000 * $i) (100 + $i) }
+    $bh = @{}; foreach ($f in $batch) { $bh[(Split-Path $f -Leaf)] = Sha-Pc $f }
+    Invoke-Kin --send @batch
+    $dlOk = Wait-Until { $ls = A shell "ls /sdcard/Download/Kin/ 2>/dev/null" | Out-String; -not ($bh.Keys | Where-Object { $ls -notmatch [regex]::Escape($_) }) } 40
+    Check 'batch PC -> phone: 3 files are in Download/Kin' $dlOk
+    $dlSame = $dlOk -and -not ($bh.Keys | Where-Object { ((( A shell "sha256sum /sdcard/Download/Kin/$_" | Out-String) -split '\s+')[0]) -ne $bh[$_] })
+    Check 'batch PC -> phone: every SHA-256 matches' $dlSame
+    # phone -> PC: the throwaway share-source app (android\share-source) shares 3 files the way a gallery does (SEND_MULTIPLE, a grant on the URIs,
+    # a provider that is not exported); adb can't build such an intent. Debug build of that app, never part of Kin.
+    $shareApk = Join-Path $PSScriptRoot '..\share-source\build\outputs\apk\debug\share-source-debug.apk'
+    if (-not (Test-Path $shareApk)) {
+        Say 'building share-source (the test app that shares files)'
+        & (Join-Path $PSScriptRoot '..\gradlew.bat') -p (Join-Path $PSScriptRoot '..\share-source') assembleDebug --console=plain 2>&1 | Out-Null
+    }
+    $srcInstall = (& $Adb -s $Serial install -r $shareApk 2>&1 | Out-String)
+    Check 'install share-source (test app)' ($srcInstall -match 'Success') ($srcInstall.Trim())
+    if ($srcInstall -match 'Success') {
+        $before = @(@((Get-Status).transfers.active) + @((Get-Status).transfers.recent) | Where-Object { $_ } | ForEach-Object { $_.id })
+        A shell am start -n app.kinrelay.sharesource/.ShareActivity --ei n 3 --ei size 200000 | Out-Null
+        $done = Wait-Until { $x = @(@((Get-Status).transfers.active) + @((Get-Status).transfers.recent)) | Where-Object { $_ -and $_.direction -eq 'in' -and $before -notcontains $_.id } | Select-Object -First 1; [bool]($x -and $x.status -eq 'done') } 60
+        Check 'batch phone -> PC: the PC finished the 3-file transfer' $done
+        $same = $true
+        foreach ($n in 1..3) {
+            $want = ((A shell "run-as app.kinrelay.sharesource sha256sum files/shared/shared-$n.bin" | Out-String) -split '\s+')[0]
+            $f = Join-Path (Join-Path $Data 'received') "shared-$n.bin"
+            if (-not ((Test-Path -LiteralPath $f) -and $want -and (Sha-Pc $f) -eq $want)) { $same = $false }
+        }
+        Check 'batch phone -> PC: every SHA-256 matches' $same
+    }
+
     # ---- the app did not crash (R8 problems show up as a FATAL EXCEPTION, ClassNotFound, NoSuchMethod, ...)
     $log = A logcat -d | Out-String
     $mine = ($log -split "`n") | Where-Object { $_ -match 'FATAL EXCEPTION|AndroidRuntime' -and $_ -match $Pkg }
@@ -245,9 +300,10 @@ finally {
     }
     if (-not $KeepRunning) {
         Say 'tearing down'
-        if ($started.Kin) {
-            if ($KinCopy) { & $KinCopy --quit 2>$null }
-            if (-not (Wait-Until { -not (Get-Process Kin -ErrorAction SilentlyContinue) } 10)) { Stop-Process -Name Kin -Force -ErrorAction SilentlyContinue }
+        if ($started.Kin -and $script:KinProc) {
+            # Only the Kin.exe this script started: `--quit` carries our --data-dir (so it can only reach our instance), and a hung process is stopped by
+            # its ID, found by program file AND data directory, never by name.
+            Stop-DevKin 10
         }
         if ($started.Emulator) { Invoke-EmuScript 'stop.ps1' @('-All') 120 | Out-Null }
         & $Adb kill-server 2>$null | Out-Null

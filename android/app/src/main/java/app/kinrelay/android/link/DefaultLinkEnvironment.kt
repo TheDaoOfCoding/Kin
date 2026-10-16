@@ -38,5 +38,8 @@ class DefaultLinkEnvironment(
         discovery(shortId, timeoutMillis)
 
     override fun openSession(address: PairingAddress, listener: SessionListener): LinkConnection =
-        LinkSession(client, address, local, dedup, scope, clock, log, listener, peerDeviceId, helloTimeoutMillis)
+        LinkSession(
+            client, address, local, dedup, scope, clock, log, listener, peerDeviceId, helloTimeoutMillis,
+            reachable = { target, timeoutMillis -> racer.race(listOf(target), timeoutMillis) is RaceResult.Winner },
+        )
 }

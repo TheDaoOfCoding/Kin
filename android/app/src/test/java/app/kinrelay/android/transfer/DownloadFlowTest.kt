@@ -194,8 +194,11 @@ class DownloadFlowTest {
         val r = rig()
         val a = file("f1", "a.bin", 20_000)
         val b = file("f2", "b.bin", 20_000)
-        r.pc.sendOffer("changed", a, b)
-        r.pc.files.offers.getValue("changed").files.getValue("f2").changed = true
+        val offered = r.pc.files.offered("changed", a, b)
+        offered.files.getValue("f2").changed = true
+        // The files go side by side: the changed one answers late, so `a` is saved completely before the offer fails.
+        offered.files.getValue("f2").delayMillis = 400
+        r.pc.send(r.pc.files.offerFrame(offered))
         val t = r.awaitStatus("changed", TransferStatus.FAILED)
         r.await("the cancel") { r.pc.files.messages.isNotEmpty() }
         assertEquals("cancel:changed:error", r.pc.files.messages.single())

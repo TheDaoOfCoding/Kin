@@ -8,13 +8,17 @@ import app.kinrelay.android.link.LinkConnection
 import app.kinrelay.android.protocol.FileNames
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /** Writing the received bytes failed (no space, the entry can't be written). It isn't the network's fault, so it isn't retried. */
@@ -24,7 +28,8 @@ class SinkException(message: String, cause: Throwable? = null) : IOException(mes
 class SizeMismatchException(message: String) : IOException(message)
 
 /**
- * Receives one PC → phone transfer (protocol.md, "Files: PC → phone"). The `offer` has been acked already. For each file, in order:
+ * Receives one PC → phone transfer (protocol.md, "Files: PC → phone"). The `offer` has been acked already. For each file, started in the
+ * order of the offer and up to [TransferTimings.maxParallelFiles] at a time ([downloadAll]):
  * create a pending entry (photos to `Pictures/Kin`, videos to `Movies/Kin`, the rest to `Download/Kin`, through [SaveSink]), `GET` it
  * (with `Range: bytes=N-` when resuming, never for a 0-byte file), append to the entry, and when it is complete clear the pending flag.
  * After the last file it sends `complete`: the message is written down with the status ([OwedMessages]) and sent once; if the PC doesn't
@@ -42,6 +47,9 @@ class DownloadRunner(
     private val mimeForExtension: (String) -> String? = { null },
 ) {
     private class ConnectionLost : Exception("the connection to the PC ended")
+
+    /** One file ended the attempt for good (or as a retry); it unwinds the other files that are in flight. Never leaves the runner. */
+    private class StopAttempt(val attempt: Attempt) : RuntimeException(null, null, false, false)
 
     private sealed interface Attempt {
         data object Done : Attempt
@@ -67,9 +75,21 @@ class DownloadRunner(
         return Run(transfer, d.store.files(transferId)).execute()
     }
 
-    private inner class Run(var transfer: TransferEntity, var files: List<TransferFileEntity>) {
+    private inner class Run(var transfer: TransferEntity, initialFiles: List<TransferFileEntity>) {
+        /** Replaced as a whole (never changed in place); several files change at once, so every change goes through [replaceFile]. */
+        @Volatile var files: List<TransferFileEntity> = initialFiles
+        private val filesLock = Any()
+
+        /** One entry is made at a time: two files of one offer may have the same name, and each must see the name the other just took. */
+        private val entryLock = Mutex()
+
+        /** The names in each gallery folder, read once per attempt (not once per file): what the app has plus what this attempt creates. */
+        private var namesInFolder = HashMap<SaveFolder, MutableSet<String>>()
+        private var claimedByOthers: Set<String>? = null
+
         val done = AtomicLong(0)
         val movedThisAttempt = AtomicLong(0)
+
         val throttle = ProgressThrottle()
 
         suspend fun execute(): RunResult = try {
@@ -85,11 +105,14 @@ class DownloadRunner(
         private suspend fun run(): RunResult {
             if (!setStatus(TransferStatus.ACTIVE)) return RunResult.Canceled
             var stalled = 0
+            // The link was found dead (a silent network drop): the next wait for a connection asks the loop to try at once.
+            var kickNext = false
             while (true) {
                 currentCoroutineContext().ensureActive()
                 // Before every attempt: this transfer belongs to one PC, and only that PC is ever asked for it.
                 if (!d.isPairedWith(transfer)) return peerChanged()
-                val connection = d.connectionFor(transfer, timings.reconnectWaitMillis, kick = false) ?: return park()
+                val connection = d.connectionFor(transfer, timings.reconnectWaitMillis, kick = kickNext) ?: return park()
+                kickNext = false
                 if (!d.isPairedWith(transfer)) return peerChanged()
                 val endpoint = connection.httpEndpoint ?: return failAndCancel(connection, "internal", "The connection has no file channel.")
                 movedThisAttempt.set(0)
@@ -104,7 +127,16 @@ class DownloadRunner(
                     is Attempt.Fatal -> return failAndCancel(connection, attempt.code, attempt.message)
                     is Attempt.Retry -> {
                         persistProgress()
-                        stalled = if (attempt.moved) 0 else stalled + 1
+                        // See UploadRunner: a broken attempt on a link that still says "ready" is checked before it counts against the
+                        // transfer, and a network that went silent is waited out instead of failing the transfer.
+                        if (!connection.foundDead && connection.isReady) connection.checkAlive(timings.probeTimeoutMillis)
+                        if (connection.foundDead) {
+                            d.log.w("transfer", "download ${transfer.id}: the PC doesn't answer; waiting for a new connection")
+                            stalled = 0
+                            kickNext = true
+                        } else {
+                            stalled = if (attempt.moved) 0 else stalled + 1
+                        }
                         if (stalled >= timings.maxStalledAttempts) {
                             return failAndCancel(connection, "connection_lost", "The connection to ${transfer.peerName} keeps dropping.")
                         }
@@ -120,21 +152,23 @@ class DownloadRunner(
                 connection.awaitEnd()
                 throw ConnectionLost()
             }
+            val guard = launch {
+                watchForStall(connection, timings, d.log, "download ${transfer.id}", movedThisAttempt::get)
+            }
             try {
                 block()
             } finally {
                 watcher.cancel()
+                guard.cancel()
             }
         }
 
         private suspend fun attempt(http: TransferHttp): Attempt {
             try {
                 done.set(files.filter { it.finished }.sumOf { it.size })
-                for (file in files) {
-                    if (file.finished) continue
-                    receive(http, file)?.let { return it }
-                }
-                return Attempt.Done
+                namesInFolder = HashMap()
+                claimedByOthers = null
+                return downloadAll(http)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: SinkException) {
@@ -151,11 +185,71 @@ class DownloadRunner(
             }
         }
 
-        /** One file. Null when it is saved completely. */
+        /**
+         * Fetches the unfinished files with up to [TransferTimings.maxParallelFiles] `GET`s at a time, one request per file (a file is never
+         * split), in the order of the offer: a new file starts the moment a slot frees. One producer makes the entries (gallery rows) of the
+         * next files ahead of time, so the requests don't wait for MediaStore between two files, and, being one, it also hands out names
+         * one at a time.
+         *
+         * - A file that fails for good (`Fatal`) stops the files that are in flight and ends the attempt.
+         * - A file whose connection broke, or that the PC answered oddly, only fails *that* file for this attempt (`Retry`): the others go on
+         *   and finish, and the next attempt resumes what is missing with `Range`.
+         */
+        private suspend fun downloadAll(http: TransferHttp): Attempt {
+            val todo = files.filter { !it.finished }
+            if (todo.isEmpty()) return Attempt.Done
+            val parallel = timings.maxParallelFiles.coerceIn(1, todo.size)
+            val retry = AtomicBoolean(false)
+            val ready = Channel<TransferFileEntity>(capacity = parallel)
+            try {
+                coroutineScope {
+                    launch {
+                        try {
+                            for (file in todo) ready.send(ensureEntry(file))
+                        } finally {
+                            ready.close()
+                        }
+                    }
+                    repeat(parallel) {
+                        launch {
+                            for (entry in ready) {
+                                when (val outcome = receiveGuarded(http, entry)) {
+                                    null -> Unit
+                                    is Attempt.Retry -> retry.set(true)
+                                    else -> throw StopAttempt(outcome)
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e: StopAttempt) {
+                return e.attempt
+            }
+            return if (retry.get()) Attempt.Retry(movedThisAttempt.get() > 0) else Attempt.Done
+        }
+
+        /** [receive] for one of several files: a broken connection fails only this file; a file that can't be written ends the attempt. */
+        private suspend fun receiveGuarded(http: TransferHttp, entry: TransferFileEntity): Attempt? = try {
+            receive(http, entry)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: SinkException) {
+            throw e
+        } catch (e: SizeMismatchException) {
+            throw e
+        } catch (e: IOException) {
+            currentCoroutineContext().ensureActive()
+            d.log.w("transfer", "download ${transfer.id}: ${e.javaClass.simpleName}: ${e.message}")
+            Attempt.Retry(movedThisAttempt.get() > 0)
+        }
+
+        /** One file, whose entry exists. Null when it is saved completely. */
         private suspend fun receive(http: TransferHttp, start: TransferFileEntity): Attempt? {
-            var file = ensureEntry(start)
+            var file = start
             var restarted = false
             var recreated = 0
+            // How many bytes of this file are counted in `done` now (files run side by side, so `done` is only ever added to).
+            var credited = 0L
             while (true) {
                 val uri = file.localUri!!
                 val length = d.sink.length(uri)
@@ -170,10 +264,11 @@ class DownloadRunner(
                 }
                 val have = if (length > file.size) 0L else length
                 d.progress.set(transfer.id, file.fileId, have)
+                done.addAndGet(have - credited)
+                credited = have
                 if (have == file.size && file.size > 0) return finishFile(file)
                 // No Range for a 0-byte file (any Range on it is unsatisfiable), none when starting from 0.
                 val from = if (file.size > 0 && have > 0) have else null
-                done.set(files.filter { it.finished }.sumOf { it.size } + have)
 
                 d.wake.acquire()
                 val got = try {
@@ -238,6 +333,12 @@ class DownloadRunner(
                     from
                 }
             }
+            // A `200` to a Range request starts the file over: what was counted for it so far is not part of the progress any more.
+            val counted = from ?: 0L
+            if (writeFrom < counted) {
+                done.addAndGet(writeFrom - counted)
+                d.progress.set(transfer.id, file.fileId, writeFrom)
+            }
             val expected = file.size - writeFrom
             val declared = body.contentLength()
             if (declared >= 0 && declared != expected) throw SizeMismatchException("expected $expected bytes, the PC announced $declared")
@@ -270,15 +371,18 @@ class DownloadRunner(
         }
 
         /** The pending entry for [file]: the one it has, or a new one named per protocol.md, "File names". */
-        private suspend fun ensureEntry(file: TransferFileEntity): TransferFileEntity {
+        private suspend fun ensureEntry(file: TransferFileEntity): TransferFileEntity = entryLock.withLock {
             val uri = file.localUri
-            if (uri != null && d.sink.length(uri) != null) return file
+            if (uri != null && d.sink.length(uri) != null) return@withLock file
             val cleaned = FileNames.clean(file.name, emptyList())
             val classified = MediaKinds.classify(cleaned, file.mime, mimeForExtension)
-            // `existing`: what this app already has in the folder, what unfinished transfers claimed, what this transfer saved.
+            // `existing`: what this app already has in the folder, what unfinished transfers claimed, what this transfer saved. The first two are
+            // read once per attempt (a gallery query per file adds up over hundreds of files); the names this attempt creates are added as it goes.
+            val inFolder = namesInFolder.getOrPut(classified.folder) { HashSet(d.sink.existingNames(classified.folder)) }
+            val claimed = claimedByOthers ?: d.store.claimedNames().also { claimedByOthers = it }
             val existing = HashSet<String>().apply {
-                addAll(d.sink.existingNames(classified.folder))
-                addAll(d.store.claimedNames())
+                addAll(inFolder)
+                addAll(claimed)
                 files.forEach { f -> if (f.fileId != file.fileId) f.finalName?.let(::add) }
             }
             var created: SavedEntry? = null
@@ -309,8 +413,14 @@ class DownloadRunner(
                 runCatching { d.sink.delete(entry.uri) }
                 throw e
             }
-            files = files.map { if (it.fileId == file.fileId) updated else it }
-            return updated
+            inFolder += entry.finalName
+            replaceFile(updated)
+            updated
+        }
+
+        /** Several files change at once: the list is replaced under a lock, so no update is lost. */
+        private fun replaceFile(updated: TransferFileEntity) {
+            synchronized(filesLock) { files = files.map { if (it.fileId == updated.fileId) updated else it } }
         }
 
         private suspend fun finishFile(file: TransferFileEntity): Attempt? {
@@ -319,7 +429,7 @@ class DownloadRunner(
             d.sink.finish(uri)
             val finished = file.copy(bytesDone = file.size, finished = true)
             d.store.updateFile(finished)
-            files = files.map { if (it.fileId == file.fileId) finished else it }
+            replaceFile(finished)
             return null
         }
 

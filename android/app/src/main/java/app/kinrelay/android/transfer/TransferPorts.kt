@@ -155,14 +155,34 @@ data class TransferTimings(
     val reconnectWaitMillis: Long = 15 * 60_000L,
     /** The PC answers an ack within 5 s (protocol.md). */
     val ackTimeoutMillis: Long = 5_000,
-    /** Attempts in a row that moved no bytes before a transfer is failed. */
+    /** Attempts in a row that moved no bytes (on a connection that answers) before a transfer is failed. */
     val maxStalledAttempts: Int = 5,
+    /**
+     * No byte moved for this long: the PC is asked whether it still answers (StallGuard.kt). A transfer that moves bytes never asks, and
+     * an attempt that failed is checked at once ([probeTimeoutMillis]).
+     */
+    val stallProbeAfterMillis: Long = 15_000,
+    /** How long the PC has to answer that check (a new TLS connection) before the connection is treated as dead and replaced. */
+    val probeTimeoutMillis: Long = 10_000,
     val maxOffsetMismatches: Int = 5,
     /** Pause before a retry that isn't waiting for a connection. */
     val retryDelayMillis: Long = 500,
     /** Files under this size are copied into the cache when a share can't be sent right away (android.md). */
     val cacheCopyLimitBytes: Long = 50L * 1024 * 1024,
-)
+    /**
+     * Files of one transfer that are on the wire at the same time, in either direction (protocol.md: a client MAY run up to 4 file requests
+     * of a transfer at once). One request per file, a file is never split, so a single big file is not slower. 1 gives the old one-by-one order.
+     */
+    val maxParallelFiles: Int = MAX_PARALLEL_FILES,
+    /** Shared files looked at (`stat`) at the same time when a share is turned into a transfer. */
+    val statParallelism: Int = STAT_PARALLELISM,
+) {
+    companion object {
+        /** The most file requests of one transfer that protocol.md allows a client to run at once. */
+        const val MAX_PARALLEL_FILES = 4
+        const val STAT_PARALLELISM = 8
+    }
+}
 
 /** What a runner ended with. */
 sealed interface RunResult {

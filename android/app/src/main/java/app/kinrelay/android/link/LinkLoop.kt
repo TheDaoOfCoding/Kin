@@ -62,6 +62,11 @@ interface LinkHost {
  * architecture.md, "Finding each other": the last working addresses (1.5 s), then mDNS (5 s),
  * then backoff. The backoff resets only on a user action or after a connection that kept an
  * accepted `hello` for 60 s ([CloseRules.resetsBackoff]); a network change creates a new loop.
+ *
+ * One exception, for the sake of a transfer that is in the middle of its files: while [workWaiting] says something waits for the link
+ * (a transfer that was moving and now waits for the PC to come back), a step of the backoff is at most [WAITING_RETRY_MILLIS]. The steps
+ * are what keeps a PC that is off from costing the phone's battery, but 2 or 10 minutes of sleep for a PC that is back after a short hole
+ * would leave the user's files lying there for no reason. Nobody waiting: the steps are exactly the ones above.
  */
 class LinkLoop(
     private val scope: CoroutineScope,
@@ -71,6 +76,7 @@ class LinkLoop(
     private val clock: Clock,
     private val log: KinLog,
     private val backoff: Backoff = Backoff(),
+    private val workWaiting: () -> Boolean = { false },
 ) {
     private val mutableState = MutableStateFlow<LinkState>(LinkState.Connecting())
     val state: StateFlow<LinkState> = mutableState
@@ -105,6 +111,14 @@ class LinkLoop(
         if (mutableState.value !is LinkState.Connecting) return
         backoff.reset()
         wake.trySend(Unit)
+    }
+
+    /**
+     * Something (a transfer) has started waiting for the link: a loop that sleeps a long backoff step tries now instead, and carries on at
+     * the short steps while [workWaiting] holds. Does nothing while connected, and does not wake a loop that stopped on purpose.
+     */
+    fun workIsWaiting() {
+        if (mutableState.value is LinkState.Connecting) wake.trySend(Unit)
     }
 
     /**
@@ -198,15 +212,19 @@ class LinkLoop(
     }
 
     private suspend fun waitBeforeRetry() {
-        val delayMillis = backoff.next()
-        log.i("link", "PC not reachable; next attempt in ${delayMillis / 1000} s")
+        val stepMillis = backoff.next()
+        val delayMillis = if (workWaiting()) minOf(stepMillis, WAITING_RETRY_MILLIS) else stepMillis
+        log.i("link", "PC not reachable; next attempt in ${delayMillis / 1000} s" + if (delayMillis < stepMillis) " (a transfer is waiting)" else "")
         mutableState.value = LinkState.Connecting(retryInMillis = delayMillis)
         wake.tryReceive().getOrNull()?.let { return }
         withTimeoutOrNull(delayMillis) { wake.receive() }
     }
 
-    private companion object {
-        const val RACE_TIMEOUT_MILLIS = 1_500L
-        const val DISCOVERY_TIMEOUT_MILLIS = 5_000L
+    companion object {
+        private const val RACE_TIMEOUT_MILLIS = 1_500L
+        private const val DISCOVERY_TIMEOUT_MILLIS = 5_000L
+
+        /** The longest wait between attempts while a transfer waits for the link. */
+        const val WAITING_RETRY_MILLIS = 10_000L
     }
 }

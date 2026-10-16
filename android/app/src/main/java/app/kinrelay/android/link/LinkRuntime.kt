@@ -128,6 +128,11 @@ class LinkRuntime(
         scope.launch { lock.withLock { network?.let { switchTo(it) } } }
     }
 
+    /** A transfer started waiting for the link: try to connect now, and keep trying at short steps while it waits. */
+    fun workIsWaiting() {
+        loop?.workIsWaiting()
+    }
+
     fun userAction() {
         val running = loop
         if (running != null) {
@@ -163,7 +168,7 @@ class LinkRuntime(
             log = graph.log,
             wsPingIntervalSeconds = graph.settings.pingIntervalSeconds(),
         )
-        val newLoop = LinkLoop(scope, shortId, environment, Host(device), clock, graph.log)
+        val newLoop = LinkLoop(scope, shortId, environment, Host(device), clock, graph.log, workWaiting = { graph.link.transferWaiting })
         loop = newLoop
         stateJob = scope.launch { newLoop.state.collect(::setState) }
         newLoop.start()

@@ -90,7 +90,8 @@ class LinkLoopTest {
             SessionEnd(code, upgrade, "test", helloFor, unpaired)
     }
 
-    private fun TestScope.loop(env: Env, host: Host) = LinkLoop(this, "ABCDEFGH", env, host, { currentTime }, KinLog.None)
+    private fun TestScope.loop(env: Env, host: Host, workWaiting: () -> Boolean = { false }) =
+        LinkLoop(this, "ABCDEFGH", env, host, { currentTime }, KinLog.None, workWaiting = workWaiting)
 
     private fun TestScope.advance(millis: Long) {
         advanceTimeBy(millis)
@@ -104,6 +105,72 @@ class LinkLoopTest {
         loop.start()
         advance(1_355_000 + 1)
         assertEquals(listOf(0L, 5_000, 35_000, 155_000, 755_000, 1_355_000), env.discoverTimes)
+        loop.stop("test")
+    }
+
+    @Test
+    fun whileATransferWaitsEveryBackoffStepIsAtMost10Seconds() = runTest {
+        val env = Env(this)
+        val loop = loop(env, Host(listOf(known)), workWaiting = { true })
+        loop.start()
+        advance(60_001)
+        assertEquals(listOf(0L, 5_000, 15_000, 25_000, 35_000, 45_000, 55_000), env.discoverTimes)
+        loop.stop("test")
+    }
+
+    @Test
+    fun theBackoffIsTheUsualOneAgainAsSoonAsNothingWaits() = runTest {
+        var waiting = true
+        val env = Env(this)
+        val loop = loop(env, Host(listOf(known)), workWaiting = { waiting })
+        loop.start()
+        advance(15_001) // attempts at 0, 5 s and 15 s; the third step (120 s) is capped to 10 s while someone waits
+        assertEquals(listOf(0L, 5_000, 15_000), env.discoverTimes)
+        waiting = false
+        advance(25_000) // 25 s: the step now running was chosen while waiting (10 s); the next ones are the idle steps
+        assertEquals(listOf(0L, 5_000, 15_000, 25_000), env.discoverTimes)
+        advance(600_000)
+        assertEquals("idle again: every 10 min", listOf(0L, 5_000, 15_000, 25_000, 625_000), env.discoverTimes)
+        loop.stop("test")
+    }
+
+    @Test
+    fun aTransferThatStartsWaitingWakesALoopThatSleepsALongStep() = runTest {
+        var waiting = false
+        val env = Env(this)
+        val loop = loop(env, Host(listOf(known)), workWaiting = { waiting })
+        loop.start()
+        advance(40_000) // attempts at 0, 5 s, 35 s; now asleep until 155 s
+        assertEquals(listOf(0L, 5_000, 35_000), env.discoverTimes)
+
+        waiting = true
+        loop.workIsWaiting()
+        runCurrent()
+        assertEquals("tried at once", listOf(0L, 5_000, 35_000, 40_000), env.discoverTimes)
+        advance(10_000)
+        assertEquals("then at the short step", listOf(0L, 5_000, 35_000, 40_000, 50_000), env.discoverTimes)
+        loop.stop("test")
+    }
+
+    @Test
+    fun aTransferWaitingDoesNotWakeALoopThatStoppedOnPurposeOrIsConnected() = runTest {
+        val env = Env(this).apply { winners = setOf(known) }
+        val loop = loop(env, Host(listOf(known)), workWaiting = { true })
+        loop.start()
+        runCurrent()
+        env.sessions.single().listener.onHelloAccepted(peer)
+        runCurrent()
+        loop.workIsWaiting() // connected: nothing to do
+        runCurrent()
+        assertEquals(1, env.sessions.size)
+
+        env.sessions[0].ended.complete(end(4001, helloFor = 1_000))
+        runCurrent()
+        assertEquals(LinkState.Replaced, loop.state.value)
+        loop.workIsWaiting()
+        runCurrent()
+        advance(60_000)
+        assertEquals("replaced: only the user wakes it", 1, env.sessions.size)
         loop.stop("test")
     }
 

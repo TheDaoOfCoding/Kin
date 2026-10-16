@@ -78,7 +78,8 @@ class TransferNotifications(context: Context) : TransferNotifier {
         val text = when {
             waiting -> "Waiting for ${transfer.peerName}…"
             files.size == 1 -> "$percent%"
-            else -> "${minOf(finished + 1, files.size)} of ${files.size} files · $percent%"
+            // Several files are on the wire at once, so "which file is it on" has no answer: it says how many are done.
+            else -> "$finished of ${files.size} files done · $percent%"
         }
         val builder = base(NotificationChannels.TRANSFERS, GROUP_SENDS, title, text)
             .setOngoing(true)

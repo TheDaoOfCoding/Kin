@@ -2,6 +2,7 @@ package app.kinrelay.android.testing
 
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -34,6 +35,9 @@ class FakePcFiles {
     class OfferedFile(val fileId: String, val name: String, val mime: String, val bytes: ByteArray) {
         /** The file changed after the offer: `GET` answers `409 source_changed`. */
         @Volatile var changed = false
+
+        /** `GET` of this file waits this long before it answers (so a test can make one file of a batch the slow one). */
+        @Volatile var delayMillis = 0L
     }
 
     class Offered(val id: String, val files: LinkedHashMap<String, OfferedFile>) {
@@ -75,6 +79,36 @@ class FakePcFiles {
     /** The next `GET` sends only this many bytes of the body (with the full Content-Length) and closes the connection. */
     @Volatile var dropGetAfter: Long? = null
 
+    /** With [dropGetAfter] set: only a `GET` of this file is cut off (the others go through), so a test knows which file of a batch breaks. */
+    @Volatile var dropGetFileId: String? = null
+
+    /** With [dropPutKeeping] set: only a `PUT` of this file is dropped. */
+    @Volatile var dropPutFileId: String? = null
+
+    /**
+     * Files of one transfer on the wire at the same time, as the PC sees them: a `PUT` or `GET` counts from the moment it is dispatched to
+     * the moment its answer is made ([requestDelayMillis] keeps it there long enough for the others to overlap). [maxInFlight] is the
+     * highest count seen.
+     */
+    val inFlight = AtomicInteger()
+    val maxInFlight = AtomicInteger()
+
+    /** Every file request waits this long before it is answered. */
+    @Volatile var requestDelayMillis = 0L
+
+    /** The first [holdFirstRequests] file requests wait (up to 3 s) until that many are in flight together: it proves the phone runs them at once. */
+    @Volatile var holdFirstRequests = 0
+    private val fileRequestsSeen = AtomicInteger()
+
+    /**
+     * A silent network: every file request is held without an answer (nothing is stored, nothing is sent back) until this is cleared, then
+     * it ends with a closed socket. The WebSocket stays open, as it does when packets just stop (v0.1.1 silent-drop fix).
+     */
+    @Volatile var silent = false
+
+    /** Every file request ends at once with a closed socket and nothing is stored (a network that resets everything). */
+    @Volatile var failFast = false
+
     /** Answer a `GET` that has a `Range` with `200` and the whole file (the PC ignores the range). */
     @Volatile var ignoreRange = false
 
@@ -112,6 +146,31 @@ class FakePcFiles {
     }
 
     fun handle(request: RecordedRequest): MockResponse {
+        val isFileRequest = request.url.encodedPath.trim('/').split('/').let { it.size == 5 && it[3] == "files" }
+        if (!isFileRequest) return handleUntracked(request)
+        val seen = fileRequestsSeen.incrementAndGet()
+        val now = inFlight.incrementAndGet()
+        maxInFlight.accumulateAndGet(now) { a, b -> maxOf(a, b) }
+        try {
+            val hold = holdFirstRequests
+            if (seen <= hold) {
+                val deadline = System.currentTimeMillis() + 3_000
+                while (inFlight.get() < hold && System.currentTimeMillis() < deadline) Thread.sleep(2)
+            }
+            if (requestDelayMillis > 0) Thread.sleep(requestDelayMillis)
+            if (failFast) return MockResponse.Builder().onResponseStart(SocketEffect.CloseSocket()).build()
+            if (silent) {
+                val deadline = System.currentTimeMillis() + 30_000
+                while (silent && System.currentTimeMillis() < deadline) Thread.sleep(5)
+                return MockResponse.Builder().onResponseStart(SocketEffect.CloseSocket()).build()
+            }
+            return handleUntracked(request)
+        } finally {
+            inFlight.decrementAndGet()
+        }
+    }
+
+    private fun handleUntracked(request: RecordedRequest): MockResponse {
         val segments = request.url.encodedPath.trim('/').split('/')
         val bodyBytes = request.body?.toByteArray() ?: ByteArray(0)
         val query = request.url.queryParameter("offset")?.toLongOrNull()
@@ -162,7 +221,7 @@ class FakePcFiles {
         val stored = file.data.size.toLong()
         if (offset != stored) return json(409, """{"error":"offset_mismatch","message":"The PC has $stored bytes.","offset":$stored}""")
         if (offset + body.size != file.size) return error(400, "bad_request", "Content-Length is not size - offset")
-        dropPutKeeping?.let { keep ->
+        dropPutKeeping?.takeIf { dropPutFileId == null || dropPutFileId == fileId }?.let { keep ->
             dropPutKeeping = null
             file.data += body.copyOfRange(0, keep.toInt().coerceAtMost(body.size))
             afterDrop?.invoke()
@@ -186,6 +245,7 @@ class FakePcFiles {
         val offered = offers[id]
         if (offered == null || offered.gone) return error(404, "not_found", "The offer is gone.")
         val file = offered.files[fileId] ?: return error(404, "not_found", "Unknown file.")
+        if (file.delayMillis > 0) Thread.sleep(file.delayMillis)
         if (file.changed) return error(409, "source_changed", "The file changed after it was offered.")
         val size = file.bytes.size
         var from = 0
@@ -197,7 +257,7 @@ class FakePcFiles {
             partial = true
         }
         val body = file.bytes.copyOfRange(from, size)
-        val dropAfter = dropGetAfter
+        val dropAfter = dropGetAfter?.takeIf { dropGetFileId == null || dropGetFileId == fileId }
         val sent = if (dropAfter != null) body.copyOfRange(0, dropAfter.toInt().coerceAtMost(body.size)) else body
         val builder = MockResponse.Builder()
             .code(if (partial) 206 else 200)

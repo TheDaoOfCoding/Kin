@@ -10,12 +10,18 @@ import app.kinrelay.android.ui.UiText
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import java.util.concurrent.atomic.AtomicInteger
 
 /** How the UI and the debug hooks talk to the running service, which may or may not exist. */
 class LinkController(private val graph: AppGraph) : OutgoingLink, TransferLink {
     @Volatile var runtime: LinkRuntime? = null
 
     val state = MutableStateFlow<LinkState>(LinkState.Stopped)
+
+    private val waiting = AtomicInteger()
+
+    /** Something (a transfer, a send) is waiting for a connection right now: the reconnect loop keeps its steps short ([LinkLoop]). */
+    val transferWaiting: Boolean get() = waiting.get() > 0
 
     private val mutableLastPing = MutableStateFlow<PingResult?>(null)
     val lastPing: StateFlow<PingResult?> = mutableLastPing
@@ -64,12 +70,19 @@ class LinkController(private val graph: AppGraph) : OutgoingLink, TransferLink {
             userAction()
         }
         val deadline = SystemClock.elapsedRealtime() + waitMillis
-        while (true) {
-            readySession(peerDeviceId)?.let { return it }
-            val state = state.value
-            val hopeless = state == LinkState.PermissionNeeded || state == LinkState.PairAgain || state == LinkState.UpdateApp
-            if (hopeless || SystemClock.elapsedRealtime() >= deadline) return null
-            delay(POLL_MILLIS)
+        waiting.incrementAndGet()
+        try {
+            // A loop that sleeps a long backoff step (earned while nothing waited) tries now; it then retries every few seconds, not minutes.
+            runtime?.workIsWaiting()
+            while (true) {
+                readySession(peerDeviceId)?.let { return it }
+                val state = state.value
+                val hopeless = state == LinkState.PermissionNeeded || state == LinkState.PairAgain || state == LinkState.UpdateApp
+                if (hopeless || SystemClock.elapsedRealtime() >= deadline) return null
+                delay(POLL_MILLIS)
+            }
+        } finally {
+            waiting.decrementAndGet()
         }
     }
 

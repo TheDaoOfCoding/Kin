@@ -74,10 +74,13 @@ class TransferEngine(
         }
         val id = d.newId()
         val files = ArrayList<TransferFileEntity>()
-        for (source in sources) {
+        // Each look-up is a round trip to the app that owns the file (a gallery): 50 photos one after the other took seconds, so they are
+        // looked at several at a time. Only the cheap, read-only `stat` runs in parallel; what follows (a cache copy, the file IDs) is in order.
+        val looked = sources.mapParallel(timings.statParallelism) { d.sources.stat(it.uri) }
+        for ((index, source) in sources.withIndex()) {
             val fileId = "f${files.size + 1}"
             var uri = source.uri
-            var info = d.sources.stat(uri)
+            var info = looked[index]
             if (info == null) {
                 // No size to report (a stream, or a provider that doesn't say): a copy in the cache has one.
                 val cached = runCatching { d.sources.cacheCopy(uri, id, fileId) }.getOrNull()
@@ -122,13 +125,14 @@ class TransferEngine(
         )
         d.store.create(transfer, files)
         d.log.i("transfer", "upload $id created: ${files.size} files, ${transfer.totalBytes} bytes")
-        launchUpload(id)
+        // The files were looked at a moment ago (that is how the transfer was made): the first attempt doesn't look at all of them again.
+        launchUpload(id, sourcesJustChecked = true)
     }
 
     private fun fallbackName(uri: String): String = uri.substringBefore('?').substringAfterLast('/').ifBlank { "file" }
 
-    private fun launchUpload(id: String, userRetry: Boolean = false) = launch(id, uploadLock) {
-        UploadRunner(d, timings, httpFor, onRenamed = { old, new -> rename(old, new) }, userRetry = userRetry).run(id)
+    private fun launchUpload(id: String, userRetry: Boolean = false, sourcesJustChecked: Boolean = false) = launch(id, uploadLock) {
+        UploadRunner(d, timings, httpFor, onRenamed = { old, new -> rename(old, new) }, userRetry = userRetry, sourcesJustChecked = sourcesJustChecked).run(id)
     }
 
     private fun rename(old: String, new: String) {

@@ -18,6 +18,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.ConnectionPool
+import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -75,6 +77,18 @@ interface LinkConnection {
      */
     suspend fun sendAcked(id: String, frame: String, timeoutMillis: Long = 5_000L): AckResult
     suspend fun sendUnpairAndClose()
+
+    /**
+     * Whether the PC still answers, for a transfer that has stopped moving. The WebSocket's own ping is far too slow for that (240 s, and
+     * 240 s more for the pong), and a JSON `ping` would pop up "Ping from <phone>" on the PC every time, so this asks the network: a new
+     * TLS connection to the PC, which a silent drop (packets vanish, no reset) can't complete. If it doesn't answer in [timeoutMillis] the
+     * connection is abandoned (it ends, so the loop reconnects and the transfers wait for the new one) and the answer is false.
+     * True also when the connection can't tell (tests).
+     */
+    suspend fun checkAlive(timeoutMillis: Long = 10_000L): Boolean = true
+
+    /** [checkAlive] found the PC silent and abandoned this connection (so the end of it is the network's doing, not the PC's). */
+    val foundDead: Boolean get() = false
 }
 
 interface SessionListener {
@@ -129,6 +143,8 @@ class LinkSession(
     private val listener: SessionListener,
     override val peerDeviceId: String,
     private val helloTimeoutMillis: Long = CloseRules.HELLO_TIMEOUT_MILLIS,
+    /** Opens (and closes) a new connection to the PC at the address within the time: the probe of [checkAlive]. */
+    private val reachable: suspend (PairingAddress, Long) -> Boolean = { _, _ -> true },
 ) : LinkConnection {
     private val receiver = MessageReceiver(dedup, ReceiverRole.PHONE, listener::acceptOffer, listener::offerHistory)
     private val ended = CompletableDeferred<SessionEnd>()
@@ -139,13 +155,23 @@ class LinkSession(
     @Volatile private var ourCloseCode: Int? = null
     @Volatile private var peerCloseCode: Int? = null
     @Volatile private var peerUnpaired = false
+    @Volatile override var foundDead = false
+        private set
     private var helloTimeout: Job? = null
 
     override val isReady: Boolean get() = helloAcceptedAt != null && !ended.isCompleted
 
     /** File requests wait longer than the connection's own defaults: a response may follow a long upload, and a busy PC may be slow to write. */
     override val httpEndpoint: HttpEndpoint = HttpEndpoint(
-        client.newBuilder().readTimeout(HTTP_READ_TIMEOUT_SECONDS, TimeUnit.SECONDS).writeTimeout(HTTP_WRITE_TIMEOUT_SECONDS, TimeUnit.SECONDS).build(),
+        client.newBuilder()
+            .readTimeout(HTTP_READ_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .writeTimeout(HTTP_WRITE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            // Several files of one transfer are on the wire at once (protocol.md: up to 4), each on its own connection. A pool of its own
+            // that keeps the connections of a batch (a TLS 1.3 handshake with a client certificate per file would be the cost of a small file),
+            // and lets them go after 20 s: the PC closes a connection that moved nothing for 30 s, and a reused one that it closed would fail.
+            .connectionPool(ConnectionPool(HTTP_POOL_IDLE_CONNECTIONS, HTTP_POOL_KEEP_ALIVE_SECONDS, TimeUnit.SECONDS))
+            .dispatcher(Dispatcher().apply { maxRequests = HTTP_POOL_IDLE_CONNECTIONS * 2; maxRequestsPerHost = HTTP_POOL_IDLE_CONNECTIONS * 2 })
+            .build(),
         address,
     )
 
@@ -189,6 +215,18 @@ class LinkSession(
                 AckResult.NoReply
             }
         }
+    }
+
+    override suspend fun checkAlive(timeoutMillis: Long): Boolean {
+        if (!isReady) return false
+        if (reachable(address, timeoutMillis)) return true
+        if (ended.isCompleted) return false
+        foundDead = true
+        log.w("link", "the PC doesn't answer a new connection within $timeoutMillis ms; treating the connection as dead")
+        socket?.cancel()
+        // `cancel` ends the session at once; if it somehow doesn't, end it here so nobody keeps waiting on a dead link.
+        if (withTimeoutOrNull(CLOSE_GRACE_MILLIS) { ended.await() } == null) finish("abandoned: the PC doesn't answer")
+        return false
     }
 
     /** Sends `unpair` (the caller has already removed the PC locally), waits up to 5 s for the ack, then closes. */
@@ -300,5 +338,7 @@ class LinkSession(
         const val CLOSE_GRACE_MILLIS = 5_000L
         const val HTTP_READ_TIMEOUT_SECONDS = 60L
         const val HTTP_WRITE_TIMEOUT_SECONDS = 30L
+        const val HTTP_POOL_IDLE_CONNECTIONS = 8
+        const val HTTP_POOL_KEEP_ALIVE_SECONDS = 20L
     }
 }

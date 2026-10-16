@@ -412,7 +412,8 @@ class HttpVectorsTest {
         val old = "0193a5c2-8000-7a11-8b22-0123456789ab"
         val new = "0193a5c2-8000-7a11-8b22-0123456789ac"
         val ids = LinkedBlockingQueue(listOf(old, new))
-        val rig = TransferRig(newId = { ids.take() }).also { rigs += it; it.connect() }
+        // The vector is a sequence of requests in one order: the files go one at a time here (parallel files have their own tests).
+        val rig = TransferRig(timings = TransferRig.FAST.copy(maxParallelFiles = 1), newId = { ids.take() }).also { rigs += it; it.connect() }
         val f1 = rig.sources.add("f1.bin", TransferRig.bytes(5, 1))
         val f2 = rig.sources.add("f2.bin", TransferRig.bytes(5, 2))
         val vector = steps("transfer-id-retry-after-404-sends-only-the-missing-files")

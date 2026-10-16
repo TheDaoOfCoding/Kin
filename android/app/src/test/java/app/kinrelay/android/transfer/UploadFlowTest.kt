@@ -58,7 +58,7 @@ class UploadFlowTest {
     }
 
     @Test
-    fun severalFilesAreSentInOrderAndAZeroByteFileGetsItsOwnPut() {
+    fun severalFilesAreAllSentAndAZeroByteFileGetsItsOwnPut() {
         val r = rig()
         val a = TransferRig.bytes(70_000, 1)
         val c = TransferRig.bytes(5, 3)
@@ -70,8 +70,11 @@ class UploadFlowTest {
         assertEquals(0, r.stored(id, "f2").data.size)
         assertArrayEquals(c, r.stored(id, "f3").data)
         val puts = r.pc.files.calls.filter { it.method == "PUT" }
-        assertEquals(listOf("/v1/transfers/$id/files/f1", "/v1/transfers/$id/files/f2", "/v1/transfers/$id/files/f3"), puts.map { it.path })
-        assertEquals("the 0-byte file is a PUT with Content-Length 0 at offset 0", Triple(0L, 0L, 0L), Triple(puts[1].offset, puts[1].contentLength, puts[1].bodyBytes))
+        // Files go side by side, so the order in which the PC sees the requests is not fixed; what it sees is one PUT per file.
+        assertEquals(setOf("/v1/transfers/$id/files/f1", "/v1/transfers/$id/files/f2", "/v1/transfers/$id/files/f3"), puts.map { it.path }.toSet())
+        assertEquals(3, puts.size)
+        val empty = puts.single { it.path.endsWith("/f2") }
+        assertEquals("the 0-byte file is a PUT with Content-Length 0 at offset 0", Triple(0L, 0L, 0L), Triple(empty.offset, empty.contentLength, empty.bodyBytes))
         assertEquals(70_005L, r.store.transfers.getValue(id).totalBytes)
     }
 
@@ -178,13 +181,32 @@ class UploadFlowTest {
     @Test
     fun aFailureOnAPutIsFinalToo() {
         for (status in listOf(507, 413, 500)) {
-            val r = rig()
+            // One file at a time: the second file is never started.
+            val r = rig(TransferRig.FAST.copy(maxParallelFiles = 1))
             r.pc.files.putStatus = status
             val id = r.share("a.bin" to TransferRig.bytes(1_000), "b.bin" to TransferRig.bytes(1_000))
             val t = r.awaitStatus(id, TransferStatus.FAILED)
             assertEquals("$status: POST and one PUT, the second file is not started", listOf("POST", "PUT"), r.pc.files.calls.map { it.method })
             assertNotNull(t.message)
             assertFalse(r.wake.held)
+        }
+    }
+
+    @Test
+    fun aFailureOnAPutIsFinalWithSeveralFilesInFlightToo() {
+        for (status in listOf(507, 413, 500)) {
+            val r = rig()
+            r.pc.files.putStatus = status
+            val id = r.share("a.bin" to TransferRig.bytes(1_000), "b.bin" to TransferRig.bytes(1_000), "c.bin" to TransferRig.bytes(1_000))
+            val t = r.awaitStatus(id, TransferStatus.FAILED)
+            Thread.sleep(200)
+            val calls = r.pc.files.calls.map { it.method }
+            assertEquals("$status: one POST, and the PUTs of the files that were already started, no second POST (no retry)", 1, calls.count { it == "POST" })
+            assertTrue("$status: at most one PUT per file: $calls", calls.count { it == "PUT" } in 1..3)
+            assertNotNull(t.message)
+            r.await("the runner to stop") { !r.engine.isRunning(id) }
+            assertFalse(r.wake.held)
+            assertEquals("every opened source was closed", 0, r.sources.openStreams.get())
         }
     }
 

@@ -21,6 +21,8 @@ val signingStore = signingValue("KIN_KEYSTORE_FILE", "storeFile")?.let { path ->
 val signingStorePassword = signingValue("KIN_KEYSTORE_PASSWORD", "storePassword")
 val signingAlias = signingValue("KIN_KEY_ALIAS", "keyAlias")
 val signingKeyPassword = signingValue("KIN_KEY_PASSWORD", "keyPassword") ?: signingStorePassword
+// Opt-in ABIs for the smoke build type (see buildTypes): -PkinSmokeAbis=x86_64 (comma separated).
+val kinSmokeAbis = (findProperty("kinSmokeAbis") as String?)?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
 val releaseSigningReady = signingStore != null && signingStore.isFile && signingStorePassword != null && signingAlias != null && signingKeyPassword != null
 
 android {
@@ -33,8 +35,8 @@ android {
         applicationId = "app.kinrelay.android"
         minSdk = 29
         targetSdk = 37
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -52,6 +54,9 @@ android {
 
     buildTypes {
         release {
+            // Phones are ARM. The release APK carries no x86 or x86_64 copy of the few native libraries that CameraX and DataStore bring
+            // (the emulator runs the debug build, which keeps all of them).
+            ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
             signingConfig = if (releaseSigningReady) signingConfigs.getByName("release") else null
             isMinifyEnabled = true
             isShrinkResources = true
@@ -60,6 +65,20 @@ android {
                 "proguard-rules.pro"
             )
         }
+        // Smoke-test only, opt-in: `gradlew assembleSmoke -PkinSmokeAbis=x86_64` builds the release variant (same R8, shrink, proguard and signing)
+        // plus the given ABIs, so the minified code can run on an x86_64 emulator. Without the property this build type does not exist, and
+        // `release` stays ARM-only. Output: app/build/outputs/apk/smoke/app-smoke.apk (never app-release.apk).
+        if (kinSmokeAbis.isNotEmpty()) {
+            create("smoke") {
+                initWith(getByName("release"))
+                matchingFallbacks += listOf("release")
+                ndk { abiFilters.clear(); abiFilters += listOf("arm64-v8a", "armeabi-v7a") + kinSmokeAbis }
+            }
+        }
+    }
+    if (kinSmokeAbis.isNotEmpty()) {
+        // The release-only sources (the empty DebugHooks) are part of the smoke build, as they are of the release.
+        sourceSets.getByName("smoke").kotlin.directories.add("src/release/java")
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
@@ -117,7 +136,7 @@ ksp {
 }
 
 // Said once when a release is built without a signing setup (so nobody ships an unsigned APK by accident).
-if (!releaseSigningReady && gradle.startParameter.taskNames.any { it.contains("release", ignoreCase = true) }) {
+if (!releaseSigningReady && gradle.startParameter.taskNames.any { it.contains("release", ignoreCase = true) || it.contains("smoke", ignoreCase = true) }) {
     logger.lifecycle(
         "NOTE: no release signing setup found, so the release APK is built UNSIGNED and cannot be installed.\n" +
             "      Create $signingFile (storeFile, storePassword, keyAlias, keyPassword) or set KIN_KEYSTORE_FILE,\n" +

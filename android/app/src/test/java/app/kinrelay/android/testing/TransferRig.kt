@@ -188,6 +188,13 @@ class TempSources(private val root: File) : SourceFiles {
     @Volatile var readDelayMillis = 0L
     val reads = AtomicInteger()
 
+    /** How many times `stat` was called, and how long each call takes (a provider round trip: 50 photos one by one were slow). */
+    val statCalls = AtomicInteger()
+
+    /** Streams opened by `open` and not closed yet (a source opened ahead of its request must always be closed again). */
+    val openStreams = AtomicInteger()
+    @Volatile var statDelayMillis = 0L
+
     private val mimes = ConcurrentHashMap<String, String>()
 
     /** Writes [bytes] as a shared file and returns its URI. */
@@ -203,6 +210,8 @@ class TempSources(private val root: File) : SourceFiles {
     val statScript = java.util.concurrent.ConcurrentLinkedQueue<StatStep>()
 
     override fun stat(uri: String): SourceInfo? {
+        statCalls.incrementAndGet()
+        if (statDelayMillis > 0) Thread.sleep(statDelayMillis)
         statScript.poll()?.let { return it.info }
         if (lost) return null
         val file = byUri[uri]?.takeIf { it.isFile } ?: return null
@@ -213,6 +222,8 @@ class TempSources(private val root: File) : SourceFiles {
         if (lost) throw SecurityException("access lost")
         val file = byUri[uri] ?: throw java.io.FileNotFoundException(uri)
         val stream = java.io.FileInputStream(file).also { var skipped = 0L; while (skipped < offset) skipped += it.skip(offset - skipped) }
+        openStreams.incrementAndGet()
+        val closed = java.util.concurrent.atomic.AtomicBoolean(false)
         return object : InputStream() {
             override fun read(): Int = stream.read()
             override fun read(b: ByteArray, off: Int, len: Int): Int {
@@ -220,7 +231,10 @@ class TempSources(private val root: File) : SourceFiles {
                 if (readDelayMillis > 0) Thread.sleep(readDelayMillis)
                 return stream.read(b, off, minOf(len, CHUNK))
             }
-            override fun close() = stream.close()
+            override fun close() {
+                if (closed.compareAndSet(false, true)) openStreams.decrementAndGet()
+                stream.close()
+            }
         }
     }
 
@@ -391,6 +405,9 @@ class TransferRig(
     val sessions = CopyOnWriteArrayList<LinkSession>()
     @Volatile var current: LinkSession? = null
     @Volatile var unreachable = "This phone isn't on Wi-Fi."
+
+    /** What the phone's "does the PC answer a new connection?" check finds (the probe of [LinkSession.checkAlive]): by default the PC's [FakePcFiles.silent] flag. */
+    @Volatile var probeAnswers: () -> Boolean = { !pc.files.silent }
     private val deliveries = DeliveryQueue(KinLog.None).also { it.start(scope) }
     private val dedup = DedupMemory(System::currentTimeMillis)
 
@@ -454,6 +471,7 @@ class TransferRig(
         val session = LinkSession(
             client, PairingAddress("127.0.0.1", to.port), LocalHello("Pixel 8", "android", "0.1.0"),
             dedup, scope, { System.nanoTime() / 1_000_000 }, KinLog.None, listener, peerId,
+            reachable = { _, _ -> probeAnswers() },
         )
         session.open()
         check(hellos.poll(5, TimeUnit.SECONDS) != null) { "no hello" }
