@@ -130,7 +130,7 @@ No `R8` warnings about missing classes in the build output, and logcat of both r
 
 ## 8. Neutral names
 
-`grep -ril "empire|sol 02|sol02" android/` (sources, tests, resources, scripts): no hit in tracked files. The only hit is `android/local.properties` (the SDK path with the Windows user name), which is gitignored and never committed. Test sources already use neutral names (`Desk PC`, `Anna Berg`).
+`grep -ril "<PC name>|<user name>" android/` (sources, tests, resources, scripts): no hit in tracked files. The only hit is `android/local.properties` (the SDK path with the Windows user name), which is gitignored and never committed. Test sources already use neutral names (`Desk PC`, `Anna Berg`).
 
 ## 9. Install instructions (for `docs/TESTING.md`)
 
@@ -158,7 +158,7 @@ Google Play Protect may say "**Blocked by Play Protect**" or "**App not scanned*
 |---|---|---|---|
 | **Notifications** (Android 13+) | At the first start | Texts and files from the PC, and the "Connected to ..." notification | You will not see arrivals; Settings, Apps, Kin, Notifications turns it on |
 | **Nearby devices** (Android 17 only) | At the first start and before pairing | Android 17 blocks every connection to a PC on your Wi-Fi without it | Kin cannot reach the PC and says so on Home; Settings, Apps, Kin, Permissions, Nearby devices |
-| **Camera** | **Only when you tap "Scan code"** | To read the QR code the PC shows. The picture is not saved or sent | Tap "Scan code" again to allow it. **Pasting a pairing link is the other way, but the PC window shows only the QR code today (see open points)** |
+| **Camera** | **Only when you tap "Scan code"** | To read the QR code the PC shows. The picture is not saved or sent | Tap "Scan code" again to allow it. **Pasting a pairing link is the other way** (the PC window had only the QR code when this was written; since v0.1.1 it has a "Copy pairing link" button, fixed) |
 
 Pair: on the PC open Kin, choose "Pair new phone", then on the phone tap "Scan code" and point the camera at the code.
 
@@ -195,7 +195,7 @@ Settings, Apps, Kin, Uninstall. This removes the pairing on the phone; on the PC
 
 ## 11. Open points
 
-- **The PC window shows only the QR code, no pairing link.** If a friend's camera does not work (or they deny it, or the phone has none), the pasted-link path the app offers has nothing to paste: the PC would need a "Copy pairing link" button next to the code (a desktop change, not done here). Until then the only fallback is opening the link with `adb`. Worth adding before the friends test.
+- **(Fixed in v0.1.1: the PC window now has a "Copy pairing link" button, so the pasted-link path has something to paste. What follows is how it was when this was written.) The PC window shows only the QR code, no pairing link.** If a friend's camera does not work (or they deny it, or the phone has none), the pasted-link path the app offers has nothing to paste: the PC would need a "Copy pairing link" button next to the code (a desktop change, not done here). Until then the only fallback is opening the link with `adb`. Worth adding before the friends test.
 - **A real camera has not scanned a real code yet** (R17). First check on a real phone; fixes if it is poor: a bigger code on the PC, tap to focus, or a "scan from a picture" button.
 - The release APK carries libraries for four ABIs. At 4.45 MiB there is no need to split; if size ever matters, `ndk.abiFilters` to `arm64-v8a` and `armeabi-v7a` drops the two x86 sets.
 - The friends need the key to be the same for the whole test: if the key is replaced after the first install, every friend must uninstall.

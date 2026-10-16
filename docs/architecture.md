@@ -42,8 +42,8 @@ What this means:
 
 The full steps are in [protocol.md](protocol.md#pairing).
 
-1. On the PC, the user clicks "Pair new phone". The PC shows a QR code containing its addresses, its device ID and a one-time token valid for 5 minutes.
-2. The phone scans it, connects, and checks that the PC's key matches the device ID in the QR.
+1. On the PC, the user clicks "Pair new phone". The PC shows a QR code containing its addresses, its device ID and a one-time token valid for 5 minutes. The same text is a `kinrelay://pair?...` link: the **Copy pairing link** button puts it on the clipboard, for a phone whose camera can't scan the code (the user sends the link to the phone and pastes it on the first-run screen).
+2. The phone scans the code, or takes the pasted link, connects, and checks that the PC's key matches the device ID in the QR or link.
 3. The phone sends the token along with its own certificate. The PC checks the token and saves the phone's device ID as trusted.
 4. Both sides show "Paired". The PC also shows a "New device paired" notice with a way to remove it, in case someone else scanned the code.
 

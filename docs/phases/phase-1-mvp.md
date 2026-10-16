@@ -4,7 +4,7 @@ Goal: one Android phone and one Windows PC on the same Wi-Fi feel like one setup
 
 ## Scope
 
-You pair the phone once by scanning a QR code shown on the PC.
+You pair the phone once by scanning a QR code shown on the PC, or (when the camera can't scan) by pasting the same pairing link, which the PC's window can copy.
 
 | | Phone → PC | PC → phone |
 |---|---|---|

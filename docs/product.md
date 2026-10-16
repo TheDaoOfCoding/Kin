@@ -21,7 +21,7 @@ The big phone makers can't tell this story without weakening their own lock-in. 
 LocalSend is a good pipe: a file goes through and nothing stays behind. In the MVP we beat it on three things:
 
 1. **Nothing to open.** You send from the share sheet, the text selection menu, the tray or a hotkey. The other side receives without anyone opening the app.
-2. **Paired, not strangers.** You pair once with a QR code. After that your devices trust each other, so there are no accept prompts.
+2. **Paired, not strangers.** You pair once, with a QR code (or the same link pasted into the phone, when its camera can't scan). After that your devices trust each other, so there are no accept prompts.
 3. **Clipboard.** Copy on the PC, paste on the phone. Select text on the phone, send it, paste on the PC.
 
 Later we add more: it works away from home (the bridge), keeps a history you can search, and includes small "it just knows" features (see [Phase 2](phases/phase-2-features.md)).
