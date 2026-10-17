@@ -132,6 +132,9 @@ $script:ClipboardBackupMaxAge = [TimeSpan]::FromHours(1)
 # -SkipIfEmpty an empty clipboard writes nothing and returns $null. (Nothing here writes to the pipeline except that return value: callers take
 # the last output of Save-Clipboard.)
 function Write-ClipboardSnapshot([string]$dir, [switch]$SkipIfEmpty) {
+    # A locked clipboard must stop the function: with the default preference the failed read would go on with $entries empty and write an EMPTY
+    # backup, and a later Restore-Clipboard of it would clear what the user has copied (v0.1.1 review). The preference is local to this function.
+    $ErrorActionPreference = 'Stop'
     $entries = [KinClip]::Read($true)
     if ($SkipIfEmpty -and $entries.Count -eq 0) { return $null }
     if ([IO.Directory]::Exists($dir)) { [IO.Directory]::Delete($dir, $true) }
@@ -151,6 +154,9 @@ function Write-ClipboardSnapshot([string]$dir, [switch]$SkipIfEmpty) {
 }
 
 function Save-Clipboard {
+    # A locked clipboard must stop the function: with the default preference the failed read would go on with $entries empty and write an EMPTY
+    # backup, and a later Restore-Clipboard of it would clear what the user has copied (v0.1.1 review). The preference is local to this function.
+    $ErrorActionPreference = 'Stop'
     # (The long form of the temp folder: Remove-Item can't handle the 8.3 short form that $env:TEMP may have.)
     $dir = Join-Path $env:LOCALAPPDATA 'Temp\kin-clipboard-backup'
     # **An earlier backup is never overwritten, and never costs the user what is on the clipboard now** (v0.1.1, review round 1). A backup that is

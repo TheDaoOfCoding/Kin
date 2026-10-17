@@ -677,6 +677,10 @@ impl Core {
     pub fn toast_clicked(&self, toast_id: u32) -> bool {
         let target = {
             let mut targets = lock(&self.toast_targets);
+            // The toast of a link that was opened already has nothing to do on a click, and keeps its Copy button.
+            if targets.iter().any(|(i, t)| *i == toast_id && matches!(t, ToastTarget::LinkOpened(_))) {
+                return false;
+            }
             targets.iter().position(|(i, _)| *i == toast_id).and_then(|pos| targets.remove(pos)).map(|(_, t)| t)
         };
         let Some(target) = target else {
@@ -684,9 +688,11 @@ impl Core {
         };
         let (what, result) = match &target {
             // Not the link itself: it can carry a secret.
-            ToastTarget::Link(url) => {
+            ToastTarget::Link(url) | ToastTarget::LinkOffer(url) => {
                 (format!("a link ({} characters) in the default browser", url.chars().count()), self.opener.open(url))
             }
+            // It was opened when it arrived: a click on its toast opens nothing.
+            ToastTarget::LinkOpened(_) => return false,
             ToastTarget::OpenFile(path) if !links::may_open_file(path) => {
                 ("the folder of a file whose type isn't on the allow-list (not opened)".to_string(), self.opener.show_in_folder(path))
             }
@@ -718,7 +724,7 @@ impl Core {
         let result = match target {
             Some(ToastTarget::OpenFile(path)) => self.opener.show_in_folder(&path),
             Some(ToastTarget::ShowFolder(folder)) => self.opener.open_folder(&folder),
-            Some(ToastTarget::Link(_)) | None => return false,
+            Some(ToastTarget::Link(_) | ToastTarget::LinkOpened(_) | ToastTarget::LinkOffer(_)) | None => return false,
         };
         match result {
             Ok(()) => {
@@ -727,6 +733,33 @@ impl Core {
             }
             Err(e) => {
                 log::warn!("toast {toast_id}: showing the folder failed: {e}");
+                false
+            }
+        }
+    }
+
+    /// The "Copy" button of the toast of a link from the phone: the URL goes to the clipboard (the loop guard is told, so the automatic sync
+    /// doesn't send it straight back). Returns whether it was copied.
+    pub async fn toast_copy(self: &Arc<Self>, toast_id: u32) -> bool {
+        let url = {
+            let mut targets = lock(&self.toast_targets);
+            let pos =
+                targets.iter().position(|(i, t)| *i == toast_id && matches!(t, ToastTarget::LinkOpened(_) | ToastTarget::LinkOffer(_)));
+            pos.and_then(|pos| targets.remove(pos)).and_then(|(_, t)| match t {
+                ToastTarget::LinkOpened(u) | ToastTarget::LinkOffer(u) => Some(u),
+                _ => None,
+            })
+        };
+        let Some(url) = url else {
+            return false;
+        };
+        match self.copy_to_clipboard(&url).await {
+            Ok(()) => {
+                log::info!("toast {toast_id}: a link ({} characters) copied to the clipboard", url.chars().count());
+                true
+            }
+            Err(e) => {
+                log::warn!("toast {toast_id}: copying the link failed: {e}");
                 false
             }
         }
@@ -824,6 +857,10 @@ fn ms(d: Duration) -> f64 {
 pub enum ToastTarget {
     /// Open this link in the default browser.
     Link(String),
+    /// A link from the phone that was opened already (2B.1): the toast has Copy only, and a click on it does nothing (it must not open it again).
+    LinkOpened(String),
+    /// A link from the phone that was not opened (the setting is off, or a fullscreen program is running): the toast has Open and Copy.
+    LinkOffer(String),
     /// Open this received file (shown in its folder instead unless its type is on the allow-list).
     OpenFile(PathBuf),
     /// Open this folder.

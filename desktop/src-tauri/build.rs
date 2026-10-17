@@ -20,6 +20,7 @@ const COMMANDS: &[&str] = &[
     "set_device_name",
     "set_auto_clipboard_sync",
     "set_images_to_clipboard",
+    "set_open_links_automatically",
     "choose_received_folder",
     "reset_received_folder",
     "set_hotkey",

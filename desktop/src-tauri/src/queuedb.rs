@@ -60,7 +60,21 @@ pub struct HistoryRow {
     /// A text item: its text.
     pub text: Option<String>,
     pub is_url: bool,
+    /// A link item (2B.1): `text` is its URL.
+    pub is_link: bool,
+    /// The cleaned title of a link item.
+    pub title: Option<String>,
     pub files: Vec<HistoryFile>,
+}
+
+/// The stored body of a text item (a text, or a link).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextItem {
+    pub body: String,
+    pub is_url: bool,
+    pub is_link: bool,
+    pub title: Option<String>,
+    pub source_app: Option<String>,
 }
 
 /// One send, for the success rate and the latency numbers of the debug window. No text and no file name.
@@ -125,7 +139,7 @@ CREATE TABLE IF NOT EXISTS connection_log (
 );
 ";
 
-const SELECT_HISTORY: &str = "SELECT t.id, t.device_id, t.direction, t.kind, t.status, t.created_at, t.finished_at, t.total_bytes, t.error_code, t.retry_of, x.body, COALESCE(x.is_url, 0), EXISTS (SELECT 1 FROM transfers r WHERE r.retry_of = t.id)
+const SELECT_HISTORY: &str = "SELECT t.id, t.device_id, t.direction, t.kind, t.status, t.created_at, t.finished_at, t.total_bytes, t.error_code, t.retry_of, x.body, COALESCE(x.is_url, 0), EXISTS (SELECT 1 FROM transfers r WHERE r.retry_of = t.id), COALESCE(x.is_link, 0), x.link_title
      FROM transfers t LEFT JOIN transfer_texts x ON x.transfer_id = t.id";
 
 impl Db {
@@ -157,6 +171,53 @@ impl Db {
         tx.execute("INSERT INTO transfer_texts (transfer_id, body, is_url) VALUES (?1, ?2, ?3)", params![id, body, is_url as i64])?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Stores a link item (2B.1): like a text item, with the URL as its body and the title and sharing app next to it. `is_url` is true.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_link_item(
+        &self,
+        id: &str,
+        device_id: &str,
+        direction: &str,
+        status: &str,
+        created_at: i64,
+        expires_at: Option<i64>,
+        url: &str,
+        title: Option<&str>,
+        source_app: Option<&str>,
+        retry_of: Option<&str>,
+    ) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let finished = (status != "queued" && status != "active").then_some(created_at);
+        tx.execute(
+            "INSERT INTO transfers (id, device_id, direction, kind, status, created_at, updated_at, finished_at, expires_at, total_bytes, error_code, dest_dir, retry_of)
+             VALUES (?1, ?2, ?3, 'text', ?4, ?5, ?5, ?6, ?7, ?8, NULL, NULL, ?9)",
+            params![id, device_id, direction, status, created_at, finished, expires_at, url.len() as i64, retry_of],
+        )?;
+        tx.execute(
+            "INSERT INTO transfer_texts (transfer_id, body, is_url, is_link, link_title, link_source) VALUES (?1, ?2, 1, 1, ?3, ?4)",
+            params![id, url, title, source_app],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The whole stored body of a text item: text or link.
+    pub fn text_item(&self, id: &str) -> Result<Option<TextItem>> {
+        Ok(self
+            .conn()
+            .query_row("SELECT body, is_url, is_link, link_title, link_source FROM transfer_texts WHERE transfer_id = ?1", [id], |r| {
+                Ok(TextItem {
+                    body: r.get(0)?,
+                    is_url: r.get::<_, i64>(1)? != 0,
+                    is_link: r.get::<_, i64>(2)? != 0,
+                    title: r.get(3)?,
+                    source_app: r.get(4)?,
+                })
+            })
+            .optional()?)
     }
 
     /// The text of a text item, and whether it is a link.
@@ -461,6 +522,8 @@ fn read_history(r: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryRow> {
         text: r.get(10)?,
         is_url: r.get::<_, i64>(11)? != 0,
         retried: r.get::<_, i64>(12)? != 0,
+        is_link: r.get::<_, i64>(13)? != 0,
+        title: r.get(14)?,
         files: Vec::new(),
     })
 }

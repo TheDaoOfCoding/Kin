@@ -21,6 +21,9 @@ pub struct Config {
     pub dev_no_windows: bool,
     /// Developer setting (1.4): windows are shown, but toasts are only logged (for screenshots of the windows without a stream of toasts).
     pub dev_no_toasts: bool,
+    /// Developer setting (2B.1): nothing is ever opened (no browser, no Explorer): the app only logs that it would have, with the length of a link and
+    /// never the link. For a test run that receives links from the phone and must not open a window.
+    pub dev_no_open: bool,
     /// Developer setting: received files go here instead of `Downloads\Kin` (and instead of `receivedFolder` of settings.json), so
     /// a test never writes to the real Downloads folder.
     pub dev_received_dir: Option<PathBuf>,
@@ -48,6 +51,7 @@ impl Config {
             dev_print_pair_url: false,
             dev_no_windows: false,
             dev_no_toasts: false,
+            dev_no_open: false,
             dev_received_dir: None,
             dev_free_bytes: None,
             dev_clock_offset_secs: None,
@@ -73,6 +77,7 @@ impl Config {
             || self.dev_print_pair_url
             || self.dev_no_windows
             || self.dev_no_toasts
+            || self.dev_no_open
             || self.dev_received_dir.is_some()
             || self.dev_free_bytes.is_some()
             || self.dev_clock_offset_secs.is_some()
@@ -227,6 +232,7 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
     let mut print_url = truthy(env("KIN_DEV_PRINT_PAIR_URL"));
     let mut no_windows = truthy(env("KIN_DEV_NO_WINDOWS"));
     let mut no_toasts = truthy(env("KIN_DEV_NO_TOASTS"));
+    let mut no_open = truthy(env("KIN_DEV_NO_OPEN"));
     let mut received_dir = env("KIN_DEV_RECEIVED_DIR").map(PathBuf::from);
     let mut free_bytes = env("KIN_DEV_FREE_BYTES");
     let mut clock_offset = env("KIN_DEV_CLOCK_OFFSET");
@@ -250,6 +256,7 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
             "--dev-print-pair-url" => print_url = true,
             "--dev-no-windows" => no_windows = true,
             "--dev-no-toasts" => no_toasts = true,
+            "--dev-no-open" => no_open = true,
             "--dev-received-dir" => received_dir = Some(PathBuf::from(value(name)?)),
             "--dev-free-bytes" => free_bytes = Some(value(name)?),
             "--dev-clock-offset" => clock_offset = Some(value(name)?),
@@ -341,6 +348,7 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
     config.dev_print_pair_url = print_url;
     config.dev_no_windows = no_windows;
     config.dev_no_toasts = no_toasts;
+    config.dev_no_open = no_open;
     config.dev_received_dir = received_dir;
     if let Some(v) = free_bytes {
         config.dev_free_bytes = Some(v.parse().map_err(|_| format!("--dev-free-bytes: {v:?} is not a number of bytes"))?);
@@ -578,6 +586,17 @@ mod tests {
         assert!(p.config.instance_key().is_some());
         assert!(!p.config.is_dev_network());
         assert!(!p.config.advertises_on_lan(), "a Kin with its own data directory is never found by the user's phone");
+    }
+
+    #[test]
+    fn dev_no_open_is_a_developer_setting_that_needs_a_directory_of_its_own() {
+        let p = parse(&args("--dev-no-open"), &appdata).unwrap();
+        assert!(p.config.dev_no_open && p.config.dev_hooks_enabled());
+        assert!(
+            crate::instance::dev_settings_refusal(p.config.dev_hooks_enabled(), p.config.instance_key().as_deref()).is_some(),
+            "never against the installed Kin's data"
+        );
+        assert!(!parse(&[], &appdata).unwrap().config.dev_no_open, "off unless asked for");
     }
 
     #[test]

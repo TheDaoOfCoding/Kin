@@ -18,6 +18,8 @@ type Item = {
   names: string[];
   text: string | null;
   isUrl: boolean;
+  isLink: boolean;
+  title: string | null;
   retryOf: string | null;
   retried: boolean;
   canOpen: boolean;
@@ -30,7 +32,7 @@ type View = { items: Item[]; cap: number; phone: string | null; connected: boole
 const STATUS: Record<Item["status"], string> = { queued: "Queued", active: "In progress", done: "Done", failed: "Failed", canceled: "Canceled" };
 
 function title(i: Item): string {
-  if (i.kind === "text") return i.text ?? "(text)";
+  if (i.kind === "text") return i.isLink && i.title ? `${i.title} — ${i.text ?? ""}` : (i.text ?? "(text)");
   if (i.files <= 1) return i.names[0] ?? "1 file";
   return `${i.files} files`;
 }
@@ -78,7 +80,7 @@ export function startHistoryWindow(root: HTMLElement): void {
     if (i.canCancel) buttons.append(once(button("Cancel", () => {}, "secondary small"), `cancel:${i.id}`, () => invoke("history_cancel", { id: i.id })));
     const line = el("div", { className: `item ${i.status}${i.canOpen ? " clickable" : ""}` }, arrow, el("div", { className: "body" }, name, meta), buttons);
     if (i.canOpen) {
-      line.title = i.opensText ? "Click to copy this text" : "Click to open";
+      line.title = i.opensText ? (i.isLink ? "Click to copy this link" : "Click to copy this text") : "Click to open";
       line.addEventListener("click", (e) => {
         if ((e.target as HTMLElement).closest("button")) return;
         void act(invoke<string>("history_open", { id: i.id }));

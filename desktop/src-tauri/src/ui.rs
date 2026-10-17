@@ -359,6 +359,14 @@ pub fn set_images_to_clipboard(window: WebviewWindow, state: State<'_, AppState>
     Ok(())
 }
 
+/// "Open links from phone automatically" (2B.1): on by default.
+#[tauri::command]
+pub fn set_open_links_automatically(window: WebviewWindow, state: State<'_, AppState>, on: bool) -> Result<(), String> {
+    only(&window, &[SETTINGS_WINDOW], "set_open_links_automatically")?;
+    state.core.set_open_links_automatically(on);
+    Ok(())
+}
+
 /// "Choose folder…": the Windows folder picker, then the folder is checked and kept. `None` if the user closed the dialog.
 #[tauri::command]
 pub async fn choose_received_folder(window: WebviewWindow, app: AppHandle, state: State<'_, AppState>) -> Result<Option<String>, String> {

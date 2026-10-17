@@ -33,6 +33,7 @@ pub fn trim(text: &str) -> &str {
 /// The rule of protocol.md ("Text messages", "Links: `isUrl` and openable URLs"): after trimming, the scheme is `http` or `https`
 /// followed by `://`, there is no whitespace or control character anywhere, the host is not empty and not only dots (or is a
 /// non-empty `[IPv6]` literal), a port (if there is a `:`) is 1 to 65535 in ASCII digits, and the whole text is at most 8 KiB.
+/// Since changelog 55 the authority has no `@`, `\` or `%`, and a host that isn't an IPv6 literal has none of `[ ] < > ^ |`.
 pub fn is_openable_url(text: &str) -> bool {
     let t = trim(text);
     if t.len() > MAX_URL_BYTES || t.chars().any(|c| is_white_space(c) || is_control(c)) {
@@ -44,9 +45,13 @@ pub fn is_openable_url(text: &str) -> bool {
     if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
         return false;
     }
-    // The authority runs up to the first `/`, `?` or `#`. Everything up to the last `@` is user information and is ignored.
+    // The authority runs up to the first `/`, `?` or `#`. It has no user information, no backslash and no percent-encoding (changelog 55): each of
+    // them makes the host a different one for a browser than for a lenient reading (`https://evil.example\@google.com`, `https://goog%6Ce.com`).
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host_part = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if authority.contains(['@', '\\', '%']) {
+        return false;
+    }
+    let host_part = authority;
     let port = if let Some(bracketed) = host_part.strip_prefix('[') {
         let Some((inside, after)) = bracketed.split_once(']') else {
             return false;
@@ -66,7 +71,8 @@ pub fn is_openable_url(text: &str) -> bool {
             Some((host, port)) => (host, Some(port)),
             None => (host_part, None),
         };
-        if host.is_empty() || host.chars().all(|c| c == '.') {
+        // The characters a browser refuses in a host (the rest of its list is whitespace, `/ ? # :` and the ones refused above).
+        if host.is_empty() || host.chars().all(|c| c == '.') || host.contains(['[', ']', '<', '>', '^', '|']) {
             return false;
         }
         port
@@ -83,6 +89,59 @@ fn valid_port(port: &str) -> bool {
     !significant.is_empty() && significant.len() <= 5 && significant.parse::<u32>().is_ok_and(|n| n <= 65535)
 }
 
+/// The address a link leads to, as it is shown (protocol.md, "Showing the address of a link"), and whether it carries a warning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkAddress {
+    /// The host a browser connects to (WHATWG reading: lower case, punycode, IPv4 in dotted decimal, IPv6 compressed), with the port when it isn't the
+    /// scheme's default. For a host a browser would refuse: the host as written, ASCII lower-cased, each character outside U+0021..U+007E as U+FFFD.
+    pub display: String,
+    /// Marked with a warning sign and **never opened automatically**: the host as written is not ASCII, the address has a punycode (`xn--`) label, the
+    /// address is an IP address (any spelling, or IPv6), or a browser would refuse the host. (Look-alikes made of plain ASCII aren't detected.)
+    pub warn: bool,
+}
+
+impl LinkAddress {
+    /// What a toast shows: the address, with a warning sign in front of it when there is a warning.
+    pub fn shown(&self) -> String {
+        if self.warn { format!("\u{26a0} {}", self.display) } else { self.display.clone() }
+    }
+}
+
+/// The address of a URL that has passed [`is_link_url`] (or [`is_openable_url`]). It is the authority alone that decides, so only
+/// `scheme://authority/` is given to the WHATWG parser (the `url` crate): a long path or a strange query can't change the answer. After the rule the
+/// authority is just `host[:port]`, no user information, no backslash, no escape.
+pub fn link_address(url: &str) -> LinkAddress {
+    let url = trim(url);
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let written = match authority.strip_prefix('[') {
+        Some(inside) => format!("[{}]", inside.split(']').next().unwrap_or("")),
+        None => authority.split(':').next().unwrap_or("").to_string(),
+    };
+    // Not reachable for a URL that passed the rule (it has none of these), but whoever asks gets a warning for an authority that tricks the eye.
+    let tricky = authority.contains(['@', '\\', '%']);
+    if let Ok(parsed) = url::Url::parse(&format!("{}://{authority}/", scheme.to_ascii_lowercase()))
+        && let Some(host) = parsed.host()
+    {
+        let (shown, warn) = match host {
+            url::Host::Domain(domain) => {
+                (domain.to_string(), tricky || !written.is_ascii() || domain.split('.').any(|label| label.starts_with("xn--")))
+            }
+            url::Host::Ipv4(ip) => (ip.to_string(), true),
+            // The URL Standard's serialisation (`[::ffff:7f00:1]`), not `Ipv6Addr`'s own (`::ffff:127.0.0.1`).
+            url::Host::Ipv6(_) => (parsed.host_str().unwrap_or_default().to_string(), true),
+        };
+        let display = match parsed.port() {
+            Some(port) => format!("{shown}:{port}"),
+            None => shown,
+        };
+        return LinkAddress { display, warn };
+    }
+    // A browser would refuse this host (`1.2.3.4.5`, a bad punycode label): show what is written, plainly, and warn.
+    let display = written.to_ascii_lowercase().chars().map(|c| if ('\u{21}'..='\u{7e}').contains(&c) { c } else { '\u{fffd}' }).collect();
+    LinkAddress { display, warn: true }
+}
+
 /// The `isUrl` a sender writes. (Kept under its old name: the callers say what they mean.)
 pub fn is_http_url(text: &str) -> bool {
     is_openable_url(text)
@@ -92,6 +151,54 @@ pub fn is_http_url(text: &str) -> bool {
 /// openable URL by the rule above. The result is the trimmed text.
 pub fn openable_url(text: &str, is_url: bool) -> Option<&str> {
     (is_url && is_openable_url(text)).then(|| trim(text))
+}
+
+/// Whether `url` is a valid `link.url` (protocol.md, "Links: `link`"): the openable-URL rule applied to the string **as sent**, with no trimming,
+/// so whitespace at either end is invalid. (`protocol/links.json`, `urls[]`.)
+pub fn is_link_url(url: &str) -> bool {
+    url == trim(url) && is_openable_url(url)
+}
+
+/// The longest `title` of a `link` that is kept, in code points.
+pub const MAX_LINK_TITLE_CHARS: usize = 300;
+/// The longest `sourceApp` of a `link` that is kept, in code points.
+pub const MAX_LINK_SOURCE_CHARS: usize = 64;
+
+/// The `Bidi_Control` characters of protocol.md, "File names" step 2: U+061C, U+200E, U+200F, U+202A to U+202E and U+2066 to U+2069.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Cleans the `title` or `sourceApp` of a `link` (untrusted text of a web page), as protocol.md says: Bidi_Control characters become `_`, control
+/// characters become a space, runs of U+0020 collapse and the ends are trimmed, the result is cut to `max` whole code points (trailing spaces
+/// trimmed again), and an empty result is `None`. (`protocol/links.json`, `titles[]` and `sourceApps[]`.)
+pub fn clean_link_text(text: &str, max: usize) -> Option<String> {
+    let mut out = String::with_capacity(text.len().min(4 * max));
+    let mut pending_space = false;
+    for c in text.chars() {
+        let c = if is_bidi_control(c) {
+            '_'
+        } else if is_control(c) {
+            ' '
+        } else {
+            c
+        };
+        if c == ' ' {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(c);
+        if out.chars().count() > max + 1 {
+            break; // plenty to cut from: don't walk a huge title to the end
+        }
+    }
+    let cut: String = out.chars().take(max).collect();
+    let cut = cut.trim_end_matches(' ');
+    (!cut.is_empty()).then(|| cut.to_string())
 }
 
 /// The file types a toast may open with their default program: **an allow-list**. Everything else is shown in its folder, selected,
@@ -202,6 +309,42 @@ fn shell_execute(target: &str) -> Result<()> {
     }
 }
 
+/// `--dev-no-open`: opens nothing. A test run that receives links (or files) from a phone must not start a browser or Explorer on the PC of the
+/// person who runs it. It only says in the log that it would have, **with the length of a link and never the link** (the same rule as every log line).
+pub struct LogOnlyOpener;
+
+impl UrlOpener for LogOnlyOpener {
+    fn open(&self, url: &str) -> Result<()> {
+        // The same last line of defence as the real opener: what is not an http(s) link is refused.
+        if !is_openable_url(url) {
+            return Err("refusing to open something that is not an http(s) link".into());
+        }
+        log::info!(
+            "developer hook (--dev-no-open): a link of {} characters would have been opened in the browser",
+            trim(url).chars().count()
+        );
+        Ok(())
+    }
+
+    fn open_path(&self, path: &Path) -> Result<()> {
+        if !may_open_file(path) {
+            return Err("refusing to open a file whose type isn't on the allow-list".into());
+        }
+        log::info!("developer hook (--dev-no-open): a received file would have been opened");
+        Ok(())
+    }
+
+    fn show_in_folder(&self, _path: &Path) -> Result<()> {
+        log::info!("developer hook (--dev-no-open): a received file would have been shown in its folder");
+        Ok(())
+    }
+
+    fn open_folder(&self, _folder: &Path) -> Result<()> {
+        log::info!("developer hook (--dev-no-open): a folder would have been opened");
+        Ok(())
+    }
+}
+
 /// For tests: remembers what it was asked to open.
 #[derive(Default)]
 pub struct RecordingOpener {
@@ -266,7 +409,11 @@ mod tests {
             "HTTPS://EXAMPLE.COM",
             "Http://example.com:8080/x",
             "  https://example.com/trimmed \r\n",
-            "https://user:pw@example.com/",
+            "https://example.com/a@b?c=d@e#f@g",
+            "https://example.com/a\\b?c=\\d#\\e",
+            "https://example.com/100%25?x=%20",
+            "https://b\u{fc}cher.example/",
+            "https://xn--bcher-kva.example/",
             "https://192.168.1.5:47821/",
             "https://[::1]:8443/",
             "https://example.com/a%20b",
@@ -321,6 +468,68 @@ mod tests {
         ] {
             assert!(!is_openable_url(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn refuses_an_authority_that_a_browser_and_a_lenient_reading_see_differently() {
+        // B1 and B2 (changelog 55): `@`, `\` and `%` in the authority, and the characters a browser refuses in a host.
+        for bad in [
+            "https://evil.example\\@google.com",
+            "https://evil.example\\@google.com/",
+            "https://evil.example\\/x",
+            "https://example.com\\",
+            "https://\\example.com/",
+            "https://google.com@evil.example/",
+            "https://google.com:443@evil.example/",
+            "https://example.com:8443@evil.example/",
+            "https://user:pw@example.com/",
+            "https://me@[::1]:9/",
+            "https://goog%6Ce.com/",
+            "https://%67oogle.com/",
+            "http://[fe80::1%25eth0]/",
+            "https://example.com:%38%30/",
+            "https://exa<mple.com/",
+            "https://exa>mple.com/",
+            "https://a|b.com/",
+            "https://a^b.com/",
+            "https://exa[mple.com/",
+            "https://exa]mple.com/",
+        ] {
+            assert!(!is_openable_url(bad), "{bad:?}");
+            assert!(!is_link_url(bad), "{bad:?}");
+            assert_eq!(openable_url(bad, true), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn link_address_is_what_a_browser_opens() {
+        let a = |url: &str| {
+            let a = link_address(url);
+            (a.display, a.warn)
+        };
+        let plain = |host: &str| (host.to_string(), false);
+        let warned = |host: &str| (host.to_string(), true);
+        assert_eq!(a("https://www.youtube.com/watch?v=x&t=83s#f"), plain("www.youtube.com"));
+        assert_eq!(a("HTTPS://EXAMPLE.COM/Path"), plain("example.com"));
+        assert_eq!(a("https://example.com:8443/a"), plain("example.com:8443"));
+        assert_eq!(a("https://example.com:443/"), plain("example.com"));
+        assert_eq!(a("http://example.com:080/"), plain("example.com"));
+        assert_eq!(a("https://example.com:080/"), plain("example.com:80"));
+        assert_eq!(a("https://example.com./"), plain("example.com."));
+        assert_eq!(a("https://example.com?x=1"), plain("example.com"));
+        assert_eq!(a("https://example.com/a@b"), plain("example.com"));
+        assert_eq!(a("https://b\u{fc}cher.example/"), warned("xn--bcher-kva.example"));
+        assert_eq!(a("https://fa\u{df}.de/"), warned("xn--fa-hia.de"));
+        assert_eq!(a("https://xn--bcher-kva.example/"), warned("xn--bcher-kva.example"));
+        assert_eq!(a("https://example\u{200b}.com/"), warned("example.com"));
+        assert_eq!(a("https://m\u{fc}nchen.de:8080/"), warned("xn--mnchen-3ya.de:8080"));
+        assert_eq!(a("https://0x7f.1/"), warned("127.0.0.1"));
+        assert_eq!(a("https://2130706433/"), warned("127.0.0.1"));
+        assert_eq!(a("http://192.168.1.1:8080/"), warned("192.168.1.1:8080"));
+        assert_eq!(a("https://[2001:DB8:0:0:0:0:0:1]:8080/"), warned("[2001:db8::1]:8080"));
+        assert_eq!(a("https://1.2.3.4.5/"), warned("1.2.3.4.5"));
+        assert_eq!(a("https://[abc]/"), warned("[abc]"));
+        assert_eq!(a("https://paypa1.com/"), plain("paypa1.com"), "ASCII look-alikes are not detected");
     }
 
     #[test]

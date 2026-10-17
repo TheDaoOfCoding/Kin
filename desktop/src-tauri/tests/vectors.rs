@@ -11,6 +11,7 @@ use axum::body::Body;
 use axum::http::Request;
 use common::*;
 use kin_lib::encoding::*;
+use kin_lib::links;
 use kin_lib::messages::{self, Dedup, Frame, OfferState, OfferedFile, Progress, Receiver, Role};
 use kin_lib::pairing::{SeedState, pair_url};
 use kin_lib::server::{self, ApiError, Peer};
@@ -259,6 +260,17 @@ fn check_outcome(name: &str, out: &messages::Outcome, expect: &Value, frame_id: 
     if let Some(action) = expect.get("action").and_then(Value::as_str) {
         assert_eq!(out.action.vector_name(), Some(action), "{name}: action");
     }
+    // A link that is delivered says what the receiver shows and opens: `expect.link` is the URL as sent and the cleaned title and sourceApp.
+    if let messages::Action::DeliverLink { url, title, source_app, .. } = &out.action {
+        let mut got = json!({ "url": url });
+        if let Some(t) = title {
+            got["title"] = json!(t);
+        }
+        if let Some(a) = source_app {
+            got["sourceApp"] = json!(a);
+        }
+        assert_eq!(&got, &expect["link"], "{name}: the link");
+    }
     // A text that is delivered says whether it is sensitive: `expect.sensitive`, false when the case doesn't say.
     if let messages::Action::DeliverText { sensitive, .. } = &out.action {
         assert_eq!(*sensitive, expect["sensitive"].as_bool().unwrap_or(false), "{name}: sensitive");
@@ -338,6 +350,10 @@ const MESSAGES_SEQUENCE_SCOPE_1_4: &[&str] = &[
     "queue-*",
 ];
 const MESSAGES_INVALID_SCOPE_1_2: &[&str] = &["text-*", "clipboard-*"];
+/// 2B.1: the `link` message (changelog 54). The checks of what the cases are made of are in `links_scope_is_what_the_readme_says`.
+const MESSAGES_VALID_SCOPE_2B1: &[&str] = &["link-*"];
+const MESSAGES_INVALID_SCOPE_2B1: &[&str] = &["link-*"];
+const MESSAGES_SEQUENCE_SCOPE_2B1: &[&str] = &["link-*"];
 const MESSAGES_SEQUENCE_SCOPE_1_2: &[&str] =
     &["handshake-then-text-then-duplicate", "invalid-message-keeps-connection-open", "rejected-message-id-is-not-remembered"];
 
@@ -372,8 +388,9 @@ fn names(cases: &Value) -> Vec<&str> {
 #[test]
 fn messages_valid_and_invalid() {
     let root = load("messages.json");
-    let valid = with(&with(MESSAGES_VALID_SCOPE, MESSAGES_VALID_SCOPE_1_2), MESSAGES_VALID_SCOPE_1_3);
-    let invalid = with(&with(MESSAGES_INVALID_SCOPE, MESSAGES_INVALID_SCOPE_1_2), MESSAGES_INVALID_SCOPE_1_3);
+    let valid = with(&with(&with(MESSAGES_VALID_SCOPE, MESSAGES_VALID_SCOPE_1_2), MESSAGES_VALID_SCOPE_1_3), MESSAGES_VALID_SCOPE_2B1);
+    let invalid =
+        with(&with(&with(MESSAGES_INVALID_SCOPE, MESSAGES_INVALID_SCOPE_1_2), MESSAGES_INVALID_SCOPE_1_3), MESSAGES_INVALID_SCOPE_2B1);
     for (key, scope) in [("valid", valid.as_slice()), ("invalid", invalid.as_slice())] {
         assert_patterns_match(key, scope, &names(&root[key]));
         let mut run = 0;
@@ -416,8 +433,10 @@ fn messages_1_2_scope_is_what_the_readme_says() {
 #[test]
 fn messages_sequences() {
     let root = load("messages.json");
-    let scope =
-        with(&with(&with(MESSAGES_SEQUENCE_SCOPE, MESSAGES_SEQUENCE_SCOPE_1_2), MESSAGES_SEQUENCE_SCOPE_1_3), MESSAGES_SEQUENCE_SCOPE_1_4);
+    let scope = with(
+        &with(&with(&with(MESSAGES_SEQUENCE_SCOPE, MESSAGES_SEQUENCE_SCOPE_1_2), MESSAGES_SEQUENCE_SCOPE_1_3), MESSAGES_SEQUENCE_SCOPE_1_4),
+        MESSAGES_SEQUENCE_SCOPE_2B1,
+    );
     assert_patterns_match("sequences", &scope, &names(&root["sequences"]));
     let mut with_events = 0;
     for seq in root["sequences"].as_array().unwrap() {
@@ -468,6 +487,152 @@ fn messages_sequences() {
         }
     }
     assert!(with_events >= 8, "the 1.4 sequences have events: {with_events}");
+}
+
+/// 2B.1: the `link-*` cases are in the runs above. This pins how many there are, that both directions are covered, and that every invalid one is
+/// `bad_request` with the connection left open.
+#[test]
+fn links_scope_is_what_the_readme_says() {
+    let root = load("messages.json");
+    for (key, scope, at_least) in [
+        ("valid", MESSAGES_VALID_SCOPE_2B1, 18),
+        ("invalid", MESSAGES_INVALID_SCOPE_2B1, 28),
+        ("sequences", MESSAGES_SEQUENCE_SCOPE_2B1, 4),
+    ] {
+        assert_patterns_match(key, scope, &names(&root[key]));
+        let n = root[key].as_array().unwrap().iter().filter(|c| matches(c["name"].as_str().unwrap(), scope)).count();
+        assert!(n >= at_least, "messages.json {key}[]: {n} link cases, expected at least {at_least}");
+    }
+    let valid: Vec<&Value> =
+        root["valid"].as_array().unwrap().iter().filter(|c| c["name"].as_str().unwrap().starts_with("link-")).collect();
+    assert!(valid.iter().any(|c| c["from"] == "pc") && valid.iter().any(|c| c["from"] == "phone"), "links go both ways");
+    for c in valid {
+        assert_eq!(c["expect"]["action"], "deliver_link", "{}", c["name"]);
+    }
+    for c in root["invalid"].as_array().unwrap().iter().filter(|c| c["name"].as_str().unwrap().starts_with("link-")) {
+        assert_eq!(c["expect"]["code"], "bad_request", "{}", c["name"]);
+        let close = if c["state"] == "before_hello" { json!(1002) } else { json!(null) };
+        assert_eq!(c["expect"]["close"], close, "{}: only a link before the hello closes the connection", c["name"]);
+    }
+}
+
+// ----- links.json -------------------------------------------------------------------------------------------------
+
+fn synthesized(c: &Value) -> String {
+    let s = &c["synthesize"];
+    format!(
+        "{}{}{}",
+        s["prefix"].as_str().unwrap(),
+        s["fill"].as_str().unwrap().repeat(s["fillCount"].as_u64().unwrap() as usize),
+        s["suffix"].as_str().unwrap_or("")
+    )
+}
+
+#[test]
+fn links_json_urls() {
+    let root = load("links.json");
+    assert_eq!(root["maxUrlBytes"], links::MAX_URL_BYTES);
+    let mut checked = 0;
+    for c in root["urls"].as_array().unwrap() {
+        let name = c["name"].as_str().unwrap();
+        let text = if c.get("synthesize").is_some() { synthesized(c) } else { c["input"].as_str().unwrap().to_string() };
+        if c.get("synthesize").is_some() {
+            assert_eq!(text.len() as u64, c["synthesize"]["bytes"].as_u64().unwrap(), "{name}: the synthesized size");
+        }
+        assert_eq!(links::is_link_url(&text), c["valid"].as_bool().unwrap(), "{name}");
+        // The same URL in a `link` frame: delivered as it is (an unchanged URL is the same string), or answered with bad_request.
+        let mut dedup = MemoryDedup::default();
+        let mut rx = open_receiver(Role::Phone, &mut dedup);
+        let frame = json!({ "type": "link", "id": "u1", "url": text });
+        let out = rx.handle_frame(Frame::Text(frame.to_string().as_bytes()), &mut dedup);
+        if c["valid"] == true {
+            match out.action {
+                messages::Action::DeliverLink { url, .. } => assert_eq!(url, text, "{name}: delivered unchanged"),
+                other => panic!("{name}: expected a link, got {other:?}"),
+            }
+        } else {
+            assert_eq!(out.reply.as_ref().map(|r| r["code"].clone()), Some(json!("bad_request")), "{name}");
+            assert_eq!(out.reply.as_ref().and_then(|r| r.get("ref")), Some(&json!("u1")), "{name}");
+        }
+        checked += 1;
+    }
+    assert!(checked >= 40, "{checked} URLs");
+}
+
+/// `display[]` (changelog 55): the address the PC shows and whether it has a warning (a warning means it is never opened automatically).
+#[test]
+fn links_json_display() {
+    let root = load("links.json");
+    let cases = root["display"].as_array().unwrap();
+    assert!(cases.len() >= 40, "{} display cases", cases.len());
+    for c in cases {
+        let name = c["name"].as_str().unwrap();
+        let url = c["url"].as_str().unwrap();
+        assert!(links::is_link_url(url), "{name}: the URL is valid");
+        let got = links::link_address(url);
+        assert_eq!(got.display, c["display"].as_str().unwrap(), "{name}: the address");
+        assert_eq!(got.warn, c["warn"].as_bool().unwrap(), "{name}: the warning");
+        // The toast says it: a warning puts the sign in front of the address, and decide() then never opens the link by itself.
+        assert_eq!(got.shown().starts_with('\u{26a0}'), got.warn, "{name}");
+        let decision = kin_lib::phonelinks::decide(true, kin_lib::quiet::UserState::AcceptsNotifications, got.warn);
+        assert_eq!(decision == kin_lib::phonelinks::LinkDecision::Open, !got.warn, "{name}: opened by itself only without a warning");
+    }
+}
+
+#[test]
+fn links_json_titles_and_source_apps() {
+    let root = load("links.json");
+    for (key, max) in [("titles", links::MAX_LINK_TITLE_CHARS), ("sourceApps", links::MAX_LINK_SOURCE_CHARS)] {
+        assert_eq!(root[if key == "titles" { "maxTitleCodePoints" } else { "maxSourceAppCodePoints" }], max);
+        for c in root[key].as_array().unwrap() {
+            let name = c["name"].as_str().unwrap();
+            let got = links::clean_link_text(c["input"].as_str().unwrap(), max);
+            assert_eq!(got.as_deref(), c["expected"].as_str(), "{key} {name}");
+        }
+    }
+}
+
+/// What this PC does with a `link` for a peer whose `hello`s were these: the connection's `wire_form` after the receiver took the hellos.
+#[test]
+fn links_json_send_as_and_text_fallback() {
+    let root = load("links.json");
+    for c in root["sendAs"].as_array().unwrap() {
+        let name = c["name"].as_str().unwrap();
+        let mut dedup = MemoryDedup::default();
+        let mut rx = Receiver::new(Role::Phone);
+        for h in c["hellos"].as_array().unwrap() {
+            let mut hello = json!({ "type": "hello", "id": "h", "protocol": 1, "name": "X", "platform": "android", "appVersion": "0.2.0" });
+            for (k, v) in h.as_object().unwrap() {
+                hello[k] = v.clone();
+            }
+            let out = rx.handle_frame(Frame::Text(hello.to_string().as_bytes()), &mut dedup);
+            assert!(matches!(out.action, messages::Action::HandshakeOk), "{name}: a bad capabilities never fails a hello");
+        }
+        let link = json!({ "type": "link", "id": "L1", "url": "https://example.com/a?t=1", "title": "A page", "sourceApp": "Browser" });
+        let wire = kin_lib::ws::wire_form(link.clone(), rx.peer());
+        match c["expected"].as_str().unwrap() {
+            "link" => assert_eq!(wire, link, "{name}"),
+            "text" => assert_eq!(wire, json!({ "type": "text", "id": "L1", "text": "https://example.com/a?t=1", "isUrl": true }), "{name}"),
+            other => panic!("{name}: {other}"),
+        }
+        // Everything that is not a link goes as it is.
+        let text = json!({ "type": "text", "id": "T1", "text": "x", "isUrl": false });
+        assert_eq!(kin_lib::ws::wire_form(text.clone(), rx.peer()), text, "{name}");
+    }
+    for c in root["textFallback"].as_array().unwrap() {
+        let name = c["name"].as_str().unwrap();
+        let link = json!({ "type": "link", "id": "L1", "url": c["link"]["url"], "title": c["link"]["title"], "sourceApp": c["link"]["sourceApp"] });
+        let wire = kin_lib::ws::wire_form(link, None);
+        let mut expected = c["expected"].clone();
+        expected["id"] = json!("L1");
+        assert_eq!(wire, expected, "{name}");
+    }
+}
+
+/// This PC says in its own `hello` that it understands `link` (the phone sends a `link` only to a peer that says so).
+#[test]
+fn the_pcs_hello_lists_the_link_capability() {
+    assert_eq!(messages::CAPABILITIES, ["link"]);
 }
 
 #[test]

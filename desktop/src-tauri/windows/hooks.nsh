@@ -66,6 +66,23 @@
     ; ... and as the signed-in user, in case the installer was started as another account. This runs without elevation, in the user's own
     ; session, and does not wait: it needs nothing of ours. It also removes the Run value, which the template removes for this context only.
     nsis_tauri_utils::RunAsUser "cmd.exe" '/d /c "del /f /q "%APPDATA%\Microsoft\Windows\SendTo\Kin.lnk" & reg delete HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v Kin /f"'
+
+    ; The keys that tell the browsers where Kin's native messaging host is (milestone 2B.1, docs/extension.md "Registry keys"). The app writes them
+    ; itself at every start, as the signed-in user (desktop/src-tauri/src/nativehost/registry.rs), so they are removed here in BOTH contexts too:
+    ; this one, and the signed-in user's. **Exactly these six keys of the release host name, nothing else under the browsers' keys** (the dev host name
+    ; app.kinrelay.dev is never registered by Kin). Opera shares the Chrome key. The manifests in %APPDATA%\Kin\native-messaging go too (they are
+    ; made again at the next start; the rest of that folder is the user's data and stays).
+    DetailPrint "Removing the browser extension's host keys"
+    DeleteRegKey HKCU "Software\Google\Chrome\NativeMessagingHosts\app.kinrelay.desktop"
+    DeleteRegKey HKCU "Software\Chromium\NativeMessagingHosts\app.kinrelay.desktop"
+    DeleteRegKey HKCU "Software\Microsoft\Edge\NativeMessagingHosts\app.kinrelay.desktop"
+    DeleteRegKey HKCU "Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\app.kinrelay.desktop"
+    DeleteRegKey HKCU "Software\Vivaldi\NativeMessagingHosts\app.kinrelay.desktop"
+    DeleteRegKey HKCU "Software\Mozilla\NativeMessagingHosts\app.kinrelay.desktop"
+    nsis_tauri_utils::RunAsUser "cmd.exe" '/d /c "reg delete HKCU\Software\Google\Chrome\NativeMessagingHosts\app.kinrelay.desktop /f & reg delete HKCU\Software\Chromium\NativeMessagingHosts\app.kinrelay.desktop /f & reg delete HKCU\Software\Microsoft\Edge\NativeMessagingHosts\app.kinrelay.desktop /f & reg delete HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\app.kinrelay.desktop /f & reg delete HKCU\Software\Vivaldi\NativeMessagingHosts\app.kinrelay.desktop /f & reg delete HKCU\Software\Mozilla\NativeMessagingHosts\app.kinrelay.desktop /f & if defined APPDATA rd /s /q "%APPDATA%\Kin\native-messaging""'
+    SetShellVarContext current
+    RmDir /r "$APPDATA\Kin\native-messaging"
+    SetShellVarContext all
   ${EndIf}
 !macroend
 

@@ -71,6 +71,21 @@ impl Core {
         Ok(self.received_dir())
     }
 
+    /// "Open links from phone automatically": on by default. Takes effect for the next link.
+    pub fn set_open_links_automatically(&self, on: bool) {
+        let changed = {
+            let mut s = lock(&self.settings);
+            let changed = s.open_links_automatically != on;
+            s.open_links_automatically = on;
+            changed
+        };
+        if changed {
+            log::info!("open links from the phone automatically: {}", if on { "on" } else { "off" });
+            self.save_settings("open links automatically");
+            self.emit(Event::StateChanged);
+        }
+    }
+
     /// Remembers the hotkey after the window has registered it (the registration itself needs the app, see `ui::set_hotkey`).
     pub fn store_hotkey(&self, accelerator: &str) {
         lock(&self.settings).hotkey = accelerator.to_string();
@@ -88,6 +103,7 @@ impl Core {
             "defaultDeviceName": self.default_pc_name(),
             "autoClipboardSync": s.auto_clipboard_sync,
             "imagesToClipboard": s.images_to_clipboard,
+            "openLinksAutomatically": s.open_links_automatically,
             "receivedFolder": self.received_dir().to_string_lossy(),
             "receivedFolderIsDefault": s.received_folder.is_none() && self.config.dev_received_dir.is_none(),
             "hotkey": { "accelerator": hotkey.accelerator, "registered": hotkey.registered, "error": hotkey.error },

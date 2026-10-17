@@ -12,6 +12,9 @@
 //!
 //! * `--send-text <text>` sends one `text` message `--send-text-after` seconds (default 2) after the `hello`, with `isUrl` set when the
 //!   whole text is one http(s) link, and prints how long its `ack` took. Repeat the flag to send several, one per second.
+//! * (2B.1) The phone says `"capabilities": ["link"]` in its `hello` (`--old-phone` leaves it out, like a 0.1.x phone). `--send-link <url>` (repeat it;
+//!   `--send-link-title <title>` gives each a title) sends a `link` message the way `--send-text` sends a text. A `link` from the PC is acked and printed as
+//!   `received link id=<id> url=<url> title=<title> sourceApp=<app>`.
 //! * `--no-ack` doesn't ack `text` and `clipboard` from the PC (to see the PC's 5 s ack timeout and its notice).
 //! * What it receives is printed on one line each, for scripts to look for: `received clipboard id=<id> text=<text>` and
 //!   `received text id=<id> isUrl=<bool> text=<text>`. (This is a developer tool: it prints the text. Kin itself never logs it.)
@@ -103,6 +106,15 @@ impl ServerCertVerifier for Pinned {
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.algs.supported_schemes()
     }
+}
+
+/// The phone's `hello`. A 2B.1 phone lists the `link` capability; `--old-phone` is a 0.1.x phone, which doesn't.
+fn hello_of(name: &str, id: &str, old_phone: bool) -> Value {
+    let mut hello = json!({ "type": "hello", "id": id, "protocol": 1, "name": name, "platform": "android", "appVersion": "0.0.0" });
+    if !old_phone {
+        hello["capabilities"] = json!(["link"]);
+    }
+    hello
 }
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -456,7 +468,14 @@ async fn main() {
     let name = arg(&args, "--name").unwrap_or_else(|| "Fake Phone".to_string());
     let seconds: u64 = arg(&args, "--seconds").map_or(30, |s| s.parse().unwrap());
     let ping_every: Option<u64> = arg(&args, "--ping-every").map(|s| s.parse().unwrap());
-    let texts = all_args(&args, "--send-text");
+    let old_phone = args.iter().any(|a| a == "--old-phone");
+    let link_title = arg(&args, "--send-link-title");
+    // What the phone sends on its own: texts and links, one a second.
+    let texts: Vec<(&'static str, String)> = all_args(&args, "--send-text")
+        .into_iter()
+        .map(|t| ("text", t))
+        .chain(all_args(&args, "--send-link").into_iter().map(|u| ("link", u)))
+        .collect();
     let send_text_after: u64 = arg(&args, "--send-text-after").map_or(2, |s| s.parse().unwrap());
     let no_ack = args.iter().any(|a| a == "--no-ack");
     let mut uploads: Vec<Upload> = all_args(&args, "--upload")
@@ -538,7 +557,7 @@ async fn main() {
     // WebSocket.
     let (mut ws, _) =
         tokio_tungstenite::client_async(format!("ws://{host}:{port}/v1/ws"), net.connect().await).await.expect("WebSocket upgrade");
-    let hello = json!({ "type": "hello", "id": "fake-hello", "protocol": 1, "name": name, "platform": "android", "appVersion": "0.0.0" });
+    let hello = hello_of(&name, "fake-hello", old_phone);
     ws.send(Message::Text(hello.to_string().into())).await.unwrap();
     say("connected, hello sent");
     let mut hello_sent_at = Instant::now();
@@ -579,7 +598,7 @@ async fn main() {
                     let (new_ws, _) = tokio_tungstenite::client_async(format!("ws://{host}:{port}/v1/ws"), net.connect().await).await.expect("WebSocket upgrade after the reconnect");
                     ws = new_ws;
                     hellos += 1;
-                    let hello = json!({ "type": "hello", "id": format!("fake-hello-{hellos}"), "protocol": 1, "name": name, "platform": "android", "appVersion": "0.0.0" });
+                    let hello = hello_of(&name, &format!("fake-hello-{hellos}"), old_phone);
                     ws.send(Message::Text(hello.to_string().into())).await.unwrap();
                     hello_sent_at = Instant::now();
                     say(&format!("reconnected at={} (hello sent)", unix_ms()));
@@ -591,11 +610,19 @@ async fn main() {
                     tokio::spawn(async move { upload(&net, uploads, upload_cut).await });
                     continue;
                 }
-                if let Some((i, text)) = pending_text.take().filter(|_| Instant::now() >= next_text) {
-                    let id = format!("fake-text-{}", i + 1);
-                    let frame = json!({ "type": "text", "id": id, "text": text, "isUrl": is_url(&text) });
+                if let Some((i, (kind, text))) = pending_text.take().filter(|_| Instant::now() >= next_text) {
+                    let id = format!("fake-{kind}-{}", i + 1);
+                    let frame = if kind == "link" {
+                        let mut f = json!({ "type": "link", "id": id, "url": text, "sourceApp": "Fake Phone" });
+                        if let Some(t) = &link_title {
+                            f["title"] = json!(t);
+                        }
+                        f
+                    } else {
+                        json!({ "type": "text", "id": id, "text": text, "isUrl": is_url(&text) })
+                    };
                     ws.send(Message::Text(frame.to_string().into())).await.unwrap();
-                    say(&format!("sent text id={id} isUrl={}", is_url(&text)));
+                    say(&format!("sent {kind} id={id} isUrl={}", is_url(&text)));
                     text_sent = Some((id, Instant::now()));
                     pending_text = texts.next();
                     next_text = Instant::now() + Duration::from_secs(1);
@@ -628,6 +655,20 @@ async fn main() {
                                 say(&format!("ack for {id} after {} ms", at.elapsed().as_millis()));
                             } else if let Some((id, at)) = text_sent.take().filter(|(id, _)| v["ref"] == *id) {
                                 say(&format!("ack for text {id} after {} ms", at.elapsed().as_millis()));
+                            }
+                        }
+                        Some("link") => {
+                            say(&format!(
+                                "received link id={} url={} title={} sourceApp={}",
+                                v["id"],
+                                v["url"].as_str().unwrap_or(""),
+                                v["title"].as_str().unwrap_or(""),
+                                v["sourceApp"].as_str().unwrap_or("")
+                            ));
+                            if no_ack {
+                                say("not acking (--no-ack)");
+                            } else {
+                                ws.send(Message::Text(json!({ "type": "ack", "ref": v["id"] }).to_string().into())).await.unwrap();
                             }
                         }
                         Some(kind @ ("clipboard" | "text")) => {

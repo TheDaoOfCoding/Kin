@@ -33,7 +33,18 @@ fn hello_frame(core: &Core) -> serde_json::Value {
         "name": core.pc_name(),
         "platform": "windows",
         "appVersion": APP_VERSION,
+        "capabilities": messages::CAPABILITIES,
     })
+}
+
+/// A `link` goes on the wire as a `link` only to a peer whose latest `hello` lists the `link` capability. To any other peer (a 0.1.x phone) the same
+/// item goes as a `text`: the same `id`, the URL as the text, `isUrl` true, no title (protocol.md, "Versioning"). The choice is made here, when the
+/// message goes out, so a link that waited in the queue is sent in the form the peer understands now. Every other frame is left alone.
+pub fn wire_form(frame: serde_json::Value, peer: Option<&messages::Peer>) -> serde_json::Value {
+    if frame["type"] != "link" || peer.is_some_and(|p| p.has("link")) {
+        return frame;
+    }
+    json!({ "type": "text", "id": frame["id"], "text": frame["url"], "isUrl": true })
 }
 
 /// Remembers message IDs in the database, so a repeat gets the same answer even after a restart.
@@ -241,6 +252,12 @@ impl Conn {
                 let from = self.receiver.peer().map_or("phone".to_string(), |p| p.name.clone());
                 self.core.receive_text(&self.device_id, &from, &id, text, is_url, sensitive).await;
             }
+            // A link is opened (or offered) by the core, which also decides about fullscreen programs. It never goes to the clipboard.
+            // It runs as a task of its own: opening a browser can take a moment and the connection's task must go on answering pings and acks.
+            Action::DeliverLink { id, url, title, source_app } => {
+                let (core, device_id) = (self.core.clone(), self.device_id.clone());
+                tokio::spawn(async move { core.receive_link(&device_id, &id, url, title, source_app).await });
+            }
             // The control channel never waits for files: what these do (stopping a writer, deleting partial files) runs on its own.
             Action::MarkTransferDone { transfer_id } => {
                 let (core, device_id) = (self.core.clone(), self.device_id.clone());
@@ -286,10 +303,11 @@ impl Conn {
         let _ = self.core.db.touch(&self.device_id, unix_ms() as i64, Some(&self.remote.to_string()));
         self.core.connections.mark_open(&self.device_id, self.conn_id);
         log::info!(
-            "phone connected: {:?} ({}, app {}) device {} from {}",
+            "phone connected: {:?} ({}, app {}, capabilities {:?}) device {} from {}",
             peer.name,
             peer.platform,
             peer.app_version,
+            peer.capabilities.iter().take(16).map(|c| crate::encoding::truncate_chars(c, 32)).collect::<Vec<_>>(),
             short(&self.device_id),
             self.remote
         );
@@ -307,13 +325,16 @@ impl Conn {
                 let frame = json!({ "type": "ping", "id": id, "sentAt": unix_ms() });
                 self.send_tracked(id, frame, reply).await
             }
-            ConnCommand::Send { frame, reply } => match frame.get("id").and_then(|v| v.as_str()).map(str::to_string) {
-                Some(id) => self.send_tracked(id, frame, reply).await,
-                None => {
-                    let _ = reply.send(SendOutcome::Failed("internal".into()));
-                    None
+            ConnCommand::Send { frame, reply } => {
+                let frame = wire_form(frame, self.receiver.peer());
+                match frame.get("id").and_then(|v| v.as_str()).map(str::to_string) {
+                    Some(id) => self.send_tracked(id, frame, reply).await,
+                    None => {
+                        let _ = reply.send(SendOutcome::Failed("internal".into()));
+                        None
+                    }
                 }
-            },
+            }
             // The device name was changed in the settings: the phone learns it from a later `hello` (protocol.md, "Opening handshake":
             // a `hello` after the first one is handled the same way and is not acked).
             ConnCommand::Hello => match self.send(&hello_frame(&self.core)).await {

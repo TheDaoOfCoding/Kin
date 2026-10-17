@@ -15,6 +15,10 @@ use crate::identity::Identity;
 use crate::instance;
 use crate::links::ShellOpener;
 use crate::mdns::Advertiser;
+use crate::nativehost::api::{Api, OpenHook, OpenTarget};
+use crate::nativehost::imagefetch::HttpFetcher;
+use crate::nativehost::pipe::{Handler, PipeServer, Reply};
+use crate::nativehost::{self, HostKind, registry};
 use crate::server::{self, ServerHandle};
 use crate::storage::Db;
 use crate::sync::{HotkeyStatus, Tap};
@@ -28,6 +32,8 @@ pub struct AppState {
     tray: Tray,
     server: Mutex<Option<ServerHandle>>,
     advertiser: Mutex<Option<Advertiser>>,
+    /// The pipe the browser extension's host connects to (nativehost/). `None` if the name was taken, or the app is shutting down.
+    native_pipe: Mutex<Option<PipeServer>>,
 }
 
 pub fn run(parsed: Parsed) {
@@ -94,6 +100,7 @@ pub fn run(parsed: Parsed) {
             ui::set_device_name,
             ui::set_auto_clipboard_sync,
             ui::set_images_to_clipboard,
+            ui::set_open_links_automatically,
             ui::choose_received_folder,
             ui::reset_received_folder,
             ui::set_hotkey,
@@ -180,7 +187,10 @@ fn setup(app: &mut tauri::App, parsed: Parsed, aumid: std::result::Result<(), St
     let (win_clipboard, clipboard_changes) = WinClipboard::start()?;
     // An instance beside the installed Kin writes everything it puts on the clipboard so that the installed Kin skips it (clipboard.rs).
     let win_clipboard = win_clipboard.quiet(config.instance_key().is_some());
-    let services = Services { clipboard: Arc::new(win_clipboard), opener: Arc::new(ShellOpener), clock: Arc::new(MonotonicClock::new()) };
+    // `--dev-no-open`: a test run never starts a browser or Explorer (it logs that it would have).
+    let opener: Arc<dyn crate::links::UrlOpener> =
+        if config.dev_no_open { Arc::new(crate::links::LogOnlyOpener) } else { Arc::new(ShellOpener) };
+    let services = Services { clipboard: Arc::new(win_clipboard), opener, clock: Arc::new(MonotonicClock::new()) };
     let core = Arc::new(Core::new(config, loaded.identity, db, computer_name(), events_tx, services));
 
     let server = tauri::async_runtime::block_on(server::start(core.clone()))?;
@@ -211,8 +221,17 @@ fn setup(app: &mut tauri::App, parsed: Parsed, aumid: std::result::Result<(), St
         }
     };
     let for_integration = autostart.clone();
-    app.manage(AppState { core: core.clone(), autostart, tray, server: Mutex::new(Some(server)), advertiser: Mutex::new(advertiser) });
+    let native_pipe = start_native_pipe(app, &core);
+    app.manage(AppState {
+        core: core.clone(),
+        autostart,
+        tray,
+        server: Mutex::new(Some(server)),
+        advertiser: Mutex::new(advertiser),
+        native_pipe: Mutex::new(native_pipe),
+    });
     integrate_with_windows(&core, for_integration, loaded.created);
+    register_native_host(&core);
 
     let handle = app.handle().clone();
     tauri::async_runtime::spawn(event_loop(handle.clone(), core.clone(), events_rx));
@@ -254,6 +273,79 @@ fn setup(app: &mut tauri::App, parsed: Parsed, aumid: std::result::Result<(), St
     refresh(&handle, &core);
     handle_commands(&handle, &commands);
     Ok(())
+}
+
+/// The extension pipe (nativehost/pipe.rs): `\\.\pipe\app.kinrelay.desktop.<SID>` for the installed Kin, the dev pipe `app.kinrelay.dev.<SID>` for every
+/// other Kin, so a test or a build run never answers the user's extension and the user's Kin never answers a test. If the name is taken (someone
+/// else made it first) Kin says so and runs without the pipe: it never falls back to a pipe that others could have squatted.
+fn start_native_pipe(app: &tauri::App, core: &Arc<Core>) -> Option<PipeServer> {
+    let kind = HostKind::for_config(&core.config);
+    let sid = match nativehost::current_user_sid() {
+        Ok(sid) => sid,
+        Err(e) => {
+            log::warn!("extension pipe: the user's SID is not known ({e}); the browser extension can't reach Kin");
+            return None;
+        }
+    };
+    let suffix = std::env::var("KIN_DEV_PIPE_SUFFIX").ok();
+    let name = kind.pipe_name(&sid, suffix.as_deref());
+    let handle = app.handle().clone();
+    // "Open Kin" of the extension: the window that shows pairing, or the drop window ("Send to phone"), Kin's one main window.
+    let open: OpenHook = Arc::new(move |target| {
+        // A request can arrive in the moment before the app's state is set up: then there is nothing to open yet.
+        if handle.try_state::<AppState>().is_none() {
+            return;
+        }
+        match target {
+            OpenTarget::Pairing => ui::open_pairing_window(&handle, true),
+            OpenTarget::Main => ui::open_drop_window(&handle),
+        }
+    });
+    let api = Arc::new(Api::new(core.clone(), Arc::new(HttpFetcher::new()), Some(open)));
+    let handler: Handler = Arc::new(move |body| {
+        let api = api.clone();
+        Box::pin(async move { Reply::Respond(api.handle(&body).await) })
+    });
+    let runtime = tauri::async_runtime::block_on(async { tokio::runtime::Handle::current() });
+    match PipeServer::start(&name, handler, runtime) {
+        Ok(server) => {
+            log::info!("extension pipe: listening as {} ({:?} host)", name.rsplit('\\').next().unwrap_or("?"), kind);
+            Some(server)
+        }
+        Err(e) => {
+            log::warn!("extension pipe: could not be made ({e}); Kin runs without it and the browser extension can't reach it");
+            None
+        }
+    }
+}
+
+/// The native messaging host manifests and the `HKCU` keys of the browsers (nativehost/registry.rs), written as the signed-in user at every start.
+/// Only the installed Kin does it (`registry::may_register_release`): a debug build, a developer setting, a data directory of its own or a run
+/// from a build folder never touches these keys.
+fn register_native_host(core: &Arc<Core>) {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            log::warn!("native host: the path of Kin.exe is not known ({e})");
+            return;
+        }
+    };
+    if !registry::may_register_release(&core.config, &exe) {
+        log::info!(
+            "native host: not a normal release run (or kin-native-host.exe is not beside Kin.exe): the browser keys are not touched"
+        );
+        return;
+    }
+    let (data_dir, host_exe) = (core.config.data_dir.clone(), registry::host_exe_next_to(&exe));
+    tauri::async_runtime::spawn_blocking(move || match registry::register(HostKind::Release, "Software", &data_dir, &host_exe) {
+        Ok(report) => log::info!(
+            "native host: manifests written {}, browser keys written {}, already right {}",
+            report.manifests_written,
+            report.keys_written,
+            report.keys_already_right
+        ),
+        Err(e) => log::warn!("native host: registering for the browsers failed: {e}"),
+    });
 }
 
 /// The part of the installation that is the user's (integration.rs): the "Send to" shortcut and "Start with Windows" are made what the person
@@ -327,6 +419,7 @@ async fn event_loop(app: AppHandle, core: Arc<Core>, mut events: tokio::sync::mp
             Event::ToastRedacted { text, log_text } => toast_logged(&app, &core, &text, &log_text),
             Event::TextToast { id, from, preview, has_link } => text_toast(&app, &core, id, &from, &preview, has_link),
             Event::FilesToast { id, title, body, single, openable } => files_toast(&app, &core, id, &title, &body, single, openable),
+            Event::LinkToast { id, title, body, opened } => link_toast(&app, &core, id, &title, &body, opened),
         }
     }
 }
@@ -412,6 +505,23 @@ fn files_toast(app: &AppHandle, core: &Core, id: u32, title: &str, body: &str, s
     }
 }
 
+/// "Opened link from phone" (button Copy) or "Link from phone" (buttons Open and Copy). The body is the title and the real host. The log gets
+/// the title of the toast and the length of the body, not the body: a page title is the sender's text.
+fn link_toast(app: &AppHandle, core: &Core, id: u32, title: &str, body: &str, opened: bool) {
+    log::info!("toast: {title} ({} characters shown)", body.chars().count());
+    if core.config.toasts_are_logged_only() {
+        return;
+    }
+    let kind = if opened { ACTIONS_LINK_OPENED } else { ACTIONS_LINK_OFFER };
+    if let Err(e) = app.notification().builder().id(id as i32).title(title).body(body).action_type_id(kind).show() {
+        log::warn!("showing a toast failed: {e}");
+    }
+}
+
+/// The buttons of the toast of a link from the phone: "Copy" after it was opened, "Open" and "Copy" when it was not.
+const ACTIONS_LINK_OPENED: &str = "link_opened";
+const ACTIONS_LINK_OFFER: &str = "link_offer";
+
 /// The buttons of a toast for one received file ("Open", "Show in folder"), for one whose type may not be opened ("Show in folder"
 /// alone: see `links::may_open_file`) and for several ("Open folder"). A click on the toast itself does what the first button does.
 const ACTIONS_ONE_FILE: &str = "received_file";
@@ -426,7 +536,11 @@ fn register_toast_buttons(app: &AppHandle) {
     let show_only =
         ActionType::builder(ACTIONS_ONE_FILE_SHOW_ONLY).actions(vec![Action::builder("show", "Show in folder").build()]).build();
     let several = ActionType::builder(ACTIONS_SEVERAL_FILES).actions(vec![Action::builder("open", "Open folder").build()]).build();
-    if let Err(e) = app.notification().register_action_types(vec![one, show_only, several]) {
+    let link_opened = ActionType::builder(ACTIONS_LINK_OPENED).actions(vec![Action::builder("copy", "Copy").build()]).build();
+    let link_offer = ActionType::builder(ACTIONS_LINK_OFFER)
+        .actions(vec![Action::builder("open", "Open").build(), Action::builder("copy", "Copy").build()])
+        .build();
+    if let Err(e) = app.notification().register_action_types(vec![one, show_only, several, link_opened, link_offer]) {
         log::warn!("toast buttons are not available: {e}");
     }
 }
@@ -437,13 +551,20 @@ fn register_toast_buttons(app: &AppHandle) {
 fn register_toast_clicks(app: &AppHandle, core: &Arc<Core>) {
     let core = core.clone();
     let registered = app.notification().on_action(move |performed| {
-        // "tap" is a click on the toast, "open" and "show" are its buttons. Anything else (a dismissal) does nothing.
+        // "tap" is a click on the toast, "open", "show" and "copy" are its buttons. Anything else (a dismissal) does nothing.
         let action = performed.action_id();
-        if !matches!(action, "tap" | "open" | "show") {
+        if !matches!(action, "tap" | "open" | "show" | "copy") {
             return;
         }
         if let Some(id) = performed.notification().map(|n| n.id() as u32) {
-            core.toast_action(id, action);
+            if action == "copy" {
+                let core = core.clone();
+                tauri::async_runtime::spawn(async move {
+                    core.toast_copy(id).await;
+                });
+            } else {
+                core.toast_action(id, action);
+            }
         }
     });
     register_toast_buttons(app);
@@ -619,6 +740,9 @@ fn quit(app: &AppHandle) {
         if let Some(advertiser) = state.advertiser.lock().ok().and_then(|mut a| a.take()) {
             advertiser.stop();
         }
+        if let Some(mut pipe) = state.native_pipe.lock().ok().and_then(|mut p| p.take()) {
+            pipe.stop();
+        }
         // Remove the icon first, otherwise Windows can leave a ghost icon until it is hovered.
         let _ = app.remove_tray_by_id(tray::TRAY_ID);
         app.exit(0);
@@ -750,6 +874,10 @@ fn dev_set(app: &AppHandle, core: &Arc<Core>, key: &str, value: &str) {
         }
         "imagesToClipboard" => {
             core.set_images_to_clipboard(on);
+            write(true, on.to_string());
+        }
+        "openLinksAutomatically" => {
+            core.set_open_links_automatically(on);
             write(true, on.to_string());
         }
         "receivedFolder" => match core.set_received_folder(Some(value)) {

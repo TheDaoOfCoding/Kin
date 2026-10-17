@@ -112,6 +112,8 @@ impl Core {
             "names": r.files.iter().take(3).map(|f| f.name.clone()).collect::<Vec<_>>(),
             "text": r.text.as_deref().map(|t| one_line(t, TEXT_PREVIEW_CHARS)),
             "isUrl": r.is_url,
+            "isLink": r.is_link,
+            "title": r.title.as_deref().map(|t| one_line(t, TEXT_PREVIEW_CHARS)),
             "retryOf": r.retry_of.as_deref().map(short_transfer),
             "retried": r.retried,
             "canOpen": !matches!(open_action(r), OpenAction::Nothing),
@@ -207,6 +209,8 @@ mod tests {
             retried: false,
             text: (kind == "text").then(|| "hello".to_string()),
             is_url: false,
+            is_link: false,
+            title: None,
             files: files
                 .iter()
                 .map(|p| HistoryFile { name: "n".into(), size: 1, local_path: Some((*p).into()), finalized: true })

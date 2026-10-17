@@ -205,15 +205,27 @@ impl Core {
     /// A text over 128 KiB goes as a `.txt` file through the same path (protocol.md, "Text messages"). The text is written to a
     /// file of our own, which is removed when the transfer ends (or at the latest when the offer expires).
     pub async fn send_text_file(self: &Arc<Self>, text: &str) -> SendResult {
+        self.send_text_file_to(None, text).await
+    }
+
+    /// The same for a named phone (the browser extension may pick one).
+    pub async fn send_text_file_to(self: &Arc<Self>, device: Option<&str>, text: &str) -> SendResult {
+        self.send_temp_file(device, TEXT_FILE_NAME, text.as_bytes()).await.0
+    }
+
+    /// Writes `bytes` to a file of our own named `name` (already cleaned), offers it to `device` (`None`: the default phone) through the ordinary
+    /// file transfer, and waits for the phone's `ack` if it is connected (the offer is queued either way). The file is removed when the transfer
+    /// ends. Returns how it came out and the transfer's ID. (A long text, and an image that the browser extension sent.)
+    pub async fn send_temp_file(self: &Arc<Self>, device: Option<&str>, name: &str, bytes: &[u8]) -> (SendResult, Option<String>) {
         let folder = self.config.data_dir.join(OUTGOING_DIR).join(uuid_v7(unix_ms()));
-        let path = folder.join(TEXT_FILE_NAME);
-        let (write_folder, write_path, bytes) = (folder.clone(), path.clone(), text.as_bytes().to_vec());
+        let path = folder.join(name);
+        let (write_folder, write_path, bytes) = (folder.clone(), path.clone(), bytes.to_vec());
         let written = tokio::task::spawn_blocking(move || {
             let written = std::fs::create_dir_all(&write_folder).and_then(|()| std::fs::write(&write_path, &bytes));
             match written {
                 Ok(()) => std::fs::metadata(&write_path),
                 Err(e) => {
-                    log::error!("writing the text file failed: {e}");
+                    log::error!("writing the file to send failed: {e}");
                     let _ = std::fs::remove_dir_all(&write_folder);
                     Err(e)
                 }
@@ -221,18 +233,20 @@ impl Core {
         })
         .await;
         let Ok(Ok(meta)) = written else {
-            return SendResult::Rejected("internal".to_string());
+            return (SendResult::Rejected("internal".to_string()), None);
         };
-        let source = Source { path, name: TEXT_FILE_NAME.to_string(), size: meta.len(), mtime_ms: mtime_ms(&meta), temp: true };
-        let Some((id, mut rx)) = self.enqueue_offer(std::slice::from_ref(&source), None) else {
+        let source = Source { path, name: name.to_string(), size: meta.len(), mtime_ms: mtime_ms(&meta), temp: true };
+        let Some((id, mut rx)) = self.enqueue_offer_to(device, std::slice::from_ref(&source), None) else {
             remove_temp_source(&source.path);
-            return if self.snapshot().devices.is_empty() { SendResult::NoPhonePaired } else { SendResult::Rejected("internal".into()) };
+            let result =
+                if self.snapshot().devices.is_empty() { SendResult::NoPhonePaired } else { SendResult::Rejected("internal".into()) };
+            return (result, None);
         };
         if self.connections.most_recent_open().is_some() {
             self.flush_queue().await;
         }
         self.queue.forget(&id);
-        rx.try_recv().unwrap_or(SendResult::PhoneOffline)
+        (rx.try_recv().unwrap_or(SendResult::PhoneOffline), Some(id))
     }
 
     pub(crate) fn offer_failed_toast(&self, result: &SendResult, phone: Option<&str>) {

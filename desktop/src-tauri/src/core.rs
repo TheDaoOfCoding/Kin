@@ -51,6 +51,15 @@ pub enum Event {
         preview: String,
         has_link: bool,
     },
+    /// A link from the phone (2B.1). `opened`: it was opened in the browser ("Opened link from phone", button Copy); otherwise it is offered
+    /// ("Link from phone", buttons Open and Copy). `body` is the title and the real host. The URL itself is behind the toast's target
+    /// (`Core::toast_action`), never in the event and never in a log.
+    LinkToast {
+        id: u32,
+        title: String,
+        body: String,
+        opened: bool,
+    },
     /// "3 files from <phone>". A click opens the file (one file) or the folder (`Core::toast_clicked`).
     FilesToast {
         id: u32,
@@ -200,6 +209,8 @@ pub struct Core {
     pub(crate) clipboard: Arc<dyn Clipboard>,
     pub(crate) opener: Arc<dyn UrlOpener>,
     pub(crate) clock: Arc<dyn Clock>,
+    /// Whether the user is in a fullscreen program (quiet.rs). The real one unless a test says otherwise (`set_user_state_probe`).
+    user_state: Mutex<Arc<dyn crate::quiet::UserStateProbe>>,
 }
 
 /// What the core uses from the outside world. The app passes the real ones, the tests pass fakes.
@@ -273,6 +284,7 @@ impl Core {
             clipboard: services.clipboard,
             opener: services.opener,
             clock: services.clock,
+            user_state: Mutex::new(Arc::new(crate::quiet::WindowsUserState)),
         };
         core.recover_transfers();
         core.prune_storage(unix_ms() as i64);
@@ -291,6 +303,17 @@ impl Core {
 
     pub(crate) fn set_shown_pc_name(&self, name: String) {
         *lock(&self.pc_name) = name;
+    }
+
+    /// What the user is doing right now (a fullscreen game, a presentation, quiet time, or nothing special).
+    pub fn user_state(&self) -> Arc<dyn crate::quiet::UserStateProbe> {
+        lock(&self.user_state).clone()
+    }
+
+    /// For tests: pretend a fullscreen game (or anything else) is running.
+    #[doc(hidden)]
+    pub fn set_user_state_probe(&self, probe: Arc<dyn crate::quiet::UserStateProbe>) {
+        *lock(&self.user_state) = probe;
     }
 
     pub fn emit(&self, event: Event) {

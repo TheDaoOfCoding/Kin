@@ -120,6 +120,9 @@ pub struct Settings {
     pub images_to_clipboard: bool,
     /// The name this PC shows to the phone (1.4, the settings window). `None`: the computer's own name.
     pub device_name: Option<String>,
+    /// "Open links from phone automatically" (2B.1, on by default): a `link` from the phone opens in the default browser at once. Off: a toast
+    /// with Open and Copy. A fullscreen game or a presentation always gets the toast (phonelinks.rs).
+    pub open_links_automatically: bool,
 }
 
 impl Default for Settings {
@@ -130,6 +133,7 @@ impl Default for Settings {
             received_folder: None,
             images_to_clipboard: true,
             device_name: None,
+            open_links_automatically: true,
         }
     }
 }
@@ -164,6 +168,11 @@ impl Settings {
             Some(Value::Bool(b)) => settings.images_to_clipboard = *b,
             Some(_) => problems.push("imagesToClipboard must be true or false".to_string()),
         }
+        match obj.get("openLinksAutomatically") {
+            None | Some(Value::Null) => {}
+            Some(Value::Bool(b)) => settings.open_links_automatically = *b,
+            Some(_) => problems.push("openLinksAutomatically must be true or false".to_string()),
+        }
         match obj.get("deviceName") {
             None | Some(Value::Null) => {}
             Some(Value::String(s)) => settings.device_name = clean_device_name(s),
@@ -179,6 +188,7 @@ impl Settings {
             "receivedFolder": self.received_folder,
             "imagesToClipboard": self.images_to_clipboard,
             "deviceName": self.device_name,
+            "openLinksAutomatically": self.open_links_automatically,
         })
     }
 
@@ -368,6 +378,7 @@ mod tests {
             received_folder: Some("D:/Received".into()),
             images_to_clipboard: false,
             device_name: Some("Desk".into()),
+            open_links_automatically: false,
         };
         s.save(dir.path()).unwrap();
         assert_eq!(Settings::load(dir.path()), s);

@@ -136,6 +136,12 @@ impl Drop for Claim<'_> {
     }
 }
 
+/// What a text item holds: a text, or (2B.1) a link with its title and the app that shared it.
+pub enum TextBody<'a> {
+    Text { text: &'a str, is_url: bool },
+    Link { url: &'a str, title: Option<&'a str>, source_app: Option<&'a str> },
+}
+
 /// How a queued send came out for the caller that waits for it.
 fn outcome_of(rx: &mut oneshot::Receiver<SendResult>, fallback: SendResult) -> SendResult {
     rx.try_recv().unwrap_or(fallback)
@@ -165,8 +171,17 @@ impl Core {
     }
 
     /// The phone that new items are for: the connected one, else the one paired last. `None` when no phone is paired.
-    fn queue_target(&self) -> Option<String> {
+    pub(crate) fn queue_target(&self) -> Option<String> {
         self.snapshot().headline_device().map(|d| d.device_id.clone())
+    }
+
+    /// The phone an item is for when the sender may name one (the browser extension does): that device if it is paired (`None` if not), else
+    /// the default one.
+    pub(crate) fn queue_target_for(&self, device: Option<&str>) -> Option<String> {
+        match device {
+            Some(id) => self.db.is_paired(id).unwrap_or(false).then(|| id.to_string()),
+            None => self.queue_target(),
+        }
     }
 
     fn phone_connected(&self) -> bool {
@@ -189,14 +204,38 @@ impl Core {
     /// An explicit `text`: stored as `queued` first, then sent if the phone is connected. Returns how this send came out *now*:
     /// `Acked`, or (the item stays queued) `PhoneOffline` / `NoReply`, or `Rejected` (the item failed). `NoPhonePaired` stores nothing.
     pub async fn queue_text(self: &Arc<Self>, id: &str, text: &str, is_url: bool, tap: Tap) -> SendResult {
-        let Some(device_id) = self.queue_target() else {
+        self.queue_text_item(None, id, TextBody::Text { text, is_url }, tap).await
+    }
+
+    /// An explicit `link` (the browser extension, 2B.1): queued the same way as a text, and sent as a `link` or, to a peer that doesn't know the
+    /// type, as a text (`ws::wire_form`).
+    pub async fn queue_link(
+        self: &Arc<Self>,
+        device: Option<&str>,
+        id: &str,
+        url: &str,
+        title: Option<&str>,
+        source_app: Option<&str>,
+        tap: Tap,
+    ) -> SendResult {
+        self.queue_text_item(device, id, TextBody::Link { url, title, source_app }, tap).await
+    }
+
+    /// A text item (a text or a link) for `device` (`None`: the default phone).
+    pub(crate) async fn queue_text_item(self: &Arc<Self>, device: Option<&str>, id: &str, body: TextBody<'_>, tap: Tap) -> SendResult {
+        let Some(device_id) = self.queue_target_for(device) else {
             return SendResult::NoPhonePaired;
         };
         let now = unix_ms() as i64;
         let offline = !self.device_connected(&device_id);
-        if let Err(e) =
-            self.db.insert_text_item(id, &device_id, "out", "queued", now, Some(expiry_when_queued(now, "text")), text, is_url, None)
-        {
+        let expires = Some(expiry_when_queued(now, "text"));
+        let stored = match body {
+            TextBody::Text { text, is_url } => self.db.insert_text_item(id, &device_id, "out", "queued", now, expires, text, is_url, None),
+            TextBody::Link { url, title, source_app } => {
+                self.db.insert_link_item(id, &device_id, "out", "queued", now, expires, url, title, source_app, None)
+            }
+        };
+        if let Err(e) = stored {
             log::error!("saving the text to send failed: {e}");
             return SendResult::Rejected("internal".into());
         }
@@ -217,7 +256,17 @@ impl Core {
 
     /// Stores a file offer as `queued` (and its files). `None` if no phone is paired. The caller flushes the queue.
     pub fn enqueue_offer(&self, sources: &[Source], retry_of: Option<&str>) -> Option<(String, oneshot::Receiver<SendResult>)> {
-        let device_id = self.queue_target()?;
+        self.enqueue_offer_to(None, sources, retry_of)
+    }
+
+    /// The same for a named phone (the extension may pick one).
+    pub fn enqueue_offer_to(
+        &self,
+        device: Option<&str>,
+        sources: &[Source],
+        retry_of: Option<&str>,
+    ) -> Option<(String, oneshot::Receiver<SendResult>)> {
+        let device_id = self.queue_target_for(device)?;
         let id = uuid_v7(unix_ms());
         let now = unix_ms() as i64;
         let offline = !self.device_connected(&device_id);
@@ -317,13 +366,25 @@ impl Core {
     }
 
     async fn send_queued_text(self: &Arc<Self>, item: &QueueItem) -> Option<SendResult> {
-        let Ok(Some((body, is_url))) = self.db.text_body(&item.id) else {
+        let Ok(Some(stored)) = self.db.text_item(&item.id) else {
             log::error!("queued text {} has no body", short_transfer(&item.id));
             self.fail_item(&item.id, "text", "internal");
             return Some(SendResult::Rejected("internal".into()));
         };
         let tap = self.queue.tap_of(&item.id);
-        let frame = json!({ "type": "text", "id": item.id, "text": body, "isUrl": is_url });
+        let frame = if stored.is_link {
+            // A `link`; the connection sends it as a text to a peer that doesn't list the capability (`ws::wire_form`).
+            let mut frame = json!({ "type": "link", "id": item.id, "url": stored.body });
+            if let Some(title) = &stored.title {
+                frame["title"] = json!(title);
+            }
+            if let Some(source) = &stored.source_app {
+                frame["sourceApp"] = json!(source);
+            }
+            frame
+        } else {
+            json!({ "type": "text", "id": item.id, "text": stored.body, "isUrl": stored.is_url })
+        };
         let (result, _) = self.send_to_device(Some(&item.device_id), frame, tap).await;
         let now = unix_ms() as i64;
         match &result {
@@ -569,13 +630,27 @@ impl Core {
             return Err("No phone is paired yet.".into());
         }
         let new_id = if row.kind == "text" {
-            let text = row.text.ok_or("The text is no longer stored.")?;
+            let text = row.text.clone().ok_or("The text is no longer stored.")?;
             let new_id = uuid_v7(unix_ms());
             let now = unix_ms() as i64;
             let device_id = self.queue_target().ok_or("No phone is paired yet.")?;
             let offline = !self.phone_connected();
-            self.db
-                .insert_text_item(
+            let stored = if row.is_link {
+                let source = self.db.text_item(id).ok().flatten().and_then(|t| t.source_app);
+                self.db.insert_link_item(
+                    &new_id,
+                    &device_id,
+                    "out",
+                    "queued",
+                    now,
+                    Some(expiry_when_queued(now, "text")),
+                    &text,
+                    row.title.as_deref(),
+                    source.as_deref(),
+                    Some(id),
+                )
+            } else {
+                self.db.insert_text_item(
                     &new_id,
                     &device_id,
                     "out",
@@ -586,7 +661,8 @@ impl Core {
                     row.is_url,
                     Some(id),
                 )
-                .map_err(|e| self.retry_error(id, &e.to_string()))?;
+            };
+            stored.map_err(|e| self.retry_error(id, &e.to_string()))?;
             self.record_send_start(&new_id, "text", i64::from(offline), offline);
             new_id
         } else {

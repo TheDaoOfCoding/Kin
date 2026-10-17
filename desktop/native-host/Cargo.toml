@@ -1,0 +1,59 @@
+[package]
+name = "kin-native-host"
+version = "0.1.0"
+description = "Kin Relay native messaging host: relays the browser extension's requests to the running Kin over a named pipe"
+authors = ["Kin Relay"]
+edition = "2024"
+publish = false
+
+# A workspace of its own for now (the desktop agent folds it into the app's workspace later, see docs/results/phase-2b-1-native-host.md).
+[workspace]
+
+[lib]
+name = "kin_native_host"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kin-native-host"
+path = "src/main.rs"
+
+# The dev-only Kin stand-in (pipe server + Kin side of docs/extension.md). Never part of a release build.
+[[bin]]
+name = "mock-kin"
+path = "src/bin/mock-kin.rs"
+required-features = ["mock"]
+
+[features]
+default = []
+# A developer build of the host: the dev pipe (`app.kinrelay.dev`), and the KIN_HOST_DEV_* environment overrides. NEVER in a release.
+dev = []
+# The pipe server and the Kin stand-in used by the tests and by smoke/run-real-host.ts.
+mock = ["dep:sha2", "dep:base64"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = { version = "0.10", optional = true }
+base64 = { version = "0.22", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+# `cargo test` always has the mock server and the dev host (the integration tests need them).
+kin-native-host = { path = ".", features = ["dev", "mock"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+panic = "abort"
+strip = true

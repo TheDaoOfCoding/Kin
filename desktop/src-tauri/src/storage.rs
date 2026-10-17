@@ -136,6 +136,10 @@ impl Db {
         ensure_column(&conn, "transfer_files", "finalizing_name", "TEXT")?;
         ensure_column(&conn, "transfers", "sent_at", "INTEGER")?;
         ensure_column(&conn, "transfers", "retry_of", "TEXT")?;
+        // 2B.1: a text item may be a link (its body is the URL), with the title and the app that shared it.
+        ensure_column(&conn, "transfer_texts", "is_link", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "transfer_texts", "link_title", "TEXT")?;
+        ensure_column(&conn, "transfer_texts", "link_source", "TEXT")?;
         // The names of the phones that are paired now are remembered too, for a database that was made before `device_names` existed.
         conn.execute_batch("INSERT OR IGNORE INTO device_names (device_id, name) SELECT device_id, name FROM devices")?;
         // A failed item can be retried once: the database refuses a second retry of the same item (a double click on Retry). A database that

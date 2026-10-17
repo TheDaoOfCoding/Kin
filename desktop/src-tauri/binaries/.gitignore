@@ -1,0 +1,2 @@
+# kin-native-host.exe is copied here by desktop/build.ps1 for the installer; it is a build product.
+*.exe

@@ -12,6 +12,7 @@ type View = {
   defaultDeviceName: string;
   autoClipboardSync: boolean;
   imagesToClipboard: boolean;
+  openLinksAutomatically: boolean;
   receivedFolder: string;
   receivedFolderIsDefault: boolean;
   hotkey: { accelerator: string; registered: boolean; error: string | null };
@@ -134,6 +135,10 @@ export function startSettingsWindow(root: HTMLElement): void {
         "Clipboard and photos",
         toggle("Send the clipboard to the phone automatically", "Text you copy goes to the phone. Passwords from a password manager never do.", v.autoClipboardSync, (on) => void call("set_auto_clipboard_sync", { on })),
         toggle("Put photos from the phone on the clipboard", "A single image also goes to the clipboard, so Ctrl+V pastes it.", v.imagesToClipboard, (on) => void call("set_images_to_clipboard", { on })),
+      ),
+      section(
+        "Links",
+        toggle("Open links from the phone automatically", "A web page you share from the phone opens in your default browser. Off: a notice with Open and Copy buttons. In a fullscreen game or a presentation a link is never opened by itself.", v.openLinksAutomatically, (on) => void call("set_open_links_automatically", { on })),
       ),
       section(
         "Received files",

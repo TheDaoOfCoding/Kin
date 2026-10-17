@@ -54,6 +54,14 @@ pub enum Action {
         is_url: bool,
         sensitive: bool,
     },
+    /// A `link` message (changelog 54): store it in the history and open it, or offer to. `url` is valid (checked as sent), `title` and
+    /// `source_app` are already cleaned (`links::clean_link_text`). It never goes to the clipboard.
+    DeliverLink {
+        id: String,
+        url: String,
+        title: Option<String>,
+        source_app: Option<String>,
+    },
     /// An `offer` (PC to phone only): download the files. The PC never receives one (it answers `unsupported_type`), but the
     /// receiver implements both roles so the vectors can run on it.
     StartDownload {
@@ -98,6 +106,7 @@ impl Action {
             Action::ShowErrorOnly => "show_error_only",
             Action::ShowPingToast => "show_ping_toast",
             Action::DeliverText { .. } => "deliver_text",
+            Action::DeliverLink { .. } => "deliver_link",
             Action::SetClipboard { .. } => "set_clipboard",
             Action::StartDownload { .. } => "start_download",
             Action::MarkTransferDone { .. } => "mark_transfer_done",
@@ -191,6 +200,28 @@ pub struct Peer {
     pub name: String,
     pub platform: String,
     pub app_version: String,
+    /// The `capabilities` of its latest accepted `hello` (protocol.md, "Versioning"): the strings of the array, empty when the value is absent,
+    /// not an array, or has no strings.
+    pub capabilities: Vec<String>,
+}
+
+impl Peer {
+    /// Whether the peer's latest `hello` listed this capability (case-sensitive).
+    pub fn has(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|c| c == capability)
+    }
+}
+
+/// What this PC says it can do in its own `hello`.
+pub const CAPABILITIES: &[&str] = &["link"];
+
+/// The capabilities of a `hello`: an array of strings, anything else counts as none and entries that are not strings are skipped. A bad
+/// value never fails a `hello`.
+pub fn capabilities_of(obj: &Map<String, Value>) -> Vec<String> {
+    match obj.get("capabilities") {
+        Some(Value::Array(items)) => items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+        _ => Vec::new(),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -209,7 +240,7 @@ pub struct Receiver {
 /// PC -> phone.
 fn receivable(role: Role, ty: &str) -> bool {
     match ty {
-        "hello" | "ack" | "error" | "text" | "cancel" | "unpair" | "ping" => true,
+        "hello" | "ack" | "error" | "text" | "link" | "cancel" | "unpair" | "ping" => true,
         "complete" => role == Role::Pc,
         "clipboard" | "offer" => role == Role::Phone,
         _ => false,
@@ -276,7 +307,7 @@ impl Receiver {
             "hello" => self.hello(&obj, reference),
             "ack" => ack(&obj),
             "error" => error(&obj),
-            "ping" | "unpair" | "text" | "clipboard" | "offer" | "complete" | "cancel" => self.acked(ty, &obj, reference, dedup),
+            "ping" | "unpair" | "text" | "link" | "clipboard" | "offer" | "complete" | "cancel" => self.acked(ty, &obj, reference, dedup),
             _ => unreachable!("receivable() only lets known types through"),
         }
     }
@@ -292,6 +323,7 @@ impl Receiver {
                 name: crate::encoding::truncate_chars(name, MAX_NAME_CHARS).to_string(),
                 platform: platform.to_string(),
                 app_version: app_version.to_string(),
+                capabilities: capabilities_of(obj),
             })
         })();
         match fields {
@@ -304,7 +336,7 @@ impl Receiver {
         }
     }
 
-    /// `ping`, `unpair`, `text` and `clipboard`: an `id`, an `ack`, and a repeat of a known ID gets the first answer again.
+    /// `ping`, `unpair`, `text`, `link` and `clipboard`: an `id`, an `ack`, and a repeat of a known ID gets the first answer again.
     fn acked(&mut self, ty: &str, obj: &Map<String, Value>, reference: Option<&str>, dedup: &mut dyn Dedup) -> Outcome {
         let Some(id) = reference else {
             return bad_fields(None);
@@ -326,6 +358,10 @@ impl Receiver {
                     _ => return bad_fields(reference),
                 }
             }
+            "link" => match parse_link(obj) {
+                Some((url, title, source_app)) => Action::DeliverLink { id: id.to_string(), url, title, source_app },
+                None => return bad_fields(reference),
+            },
             "offer" => match parse_offer(obj, id) {
                 // More files than an offer may hold: rejected like any other offer the receiver can't take (`error`, no ack, nothing
                 // remembered). The PC splits a bigger send into several offers, so a phone never sees one.
@@ -387,6 +423,20 @@ impl Receiver {
 /// bytes plus its name, and a name of 255 characters is at most 765 bytes in UTF-8, so 800 files are under 700 KB even with the longest
 /// names. A receiver rejects an offer over it with `error` `too_large`.
 pub const MAX_OFFER_FILES: usize = 800;
+
+/// The fields of a `link` (protocol.md, "Links: `link`"): `url` is required and valid **as sent** (no trimming); `title` and `sourceApp` are optional
+/// strings (`null` is absent, any other type is invalid) and are cleaned and cut here.
+fn parse_link(obj: &Map<String, Value>) -> Option<(String, Option<String>, Option<String>)> {
+    let url = obj.get("url")?.as_str().filter(|u| crate::links::is_link_url(u))?;
+    let text = |key: &str, max: usize| match obj.get(key) {
+        None | Some(Value::Null) => Some(None),
+        Some(Value::String(s)) => Some(crate::links::clean_link_text(s, max)),
+        Some(_) => None,
+    };
+    let title = text("title", crate::links::MAX_LINK_TITLE_CHARS)?;
+    let source_app = text("sourceApp", crate::links::MAX_LINK_SOURCE_CHARS)?;
+    Some((url.to_string(), title, source_app))
+}
 
 /// `transferId` of `complete` and `cancel`: 1 to 64 characters of `A-Z a-z 0-9 - _`, as it goes in URLs.
 fn transfer_id_of(obj: &Map<String, Value>) -> Option<String> {

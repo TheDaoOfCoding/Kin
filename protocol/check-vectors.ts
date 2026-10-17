@@ -435,6 +435,113 @@ function createNewModel(input: string, existing: string[], onDisk: string[], cre
   }
 }
 
+// ---- urls.json: the openable-URL rule (docs/protocol.md, "Text messages", "Links")
+// Whitespace is the Unicode White_Space set, written out so no platform's isWhitespace() decides. Control characters: U+0000-U+001F, U+007F-U+009F.
+const isWhiteSpaceCp = (cp: number) =>
+  (cp >= 0x09 && cp <= 0x0d) || cp === 0x20 || cp === 0x85 || cp === 0xa0 || cp === 0x1680 || (cp >= 0x2000 && cp <= 0x200a) ||
+  cp === 0x2028 || cp === 0x2029 || cp === 0x202f || cp === 0x205f || cp === 0x3000;
+const isControlCp = (cp: number) => cp <= 0x1f || (cp >= 0x7f && cp <= 0x9f);
+const MAX_URL_BYTES = 8192;
+const sha256Hex = (b: Uint8Array) => hex(sha256(b));
+
+function trimWhiteSpace(s: string): string {
+  const chars = Array.from(s);
+  let a = 0;
+  let b = chars.length;
+  while (a < b && isWhiteSpaceCp(chars[a].codePointAt(0)!)) a++;
+  while (b > a && isWhiteSpaceCp(chars[b - 1].codePointAt(0)!)) b--;
+  return chars.slice(a, b).join("");
+}
+
+function isOpenableUrl(text: string): boolean {
+  const t = trimWhiteSpace(text);
+  if (utf8Len(t) > MAX_URL_BYTES) return false;
+  const scheme = /^https?:\/\//i.exec(t);
+  if (!scheme) return false;
+  if (Array.from(t).some((ch) => isWhiteSpaceCp(ch.codePointAt(0)!) || isControlCp(ch.codePointAt(0)!))) return false;
+  const rest = t.slice(scheme[0].length);
+  const cut = rest.search(/[/?#]/);
+  const authority = cut < 0 ? rest : rest.slice(0, cut);
+  // changelog 55: an authority with user information, a backslash or an escape is ambiguous (a browser reads it another way) and is not openable
+  if (/[@\\%]/.test(authority)) return false;
+  const hostPart = authority;
+  let host: string;
+  let port: string | undefined;
+  if (hostPart.startsWith("[")) {
+    const close = hostPart.indexOf("]");
+    if (close < 2) return false; // no closing bracket, or nothing inside
+    host = hostPart.slice(1, close);
+    if (host.includes("[")) return false;
+    const after = hostPart.slice(close + 1);
+    if (after === "") port = undefined;
+    else if (after.startsWith(":")) port = after.slice(1);
+    else return false;
+  } else {
+    const colon = hostPart.indexOf(":");
+    host = colon < 0 ? hostPart : hostPart.slice(0, colon);
+    port = colon < 0 ? undefined : hostPart.slice(colon + 1);
+    if (host === "" || /^\.+$/.test(host) || /[\[\]<>^|]/.test(host)) return false;
+  }
+  if (port !== undefined) {
+    if (!/^[0-9]+$/.test(port)) return false;
+    const digits = port.replace(/^0+/, "");
+    if (digits === "" || digits.length > 5 || Number(digits) > 65535) return false;
+  }
+  return true;
+}
+
+// ---- link message rules (docs/protocol.md, "Links: link"; changelog 54)
+// link.url is the openable-URL rule applied to the string as sent: no trimming, so whitespace at either end is invalid.
+const isLinkUrl = (url: unknown): url is string => typeof url === "string" && url === trimWhiteSpace(url) && isOpenableUrl(url);
+// The address a receiver shows (docs/protocol.md, "Showing the address of a link"): the host a browser connects to, and whether it carries a warning.
+// The model asks the WHATWG parser of the runtime (Bun here) about `scheme://authority/`; a host it refuses is shown as written, ASCII lower-cased.
+function displayAddress(url: string): { display: string; warn: boolean } {
+  const scheme = /^https?:\/\//i.exec(url)![0].toLowerCase();
+  const authority = url.slice(scheme.length).split(/[/?#]/)[0];
+  const written = authority.startsWith("[") ? authority.slice(0, authority.indexOf("]") + 1) : authority.split(":")[0];
+  let parsed: URL | null = null;
+  try {
+    parsed = new URL(scheme + authority + "/");
+  } catch {
+    parsed = null;
+  }
+  if (parsed === null) {
+    const lower = written.replace(/[A-Z]/g, (c) => c.toLowerCase());
+    return { display: Array.from(lower, (ch) => (ch >= "!" && ch <= "~" ? ch : "�")).join(""), warn: true };
+  }
+  const isIp = parsed.hostname.startsWith("[") || /^\d+\.\d+\.\d+\.\d+$/.test(parsed.hostname);
+  const warn = /[^\x00-\x7f]/.test(written) || parsed.hostname.split(".").some((label) => label.startsWith("xn--")) || isIp;
+  return { display: parsed.host, warn };
+}
+const isBidiControlCp = (cp: number) => cp === 0x061c || cp === 0x200e || cp === 0x200f || (cp >= 0x202a && cp <= 0x202e) || (cp >= 0x2066 && cp <= 0x2069);
+// title and sourceApp: bidi controls -> "_", control characters -> a space, runs of spaces collapse and the ends are trimmed,
+// cut to max code points (trailing spaces trimmed again), empty = absent (null).
+function cleanLinkText(input: string, max: number): string | null {
+  let out = "";
+  for (const ch of input) {
+    const cp = ch.codePointAt(0)!;
+    out += isBidiControlCp(cp) ? "_" : isControlCp(cp) ? " " : ch;
+  }
+  out = out.replace(/ +/g, " ").replace(/^ | $/g, "");
+  out = Array.from(out).slice(0, max).join("").replace(/ +$/, "");
+  return out === "" ? null : out;
+}
+const MAX_TITLE = 300;
+const MAX_SOURCE_APP = 64;
+// the capabilities of a hello: an array of strings; anything else counts as none, and entries that are not strings are skipped
+const capabilitiesOf = (hello: any): Set<string> => new Set(Array.isArray(hello?.capabilities) ? hello.capabilities.filter((c: unknown) => typeof c === "string") : []);
+// How a sender puts a link on the wire: as a link only to a peer whose latest accepted hello lists "link", else as a text.
+const sendLinkAs = (hellos: any[]): "link" | "text" => (hellos.length > 0 && capabilitiesOf(hellos[hellos.length - 1]).has("link") ? "link" : "text");
+const linkOf = (o: any) => {
+  const link: any = { url: o.url };
+  const title = typeof o.title === "string" ? cleanLinkText(o.title, MAX_TITLE) : null;
+  const sourceApp = typeof o.sourceApp === "string" ? cleanLinkText(o.sourceApp, MAX_SOURCE_APP) : null;
+  if (title !== null) link.title = title;
+  if (sourceApp !== null) link.sourceApp = sourceApp;
+  return link;
+};
+
+
 // ------------------------------------------------------------------ WebSocket messages
 type Role = "phone" | "pc";
 const MAX_FRAME = 1048576;
@@ -442,15 +549,15 @@ const MAX_OFFER_FILES = 800; // more files in one offer: the receiver answers er
 const TRANSFER_ID = /^[A-Za-z0-9_-]{1,64}$/;
 const INT_FIELDS = ["protocol", "size", "totalSize", "offset", "received", "sentAt"];
 const DIRECTION: Record<string, Role | "both"> = {
-  hello: "both", ack: "both", error: "both", text: "both", clipboard: "pc", offer: "pc",
+  hello: "both", ack: "both", error: "both", text: "both", link: "both", clipboard: "pc", offer: "pc",
   complete: "phone", cancel: "both", unpair: "both", ping: "both",
 };
-const ACKED = new Set(["text", "clipboard", "offer", "complete", "cancel", "unpair", "ping"]);
+const ACKED = new Set(["text", "link", "clipboard", "offer", "complete", "cancel", "unpair", "ping"]);
 const ACTION: Record<string, string> = {
-  hello: "handshake_ok", ack: "mark_delivered", error: "mark_failed", text: "deliver_text", clipboard: "set_clipboard",
+  hello: "handshake_ok", ack: "mark_delivered", error: "mark_failed", text: "deliver_text", link: "deliver_link", clipboard: "set_clipboard",
   offer: "start_download", complete: "mark_transfer_done", cancel: "cancel_transfer", unpair: "remove_peer_and_close", ping: "show_ping_toast",
 };
-type Outcome = { reply: "ack" | "error" | "none"; action?: string; code?: string; ref?: string | null; close: number | null; sensitive?: boolean };
+type Outcome = { reply: "ack" | "error" | "none"; action?: string; code?: string; ref?: string | null; close: number | null; sensitive?: boolean; link?: any };
 const isObj = (x: any) => x !== null && typeof x === "object" && !Array.isArray(x);
 const isStr = (x: any) => typeof x === "string";
 const isNonEmptyStr = (x: any) => typeof x === "string" && x.length > 0;
@@ -515,6 +622,8 @@ function validateFields(type: string, o: any, badInts: Set<string>): boolean {
     case "error": return isStr(o.code) && isStr(o.message) && (o.ref === undefined || o.ref === null || validMsgId(o.ref));
     // sensitive is an optional strict boolean (null counts as absent; "true", 1 and 0 are invalid)
     case "text": return id() && isNonEmptyStr(o.text) && typeof o.isUrl === "boolean" && (o.sensitive === undefined || o.sensitive === null || typeof o.sensitive === "boolean");
+    // url is required and checked as sent; title and sourceApp are optional strings (null counts as absent)
+    case "link": return id() && isLinkUrl(o.url) && (o.title === undefined || o.title === null || typeof o.title === "string") && (o.sourceApp === undefined || o.sourceApp === null || typeof o.sourceApp === "string");
     case "clipboard": return id() && isNonEmptyStr(o.text);
     case "offer": {
       if (!id() || !TRANSFER_ID.test(o.id) || !int("totalSize") || !Array.isArray(o.files) || o.files.length < 1) return false;
@@ -617,7 +726,7 @@ class Receiver {
       return { reply: "ack", ref: o.id, action: "ignore_duplicate", close: null };
     }
     this.seen.add(seenKey);
-    return { reply: "ack", ref: o.id, action: ACTION[type], close: type === "unpair" ? 1000 : null, ...(type === "text" ? { sensitive: o.sensitive === true } : {}) };
+    return { reply: "ack", ref: o.id, action: ACTION[type], close: type === "unpair" ? 1000 : null, ...(type === "text" ? { sensitive: o.sensitive === true } : {}), ...(type === "link" ? { link: linkOf(o) } : {}) };
   }
 }
 
@@ -655,6 +764,8 @@ function sameOutcome(actual: Outcome, expect: any): boolean {
   if (actual.reply === "ack" && expect.ref !== undefined && actual.ref !== expect.ref) return false;
   // a deliver_text case says whether the text is sensitive; absent means false
   if (actual.action === "deliver_text" && (expect.sensitive ?? false) !== (actual.sensitive ?? false)) return false;
+  // a deliver_link case says what the receiver shows and opens: the url as sent, the cleaned title and sourceApp
+  if (actual.action === "deliver_link" && expect.link !== undefined && !eq(actual.link, expect.link)) return false;
   return true;
 }
 
@@ -1157,60 +1268,6 @@ function checkResponse(group: string, name: string, expected: any, actual: Reply
   console.log(`milestone 1.2 scope: ${inScope} cases in messages.json (text and clipboard)`);
 }
 
-// ---- urls.json: the openable-URL rule (docs/protocol.md, "Text messages", "Links")
-// Whitespace is the Unicode White_Space set, written out so no platform's isWhitespace() decides. Control characters: U+0000-U+001F, U+007F-U+009F.
-const isWhiteSpaceCp = (cp: number) =>
-  (cp >= 0x09 && cp <= 0x0d) || cp === 0x20 || cp === 0x85 || cp === 0xa0 || cp === 0x1680 || (cp >= 0x2000 && cp <= 0x200a) ||
-  cp === 0x2028 || cp === 0x2029 || cp === 0x202f || cp === 0x205f || cp === 0x3000;
-const isControlCp = (cp: number) => cp <= 0x1f || (cp >= 0x7f && cp <= 0x9f);
-const MAX_URL_BYTES = 8192;
-const sha256Hex = (b: Uint8Array) => hex(sha256(b));
-
-function trimWhiteSpace(s: string): string {
-  const chars = Array.from(s);
-  let a = 0;
-  let b = chars.length;
-  while (a < b && isWhiteSpaceCp(chars[a].codePointAt(0)!)) a++;
-  while (b > a && isWhiteSpaceCp(chars[b - 1].codePointAt(0)!)) b--;
-  return chars.slice(a, b).join("");
-}
-
-function isOpenableUrl(text: string): boolean {
-  const t = trimWhiteSpace(text);
-  if (utf8Len(t) > MAX_URL_BYTES) return false;
-  const scheme = /^https?:\/\//i.exec(t);
-  if (!scheme) return false;
-  if (Array.from(t).some((ch) => isWhiteSpaceCp(ch.codePointAt(0)!) || isControlCp(ch.codePointAt(0)!))) return false;
-  const rest = t.slice(scheme[0].length);
-  const cut = rest.search(/[/?#]/);
-  const authority = cut < 0 ? rest : rest.slice(0, cut);
-  const at = authority.lastIndexOf("@");
-  const hostPart = at >= 0 ? authority.slice(at + 1) : authority;
-  let host: string;
-  let port: string | undefined;
-  if (hostPart.startsWith("[")) {
-    const close = hostPart.indexOf("]");
-    if (close < 2) return false; // no closing bracket, or nothing inside
-    host = hostPart.slice(1, close);
-    if (host.includes("[")) return false;
-    const after = hostPart.slice(close + 1);
-    if (after === "") port = undefined;
-    else if (after.startsWith(":")) port = after.slice(1);
-    else return false;
-  } else {
-    const colon = hostPart.indexOf(":");
-    host = colon < 0 ? hostPart : hostPart.slice(0, colon);
-    port = colon < 0 ? undefined : hostPart.slice(colon + 1);
-    if (host === "" || /^\.+$/.test(host)) return false;
-  }
-  if (port !== undefined) {
-    if (!/^[0-9]+$/.test(port)) return false;
-    const digits = port.replace(/^0+/, "");
-    if (digits === "" || digits.length > 5 || Number(digits) > 65535) return false;
-  }
-  return true;
-}
-
 {
   const g = "urls";
   const d = load("urls.json");
@@ -1408,6 +1465,90 @@ function receiverModel(frame: any) {
   }
   console.log("v0.1.1 scope: 1 sequence in http.json");
 }
+
+// ---- links.json (changelog 54) and the 2B.1 scope: the link-* cases of messages.json
+{
+  const g = "links";
+  const d = load("links.json");
+  const synth = (c: any) => c.synthesize.prefix + c.synthesize.fill.repeat(c.synthesize.fillCount) + (c.synthesize.suffix ?? "");
+  check(g, "limits", d.maxUrlBytes === MAX_URL_BYTES && d.maxTitleCodePoints === MAX_TITLE && d.maxSourceAppCodePoints === MAX_SOURCE_APP);
+  for (const k of ["urls", "titles", "sourceApps", "sendAs", "textFallback"]) uniqueNames(g + "." + k, d[k]);
+  for (const c of d.urls) {
+    const text: string = c.synthesize ? synth(c) : c.input;
+    if (c.synthesize) check(g, `url ${c.name}: synthesized size matches bytes`, utf8Len(text) === c.synthesize.bytes, () => `${utf8Len(text)} vs ${c.synthesize.bytes}`);
+    check(g, `url ${c.name}`, isLinkUrl(text) === c.valid, () => `input ${j(text.slice(0, 100))} expected ${c.valid}, model says ${isLinkUrl(text)}`);
+    // the same link as a link in a frame goes through the receiver, and an unchanged URL comes out as the same string
+    const frame = { type: "link", id: "u1", url: text };
+    const out = new Receiver("phone", "open").receive("pc", { frame });
+    check(g, `url ${c.name}: the receiver agrees`, c.valid ? out.reply === "ack" && out.link?.url === text : out.reply === "error" && out.code === "bad_request" && out.ref === "u1");
+    if (c.unchanged) check(g, `url ${c.name}: delivered unchanged`, c.valid && out.link?.url === c.input);
+  }
+  check(g, "urls has accepted and rejected cases", d.urls.some((c: any) => c.valid) && d.urls.some((c: any) => !c.valid));
+  // a link.url that is valid is also an openable URL as a text would see it; the reverse needs the url to be trimmed first
+  for (const c of d.urls.filter((c: any) => c.valid && c.input !== undefined)) check(g, `url ${c.name}: valid as a link means valid as a text`, isOpenableUrl(c.input));
+  // display[] (changelog 55): the address a receiver shows and whether it is marked
+  uniqueNames(g + ".display", d.display);
+  for (const c of d.display) {
+    check(g, `display ${c.name}: the URL is valid as a link`, isLinkUrl(c.url));
+    const got = displayAddress(c.url);
+    check(g, `display ${c.name}`, got.display === c.display && got.warn === c.warn, () => `expected ${j(c.display)} warn ${c.warn}, model says ${j(got.display)} warn ${got.warn}`);
+    // apart from a host a browser refuses, the shown address is what a browser reports for the whole URL
+    if (c.parseFails) {
+      check(g, `display ${c.name}: a browser refuses the URL`, (() => { try { new URL(c.url); return false; } catch { return true; } })());
+      check(g, `display ${c.name}: refused hosts warn`, c.warn === true);
+    } else {
+      check(g, `display ${c.name}: equals the browser's host`, new URL(c.url).host === c.display, () => `${new URL(c.url).host}`);
+    }
+    // a plain ASCII host that isn't an IP address and has no punycode label never warns
+    if (!c.warn) check(g, `display ${c.name}: no warning means plain ASCII`, /^[a-z0-9.:_-]+$/.test(c.display) && !c.display.split(".").some((l: string) => l.startsWith("xn--")));
+  }
+  check(g, "display has warned and plain cases", d.display.some((c: any) => c.warn) && d.display.some((c: any) => !c.warn) && d.display.length >= 40);
+  for (const c of d.urls.filter((c: any) => c.valid && c.input !== undefined)) check(g, `url ${c.name}: the address can be shown`, typeof displayAddress(c.input).display === "string");
+  for (const [key, max] of [["titles", MAX_TITLE], ["sourceApps", MAX_SOURCE_APP]] as const) {
+    for (const c of d[key]) {
+      const got = cleanLinkText(c.input, max);
+      check(g, `${key} ${c.name}`, got === c.expected, () => `expected ${j(c.expected)}, model says ${j(got)}`);
+      // cleaning is idempotent and never leaves a bidi or control character
+      if (got !== null) check(g, `${key} ${c.name}: result is stable and clean`, cleanLinkText(got, max) === got && !Array.from(got).some((ch) => isControlCp(ch.codePointAt(0)!) || isBidiControlCp(ch.codePointAt(0)!)));
+    }
+  }
+  for (const c of d.sendAs) {
+    const hellos = c.hellos.map((h: any) => ({ type: "hello", id: "h", protocol: 1, name: "X", platform: "windows", appVersion: "0.2.0", ...h }));
+    for (const h of hellos) check(g, `sendAs ${c.name}: the hello is accepted`, new Receiver("phone", "before_hello").receive("pc", { frame: h }).action === "handshake_ok");
+    check(g, `sendAs ${c.name}`, sendLinkAs(hellos) === c.expected, () => `expected ${c.expected}, model says ${sendLinkAs(hellos)}`);
+  }
+  for (const c of d.textFallback) {
+    check(g, `textFallback ${c.name}: the link is valid`, isLinkUrl(c.link.url));
+    check(g, `textFallback ${c.name}: the text frame is a valid text with isUrl true`, c.expected.isUrl === true && c.expected.text === c.link.url && isOpenableUrl(c.expected.text));
+    const frame = { type: "text", id: "t1", ...c.expected };
+    check(g, `textFallback ${c.name}: an old peer delivers it as a text`, new Receiver("pc", "open").receive("phone", { frame }).action === "deliver_text");
+  }
+}
+
+{
+  const g = "scope-2b.1";
+  const messages = load("messages.json");
+  const matches = (name: string, p: string) => (p.endsWith("*") ? name.startsWith(p.slice(0, -1)) : name === p);
+  const SCOPE: [string, any[], string[], number][] = [
+    ["messages.valid", messages.valid, ["link-*"], 18],
+    ["messages.invalid", messages.invalid, ["link-*"], 28],
+    ["messages.sequences", messages.sequences, ["link-*"], 4],
+  ];
+  let inScope = 0;
+  for (const [label, cases, patterns, atLeast] of SCOPE) {
+    for (const p of patterns) check(g, `${label}: "${p}" matches a case`, cases.some((c) => matches(c.name, p)));
+    const hits = cases.filter((c) => patterns.some((p) => matches(c.name, p)));
+    inScope += hits.length;
+    check(g, `${label}: at least ${atLeast} cases in scope`, hits.length >= atLeast, () => String(hits.length));
+  }
+  // every link case that is valid is acked as deliver_link and carries the expected link; every invalid one is bad_request with the id as ref
+  for (const c of messages.valid.filter((c: any) => c.name.startsWith("link-"))) check(g, `${c.name}: delivers a link`, c.expect.action === "deliver_link" && typeof c.expect.link?.url === "string");
+  for (const c of messages.invalid.filter((c: any) => c.name.startsWith("link-"))) check(g, `${c.name}: bad_request, connection stays open (unless before hello)`, c.expect.code === "bad_request" && (c.state === "before_hello" ? c.expect.close === 1002 : c.expect.close === null));
+  // both directions are exercised
+  check(g, "links go both ways", messages.valid.some((c: any) => c.name.startsWith("link-") && c.from === "pc") && messages.valid.some((c: any) => c.name.startsWith("link-") && c.from === "phone"));
+  console.log(`milestone 2B.1 scope: ${inScope} link cases in messages.json, plus links.json`);
+}
+
 
 // ---- fixtures/: DER certificates for the negative tls[] cases (made by fixtures/make-fixtures.ts)
 {
