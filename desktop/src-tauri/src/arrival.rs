@@ -12,6 +12,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use serde_json::Value;
+
 use crate::clipboard::ImageOutcome;
 use crate::core::{Core, Event, lock, short_transfer};
 use crate::links;
@@ -21,6 +23,95 @@ use crate::transfers::Entry;
 /// "1 file from Pixel", "3 files from Pixel".
 pub fn files_title(count: usize, from: &str) -> String {
     if count == 1 { format!("1 file from {from}") } else { format!("{count} files from {from}") }
+}
+
+/// Where an upload came from when the phone sent it by itself (2B.4, protocol.md "Auto-sent screenshots: `origin`"): `POST /v1/transfers` takes an optional
+/// `origin`. The PC **never trusts it for anything but wording and the clipboard rule**: a hostile phone can already put an image on the clipboard with an
+/// ordinary upload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    Screenshot,
+    Camera,
+}
+
+impl Origin {
+    /// `"screenshot"` or `"camera"` exactly; any other value, or a value of another type, is "absent" (a manual send).
+    pub fn parse(v: &Value) -> Option<Origin> {
+        match v.as_str()? {
+            "screenshot" => Some(Origin::Screenshot),
+            "camera" => Some(Origin::Camera),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Origin::Screenshot => "screenshot",
+            Origin::Camera => "camera",
+        }
+    }
+
+    pub fn from_db(text: &str) -> Option<Origin> {
+        Origin::parse(&Value::String(text.to_string()))
+    }
+}
+
+/// What the toast of a finished upload says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToastKind {
+    /// "Screenshot from <phone>"
+    Screenshot,
+    /// "Photo from <phone>"
+    Photo,
+    /// "1 file from <phone>", as before 2B.4.
+    Files,
+    /// A paused PC saves the file and shows nothing.
+    None,
+}
+
+impl ToastKind {
+    pub fn word(self) -> &'static str {
+        match self {
+            ToastKind::Screenshot => "screenshot",
+            ToastKind::Photo => "photo",
+            ToastKind::Files => "files",
+            ToastKind::None => "none",
+        }
+    }
+}
+
+/// What a 0.2.0 PC does with the image of a finished transfer (`protocol/presence.json` `origin[]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OriginPlan {
+    pub toast: ToastKind,
+    /// The image goes on the clipboard (if the setting "images also go to the clipboard" is on).
+    pub clipboard: bool,
+    /// With the formats that keep it out of Win+V and the cloud clipboard.
+    pub sensitive_formats: bool,
+}
+
+/// The one rule, pure: a **screenshot** gets its own toast and goes on the clipboard (if the setting allows) with the sensitive formats; a **camera photo** gets
+/// "Photo from" and **never** the clipboard; no origin is as before. A paused PC saves the file quietly whatever the origin: no toast, no clipboard.
+pub fn plan(origin: Option<Origin>, images_to_clipboard: bool, paused: bool) -> OriginPlan {
+    if paused {
+        return OriginPlan { toast: ToastKind::None, clipboard: false, sensitive_formats: false };
+    }
+    match origin {
+        Some(Origin::Screenshot) => {
+            OriginPlan { toast: ToastKind::Screenshot, clipboard: images_to_clipboard, sensitive_formats: images_to_clipboard }
+        }
+        Some(Origin::Camera) => OriginPlan { toast: ToastKind::Photo, clipboard: false, sensitive_formats: false },
+        None => OriginPlan { toast: ToastKind::Files, clipboard: images_to_clipboard, sensitive_formats: false },
+    }
+}
+
+/// The toast title of a finished upload: by origin ("Screenshot from Pixel", "Photo from Pixel"), else as always.
+pub fn origin_title(kind: ToastKind, count: usize, from: &str) -> String {
+    match kind {
+        ToastKind::Screenshot => format!("Screenshot from {from}"),
+        ToastKind::Photo => format!("Photo from {from}"),
+        _ => files_title(count, from),
+    }
 }
 
 impl Core {
@@ -60,6 +151,15 @@ impl Core {
         let Some(first) = files.first() else {
             return;
         };
+        // 2B.4: what the phone says about where the file came from, and the pause, decide the toast and the clipboard (`plan`).
+        let origin = *lock(&entry.origin);
+        let plan = plan(origin, self.images_to_clipboard(), self.paused());
+        if plan.toast == ToastKind::None {
+            // A paused PC: the file is saved (it is, by now) and the history has it. Nothing visible happens by itself.
+            log::info!("upload {}: arrived while paused, handled quietly (saved, no toast, no clipboard)", short_transfer(&entry.id));
+            self.presence_note_quiet_arrival();
+            return;
+        }
         let target =
             if files.len() == 1 { ToastTarget::OpenFile(first.0.clone()) } else { ToastTarget::ShowFolder(entry.dest_dir.clone()) };
         let body = if files.len() <= 3 {
@@ -71,9 +171,18 @@ impl Core {
         self.register_toast_target(toast_id, target);
         // One file whose type is on the allow-list can be opened from the toast; any other is shown in its folder.
         let openable = files.len() == 1 && links::may_open_file(&first.0);
-        self.emit(Event::FilesToast { id: toast_id, title: files_title(files.len(), from), body, single: files.len() == 1, openable });
+        self.emit(Event::FilesToast {
+            id: toast_id,
+            title: origin_title(plan.toast, files.len(), from),
+            body,
+            single: files.len() == 1,
+            openable,
+        });
 
-        if !self.images_to_clipboard() {
+        if !plan.clipboard {
+            if origin == Some(Origin::Camera) {
+                log::info!("upload {}: a camera photo is saved and shown, never put on the clipboard", short_transfer(&entry.id));
+            }
             return;
         }
         // Which files are pictures is decided by their content (the decoder), never by the name or the type the phone gave.
@@ -85,7 +194,10 @@ impl Core {
             1 => {
                 let path = images[0].clone();
                 let clipboard = self.clipboard.clone();
-                match tokio::task::spawn_blocking(move || clipboard.write_image_file(&path)).await {
+                let sensitive = plan.sensitive_formats;
+                let write =
+                    move || if sensitive { clipboard.write_image_file_with(&path, true) } else { clipboard.write_image_file(&path) };
+                match tokio::task::spawn_blocking(write).await {
                     Ok(Ok(ImageOutcome::Set { width, height })) => {
                         log::info!("upload {id}: the image ({width} x {height}) is on the clipboard");
                     }

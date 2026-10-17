@@ -365,7 +365,11 @@ fn drop_files(path: &Path) -> Vec<u8> {
 /// Puts the image in `path` on the clipboard (see the module comment for what is put there). `owner` is the clipboard window.
 /// `quiet`: also write the formats that keep the image out of the installed Kin, Windows' history and the cloud clipboard (an instance
 /// beside the installed Kin: see `clipboard::DEV_TEST_CONTENT`).
-pub fn write_clipboard_image(owner: HWND, path: &Path, quiet: bool) -> Result<ImageOutcome> {
+///
+/// `sensitive` (an auto-sent screenshot, 2B.4): also `ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory` = 0 and
+/// `CanUploadToCloudClipboard` = 0, the formats of `write_text_sensitive`, so Win+V and the cloud clipboard keep nothing and Kin's own clipboard sync
+/// (which is text only) never looks at it.
+pub fn write_clipboard_image(owner: HWND, path: &Path, quiet: bool, sensitive: bool) -> Result<ImageOutcome> {
     let (dib, width, height, kind) = match decode(path) {
         Ok(d) => (d.block, d.width, d.height, d.kind),
         Err(why) => return Ok(ImageOutcome::Skipped(why)),
@@ -378,7 +382,21 @@ pub fn write_clipboard_image(owner: HWND, path: &Path, quiet: bool) -> Result<Im
     };
     let png_block = png.as_deref().map(block_of).transpose()?;
     let drop_block = block_of(&drop_files(path))?;
-    let marks = if quiet { Some((block_of(&1u32.to_le_bytes())?, block_of(&1u32.to_le_bytes())?)) } else { None };
+    // The opt-out formats (name, DWORD value): `quiet` (an instance beside the installed Kin) and `sensitive` both exclude it from monitoring; `quiet` adds the
+    // test-content mark, `sensitive` the two zeros that keep it out of the history and the cloud clipboard.
+    let mut mark_formats: Vec<(&str, u32)> = Vec::new();
+    if quiet || sensitive {
+        mark_formats.push((crate::clipboard::EXCLUDE_FROM_MONITOR, 1));
+    }
+    if quiet {
+        mark_formats.push((crate::clipboard::DEV_TEST_CONTENT, 1));
+    }
+    if sensitive {
+        mark_formats.push((crate::clipboard::CAN_INCLUDE_IN_HISTORY, 0));
+        mark_formats.push((crate::clipboard::CAN_UPLOAD_TO_CLOUD, 0));
+    }
+    let marks: Vec<(&str, _)> =
+        mark_formats.into_iter().map(|(name, value)| Ok((name, block_of(&value.to_le_bytes())?))).collect::<Result<Vec<_>>>()?;
 
     // The clipboard may be in use by another app for a moment.
     let mut opened = false;
@@ -404,15 +422,8 @@ pub fn write_clipboard_image(owner: HWND, path: &Path, quiet: bool) -> Result<Im
                 SetClipboardData(RegisterClipboardFormatW(w!("PNG")), Some(HANDLE(block.take().0)))?;
             }
             SetClipboardData(CF_HDROP, Some(HANDLE(drop_block.take().0)))?;
-            if let Some((exclude, test_content)) = marks {
-                SetClipboardData(
-                    RegisterClipboardFormatW(&HSTRING::from(crate::clipboard::EXCLUDE_FROM_MONITOR)),
-                    Some(HANDLE(exclude.take().0)),
-                )?;
-                SetClipboardData(
-                    RegisterClipboardFormatW(&HSTRING::from(crate::clipboard::DEV_TEST_CONTENT)),
-                    Some(HANDLE(test_content.take().0)),
-                )?;
+            for (name, block) in marks {
+                SetClipboardData(RegisterClipboardFormatW(&HSTRING::from(name)), Some(HANDLE(block.take().0)))?;
             }
         }
         Ok(())

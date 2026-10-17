@@ -335,8 +335,14 @@ pub trait Clipboard: Send + Sync {
     fn clear_if_text_unchanged(&self, expected: &str, _sequence: Option<u32>) -> Result<bool> {
         self.clear_if_text(expected)
     }
-    /// Puts the image in this file on the clipboard (see `images.rs`). The default is for clipboards that can't.
-    fn write_image_file(&self, _path: &std::path::Path) -> Result<ImageOutcome> {
+    /// Puts the image in this file on the clipboard (see `images.rs`).
+    fn write_image_file(&self, path: &std::path::Path) -> Result<ImageOutcome> {
+        self.write_image_file_with(path, false)
+    }
+    /// Like [`Clipboard::write_image_file`]. With `sensitive` (an auto-sent screenshot, 2B.4) the image also carries the formats that keep it out of
+    /// Windows' clipboard history and the cloud clipboard (`ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory` = 0,
+    /// `CanUploadToCloudClipboard` = 0), as `write_text_sensitive` does for a text. The default is for clipboards that can't hold images.
+    fn write_image_file_with(&self, _path: &std::path::Path, _sensitive: bool) -> Result<ImageOutcome> {
         Ok(ImageOutcome::Skipped("this clipboard can't hold images".to_string()))
     }
 }
@@ -361,6 +367,8 @@ pub struct MemoryClipboard {
     writes: Mutex<Vec<String>>,
     sensitive_writes: Mutex<Vec<String>>,
     images: Mutex<Vec<std::path::PathBuf>>,
+    /// The images that were written with the sensitive formats (a subset of `images`).
+    sensitive_images: Mutex<Vec<std::path::PathBuf>>,
     /// Goes up with every change, like the real clipboard's counter.
     sequence: std::sync::atomic::AtomicU32,
 }
@@ -410,6 +418,11 @@ impl MemoryClipboard {
     pub fn app_images(&self) -> Vec<std::path::PathBuf> {
         self.images.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
+
+    /// The image files the app put on the clipboard **with the sensitive formats** (2B.4: auto-sent screenshots), in order.
+    pub fn app_sensitive_images(&self) -> Vec<std::path::PathBuf> {
+        self.sensitive_images.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
 }
 
 impl Clipboard for MemoryClipboard {
@@ -457,8 +470,11 @@ impl Clipboard for MemoryClipboard {
         Ok(true)
     }
 
-    fn write_image_file(&self, path: &std::path::Path) -> Result<ImageOutcome> {
+    fn write_image_file_with(&self, path: &std::path::Path, sensitive: bool) -> Result<ImageOutcome> {
         self.images.lock().unwrap_or_else(|p| p.into_inner()).push(path.to_path_buf());
+        if sensitive {
+            self.sensitive_images.lock().unwrap_or_else(|p| p.into_inner()).push(path.to_path_buf());
+        }
         *self.state.lock().unwrap_or_else(|p| p.into_inner()) = ClipSnapshot::default();
         self.notify();
         Ok(ImageOutcome::Set { width: 1, height: 1 })
@@ -795,8 +811,8 @@ mod win {
             Ok(true)
         }
 
-        fn write_image_file(&self, path: &std::path::Path) -> Result<super::ImageOutcome> {
-            crate::images::write_clipboard_image(self.hwnd(), path, self.quiet)
+        fn write_image_file_with(&self, path: &std::path::Path, sensitive: bool) -> Result<super::ImageOutcome> {
+            crate::images::write_clipboard_image(self.hwnd(), path, self.quiet, sensitive)
         }
     }
 }

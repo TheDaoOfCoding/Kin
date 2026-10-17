@@ -29,6 +29,12 @@
 //!   `'{"cmd":"volume","level":30}'`: the phone controlling the PC's media). It prints what the PC sends: `received media.status show=.. share=..`, `received media.state sid=.. state=.. app=.. title=..`,
 //!   `received media.image`, `received media.clear`, `received media.volume level=.. muted=..` and `received media.cmd id=.. sid=.. cmd=.. seekMs=..`
 //!   (`--media-cmd-error <code>` answers a command with that `error`, as a source would; media is never acked). (A developer tool: it prints titles. Kin itself never does.)
+//! * (2B.4) **Presence, pause and ring.** `--presence` adds `presence` to the phone's `capabilities` and `--ring` adds `ring` (and `presence`). Then, one per second in the
+//!   order given: `--presence-send '<json>'` (the fields of a `presence` other than `type` and `id`, for example
+//!   `'{"battery":{"level":14,"charging":false},"pause":{"remainingMs":3600000}}'`) and `--ring-status ringing[,<audible>]` or `--ring-status stopped,<reason>`. It prints what the
+//!   PC sends: `received presence battery=.. pause=..`, `received ring.start id=..` and `received ring.stop id=..` (both acked; `--ring-error <code>` answers a `ring.start`
+//!   with that `error`, `--ring-no-ack` doesn't answer it). **It never makes a sound.** `--upload-origin screenshot|camera` adds `origin` to `POST /v1/transfers` of an `--upload`.
+//!   (A developer tool: it prints the level. Kin itself never does.)
 //! * `--no-ack` doesn't ack `text` and `clipboard` from the PC (to see the PC's 5 s ack timeout and its notice).
 //! * What it receives is printed on one line each, for scripts to look for: `received clipboard id=<id> text=<text>` and
 //!   `received text id=<id> isUrl=<bool> text=<text>`. (This is a developer tool: it prints the text. Kin itself never logs it.)
@@ -123,8 +129,8 @@ impl ServerCertVerifier for Pinned {
 }
 
 /// The phone's `hello`. A 2B.1 phone lists the `link` capability; `--old-phone` is a 0.1.x phone, which doesn't; `--notif` (2B.2) adds `notif` and `--media` (2B.3)
-/// adds `media`.
-fn hello_of(name: &str, id: &str, old_phone: bool, notif: bool, media: bool) -> Value {
+/// adds `media`, `--presence` (2B.4) adds `presence` and `--ring` adds `ring` (and `presence`).
+fn hello_of(name: &str, id: &str, old_phone: bool, notif: bool, media: bool, presence: bool, ring: bool) -> Value {
     let mut hello = json!({ "type": "hello", "id": id, "protocol": 1, "name": name, "platform": "android", "appVersion": "0.0.0" });
     if !old_phone {
         let mut caps = vec!["link"];
@@ -134,9 +140,36 @@ fn hello_of(name: &str, id: &str, old_phone: bool, notif: bool, media: bool) -> 
         if media {
             caps.push("media");
         }
+        if presence || ring {
+            caps.push("presence");
+        }
+        if ring {
+            caps.push("ring");
+        }
         hello["capabilities"] = json!(caps);
     }
     hello
+}
+
+/// The frame of one of the `--presence-*` and `--ring-status` things the phone sends on its own (2B.4): `--presence-send '<json>'` is the fields of a `presence` (for
+/// example `'{"battery":{"level":14,"charging":false},"pause":{"remainingMs":3600000}}'`), `--ring-status ringing[,<audible>]` or `--ring-status stopped,<reason>`.
+fn presence_frame(kind: &str, value: &str, id: &str) -> Value {
+    if kind == "presence" {
+        let mut frame: Value =
+            serde_json::from_str(if value.is_empty() { "{}" } else { value }).expect("--presence-send takes a JSON object");
+        frame["type"] = json!("presence");
+        frame["id"] = json!(id);
+        return frame;
+    }
+    let (state, extra) = value.split_once(',').unwrap_or((value, ""));
+    let mut frame = json!({ "type": "ring.status", "id": id, "state": state });
+    if state == "stopped" && !extra.is_empty() {
+        frame["reason"] = json!(extra);
+    }
+    if state == "ringing" && !extra.is_empty() {
+        frame["audible"] = json!(extra == "true");
+    }
+    frame
 }
 
 /// The 64 x 64 picture that `--media-image` sends as the cover (stored uncompressed: about 16 KiB, under the 24,576 bytes of the wire), and its hash.
@@ -353,13 +386,19 @@ fn hash_of(u: &Upload) -> String {
     hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-async fn post_transfer(tls: &mut TlsStream<TcpStream>, id: &str, files: &[Value]) -> std::io::Result<(u16, Value)> {
-    json_request(tls, "POST", "/v1/transfers", &json!({ "id": id, "files": files })).await
+async fn post_transfer(tls: &mut TlsStream<TcpStream>, id: &str, files: &[Value], origin: Option<&str>) -> std::io::Result<(u16, Value)> {
+    let mut body = json!({ "id": id, "files": files });
+    // 2B.4: `--upload-origin screenshot|camera` is what a phone's auto-send says about a file (the PC words the toast by it and writes a screenshot to the clipboard
+    // with the sensitive formats).
+    if let Some(o) = origin {
+        body["origin"] = json!(o);
+    }
+    json_request(tls, "POST", "/v1/transfers", &body).await
 }
 
 /// One transfer: a `POST`, then a `PUT` for every file from the offset the PC reports. With `cut` the first connection is dropped after
 /// that many bytes of the first file, and everything resumes on a new one.
-async fn upload(net: &Net, uploads: Vec<Upload>, cut: Option<u64>) {
+async fn upload(net: &Net, uploads: Vec<Upload>, cut: Option<u64>, origin: Option<String>) {
     // The hashes first: a connection that sits idle for 30 s (while a big file is hashed) is closed by the PC.
     let hashes: Vec<String> = uploads.iter().map(hash_of).collect();
     let id = uuid_v7(unix_ms());
@@ -369,7 +408,7 @@ async fn upload(net: &Net, uploads: Vec<Upload>, cut: Option<u64>) {
         .map(|(i, u)| json!({ "fileId": format!("f{}", i + 1), "name": u.name, "size": u.size, "mime": "application/octet-stream" }))
         .collect();
     let mut tls = net.connect().await;
-    let (status, answer) = post_transfer(&mut tls, &id, &files).await.expect("POST /v1/transfers");
+    let (status, answer) = post_transfer(&mut tls, &id, &files, origin.as_deref()).await.expect("POST /v1/transfers");
     if status != 200 {
         say(&format!("upload refused: {status} {answer}"));
         return;
@@ -410,7 +449,7 @@ async fn upload(net: &Net, uploads: Vec<Upload>, cut: Option<u64>) {
                 cut = None;
                 drop(tls);
                 tls = net.connect().await;
-                let (status, answer) = post_transfer(&mut tls, &id, &files).await.expect("POST /v1/transfers (resume)");
+                let (status, answer) = post_transfer(&mut tls, &id, &files, origin.as_deref()).await.expect("POST /v1/transfers (resume)");
                 assert_eq!(status, 200, "the resume POST: {answer}");
                 offsets_now = offsets(&answer);
                 say(&format!("the PC has {} bytes of {}", offsets_now[i], u.name));
@@ -564,6 +603,11 @@ async fn main() {
     let notif_action_error = arg(&args, "--notif-action-error");
     let media = args.iter().any(|a| a == "--media");
     let media_cmd_error = arg(&args, "--media-cmd-error");
+    // 2B.4: `--presence` and `--ring` list the capabilities; `--ring-error <code>` answers a `ring.start` with that error and `--ring-no-ack` doesn't answer it.
+    let presence = args.iter().any(|a| a == "--presence");
+    let ring = args.iter().any(|a| a == "--ring");
+    let ring_error = arg(&args, "--ring-error");
+    let ring_no_ack = args.iter().any(|a| a == "--ring-no-ack");
     // What the phone sends on its own: texts, links and (2B.2) notification messages, one a second. The notification ones keep the order of the command line.
     let mut texts: Vec<(&'static str, String)> = all_args(&args, "--send-text")
         .into_iter()
@@ -585,6 +629,8 @@ async fn main() {
             "--media-clear" => texts.push(("media.clear", String::new())),
             "--media-volume" => texts.push(("media.volume", next())),
             "--media-cmd" => texts.push(("media.cmd", next())),
+            "--presence-send" => texts.push(("presence", next())),
+            "--ring-status" => texts.push(("ring.status", next())),
             _ => {}
         }
         i += 1;
@@ -608,6 +654,7 @@ async fn main() {
     }
     let upload_after: u64 = arg(&args, "--upload-after").map_or(3, |s| s.parse().unwrap());
     let upload_cut: Option<u64> = arg(&args, "--upload-cut").map(|s| s.parse().unwrap());
+    let upload_origin = arg(&args, "--upload-origin");
     let save_dir = arg(&args, "--save-dir").map_or_else(|| std::env::temp_dir().join("fake-phone-downloads"), PathBuf::from);
     let download_cut: Option<u64> = arg(&args, "--download-cut").map(|s| s.parse().unwrap());
     let no_download = args.iter().any(|a| a == "--no-download");
@@ -670,7 +717,7 @@ async fn main() {
     // WebSocket.
     let (mut ws, _) =
         tokio_tungstenite::client_async(format!("ws://{host}:{port}/v1/ws"), net.connect().await).await.expect("WebSocket upgrade");
-    let hello = hello_of(&name, "fake-hello", old_phone, notif, media);
+    let hello = hello_of(&name, "fake-hello", old_phone, notif, media, presence, ring);
     ws.send(Message::Text(hello.to_string().into())).await.unwrap();
     say("connected, hello sent");
     let mut hello_sent_at = Instant::now();
@@ -711,7 +758,7 @@ async fn main() {
                     let (new_ws, _) = tokio_tungstenite::client_async(format!("ws://{host}:{port}/v1/ws"), net.connect().await).await.expect("WebSocket upgrade after the reconnect");
                     ws = new_ws;
                     hellos += 1;
-                    let hello = hello_of(&name, &format!("fake-hello-{hellos}"), old_phone, notif, media);
+                    let hello = hello_of(&name, &format!("fake-hello-{hellos}"), old_phone, notif, media, presence, ring);
                     ws.send(Message::Text(hello.to_string().into())).await.unwrap();
                     hello_sent_at = Instant::now();
                     say(&format!("reconnected at={} (hello sent)", unix_ms()));
@@ -720,7 +767,8 @@ async fn main() {
                 if upload_at.is_some_and(|at| Instant::now() >= at) {
                     upload_at = None;
                     let (net, uploads) = (net.clone(), std::mem::take(&mut uploads));
-                    tokio::spawn(async move { upload(&net, uploads, upload_cut).await });
+                    let upload_origin = upload_origin.clone();
+                    tokio::spawn(async move { upload(&net, uploads, upload_cut, upload_origin).await });
                     continue;
                 }
                 if let Some((i, (kind, text))) = pending_text.take().filter(|_| Instant::now() >= next_text) {
@@ -729,6 +777,8 @@ async fn main() {
                         notif_frame(kind, &text, &id)
                     } else if kind.starts_with("media.") {
                         media_frame(kind, &text, &id)
+                    } else if kind == "presence" || kind == "ring.status" {
+                        presence_frame(kind, &text, &id)
                     } else if kind == "link" {
                         let mut f = json!({ "type": "link", "id": id, "url": text, "sourceApp": "Fake Phone" });
                         if let Some(t) = &link_title {
@@ -871,6 +921,19 @@ async fn main() {
                             ));
                             if let Some(code) = &media_cmd_error {
                                 ws.send(Message::Text(json!({ "type": "error", "ref": v["id"], "code": code, "message": "refused by the fake phone" }).to_string().into())).await.unwrap();
+                            }
+                        }
+                        // Presence and ring (2B.4). A `presence` is never acked (a developer tool: it prints the level, Kin itself never does). A `ring.start` and a
+                        // `ring.stop` are acked (a `ring.start` can be answered with an error, or not at all): the fake phone never makes a sound.
+                        Some("presence") => say(&format!("received presence battery={} pause={}", v.get("battery").unwrap_or(&Value::Null), v.get("pause").unwrap_or(&Value::Null))),
+                        Some(kind @ ("ring.start" | "ring.stop")) => {
+                            say(&format!("received {kind} id={}", v["id"].as_str().unwrap_or("")));
+                            if !(kind == "ring.start" && ring_no_ack) {
+                                let answer = match (&ring_error, kind) {
+                                    (Some(code), "ring.start") => json!({ "type": "error", "ref": v["id"], "code": code, "message": "refused by the fake phone" }),
+                                    _ => json!({ "type": "ack", "ref": v["id"] }),
+                                };
+                                ws.send(Message::Text(answer.to_string().into())).await.unwrap();
                             }
                         }
                         Some("error") => say(&format!("received error code={} ref={}", v["code"].as_str().unwrap_or(""), v["ref"])),

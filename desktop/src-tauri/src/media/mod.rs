@@ -270,14 +270,35 @@ fn state_word_of(session: &ViewSession, now_ms: u64) -> &'static str {
 // ===== the core's side ===================================================================================================
 
 impl Core {
-    /// "Share this PC's media with the phone".
+    /// "Share this PC's media with the phone": the switch **and not paused** (2B.4: a pause acts as the switch off, for as long as it lasts).
     pub fn media_share_on(&self) -> bool {
-        lock(&self.settings).media_share
+        self.feature_enabled(crate::features::MEDIA_SHARE, None) && !self.paused()
     }
 
-    /// "Show the phone's media on this PC".
+    /// "Show the phone's media on this PC": the switch **and not paused** (2B.4).
     pub fn media_show_on(&self) -> bool {
-        lock(&self.settings).media_show
+        self.feature_enabled(crate::features::MEDIA_SHOW, None) && !self.paused()
+    }
+
+    /// This PC's pause began or ended (2B.4, protocol.md "Pause"): the source sends one `media.clear` and stops reading, the viewer takes down what it shows
+    /// and drops the rest; on a resume both start again. The peer hears the new `media.status` (a paused side says it neither shows nor shares). Nothing else
+    /// changes: the switches are left as the user set them.
+    pub(crate) fn media_apply_pause(self: &Arc<Self>, paused: bool) {
+        if self.feature_enabled(crate::features::MEDIA_SHARE, None) {
+            if paused {
+                self.media_stop_source();
+            } else {
+                self.media_start_source();
+            }
+        }
+        if self.feature_enabled(crate::features::MEDIA_SHOW, None) {
+            if paused {
+                self.media_stop_surface();
+            } else {
+                self.media_start_surface();
+            }
+        }
+        self.media_send_status_to_all();
     }
 
     /// Which kind of run this is (design 6.1): the installed Kin, or a test run that touches no real session and no real volume.

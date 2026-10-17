@@ -215,7 +215,7 @@ async fn removing_the_device_on_the_pc_sends_unpair_and_then_401() {
     let w = World::new().await;
     w.pair().await;
     let mut ws = w.open_ws().await;
-    assert!(w.core().remove_device(&w.phone.device_id).unwrap());
+    assert!(w.env.core.remove_device(&w.phone.device_id).await.unwrap());
     let unpair = next_json(&mut ws).await;
     assert_eq!(unpair["type"], "unpair");
     send_json(&mut ws, &json!({ "type": "ack", "ref": unpair["id"] })).await;

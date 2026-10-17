@@ -301,6 +301,19 @@ fn check_outcome(name: &str, out: &messages::Outcome, expect: &Value, frame_id: 
             other => panic!("{name}: expected a media message, got {other:?}"),
         }
     }
+    // A `presence` or `ring.status` says what the receiver ended up with (changelog 58): `expect.presence`.
+    if let Some(want) = expect.get("presence") {
+        match &out.action {
+            messages::Action::Presence(m) => {
+                let got = match m {
+                    kin_lib::presence::wire::PresenceMsg::Presence(b) => b.to_json(),
+                    kin_lib::presence::wire::PresenceMsg::RingStatus(s) => s.to_json(),
+                };
+                assert_eq!(&got, want, "{name}: what the receiver ends up with");
+            }
+            other => panic!("{name}: expected a presence message, got {other:?}"),
+        }
+    }
     // A text that is delivered says whether it is sensitive: `expect.sensitive`, false when the case doesn't say.
     if let messages::Action::DeliverText { sensitive, .. } = &out.action {
         assert_eq!(*sensitive, expect["sensitive"].as_bool().unwrap_or(false), "{name}: sensitive");
@@ -319,6 +332,8 @@ fn run_message_case(case: &Value) {
         set_own(&mut rx, own);
         rx
     };
+    // A case may say that the phone's ring budget is spent (changelog 58): a `ring.start` is then `rate_limited`.
+    rx.set_ring_budget_spent(case["ringBudgetSpent"] == true);
     let (input, id) = input_of(case);
     let out = match &input {
         Input::Text(bytes) => rx.handle_frame(Frame::Text(bytes), &mut dedup),
@@ -406,6 +421,22 @@ const MESSAGES_SEQUENCE_SCOPE_2B2: &[&str] = &[
     "notif-invalid-post-keeps-the-connection-open",
     "notif-status-then-icon-then-post",
 ];
+/// 2B.4 (presence, pause and ring, changelog 58): the `presence-*` and `ring-*` cases. The rules that are not one frame are in `presence.json`: `presence_vectors.rs`.
+const MESSAGES_VALID_SCOPE_2B4: &[&str] = &["presence-*", "ring-*"];
+const MESSAGES_INVALID_SCOPE_2B4: &[&str] = &["presence-*", "ring-*"];
+const MESSAGES_SEQUENCE_SCOPE_2B4: &[&str] = &[
+    "presence-not-sent-without-capability",
+    "presence-dropped-when-feature-off-is-silent",
+    "presence-is-not-acked-or-deduplicated",
+    "presence-snapshot-replaces-pause",
+    "presence-forgotten-on-close",
+    "ring-not-sent-without-capability",
+    "ring-capability-follows-the-switch",
+    "ring-start-is-not-resent-after-reconnect",
+    "ring-start-is-acked-once",
+    "ring-status-is-ephemeral",
+    "ring-disabled-error-is-not-remembered",
+];
 /// 2B.3 (media controls, changelog 57): the `media-*` cases. The policy ones (who may send what, what a source answers) are in `media.json`: `media_vectors.rs`.
 const MESSAGES_VALID_SCOPE_2B3: &[&str] = &["media-*"];
 const MESSAGES_INVALID_SCOPE_2B3: &[&str] = &["media-*"];
@@ -456,14 +487,14 @@ fn messages_valid_and_invalid() {
             &with(&with(&with(MESSAGES_VALID_SCOPE, MESSAGES_VALID_SCOPE_1_2), MESSAGES_VALID_SCOPE_1_3), MESSAGES_VALID_SCOPE_2B1),
             MESSAGES_VALID_SCOPE_2B2,
         ),
-        MESSAGES_VALID_SCOPE_2B3,
+        &with(MESSAGES_VALID_SCOPE_2B3, MESSAGES_VALID_SCOPE_2B4),
     );
     let invalid = with(
         &with(
             &with(&with(&with(MESSAGES_INVALID_SCOPE, MESSAGES_INVALID_SCOPE_1_2), MESSAGES_INVALID_SCOPE_1_3), MESSAGES_INVALID_SCOPE_2B1),
             MESSAGES_INVALID_SCOPE_2B2,
         ),
-        MESSAGES_INVALID_SCOPE_2B3,
+        &with(MESSAGES_INVALID_SCOPE_2B3, MESSAGES_INVALID_SCOPE_2B4),
     );
     for (key, scope) in [("valid", valid.as_slice()), ("invalid", invalid.as_slice())] {
         assert_patterns_match(key, scope, &names(&root[key]));
@@ -518,7 +549,7 @@ fn messages_sequences() {
             ),
             MESSAGES_SEQUENCE_SCOPE_2B2,
         ),
-        MESSAGES_SEQUENCE_SCOPE_2B3,
+        &with(MESSAGES_SEQUENCE_SCOPE_2B3, MESSAGES_SEQUENCE_SCOPE_2B4),
     );
     assert_patterns_match("sequences", &scope, &names(&root["sequences"]));
     let mut with_events = 0;
@@ -719,11 +750,11 @@ fn links_json_send_as_and_text_fallback() {
     }
 }
 
-/// This PC says in its own `hello` that it understands `link` (the phone sends a `link` only to a peer that says so) and `media` (always: its switches travel in
-/// `media.status`, changelog 57).
+/// This PC says in its own `hello` that it understands `link` (the phone sends a `link` only to a peer that says so), `media` (always: its switches travel in
+/// `media.status`, changelog 57) and `presence` (always, changelog 58). It lists nothing for `ring`: it only ever receives `ring.status`.
 #[test]
-fn the_pcs_hello_lists_the_link_and_media_capabilities() {
-    assert_eq!(messages::CAPABILITIES, ["link", "media"]);
+fn the_pcs_hello_lists_the_link_media_and_presence_capabilities() {
+    assert_eq!(messages::CAPABILITIES, ["link", "media", "presence"]);
 }
 
 #[test]

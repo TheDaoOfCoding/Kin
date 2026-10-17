@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 use tauri_plugin_global_shortcut::{Modifiers, Shortcut};
 
+use crate::features::Overrides;
+use crate::presence::pause::PauseState;
+
 /// Why this one: see windows.md, "Hotkey". Three modifiers and a letter that no common Windows or app shortcut uses.
 pub const DEFAULT_HOTKEY: &str = "Ctrl+Alt+Shift+K";
 
@@ -139,6 +142,17 @@ pub struct Settings {
     pub media_share: bool,
     /// "Show the phone's media on this PC" (2B.3, **off by default**): what plays on the phone shows in the Windows media flyout and the tray panel.
     pub media_show: bool,
+    /// "Share this PC's battery with the phone" (2B.4, on by default). A PC with no battery shares nothing whatever this says.
+    pub presence_share_battery: bool,
+    /// "Show my phone's battery here" (2B.4, on by default): the tray tooltip, the status line and the drop window.
+    pub presence_show_phone: bool,
+    /// "Warn me when the phone's battery is low" (2B.4, on by default): one toast when it drops to 15 % or less and is not charging.
+    pub low_battery_nudge: bool,
+    /// Pause Kin (2B.4): this PC's own state. Kept in the file, so it survives a restart and a reboot. `None`: not paused. (The gate compares the clock on
+    /// each use: an end that has passed is simply no pause.)
+    pub pause: Option<PauseState>,
+    /// The per-peer overrides of the features (design section 4). Empty, and with no UI in 2B.4.
+    pub feature_overrides: Overrides,
 }
 
 impl Default for Settings {
@@ -157,11 +171,31 @@ impl Default for Settings {
             mirror_text_only: false,
             media_share: false,
             media_show: false,
+            presence_share_battery: true,
+            presence_show_phone: true,
+            low_battery_nudge: true,
+            pause: None,
+            feature_overrides: Overrides::new(),
         }
     }
 }
 
 impl Settings {
+    /// The default of a feature (the flat key), for `features::resolve`. A feature this PC has no switch for is off.
+    pub fn feature_default(&self, feature: &str) -> bool {
+        match feature {
+            crate::features::CLIPBOARD_SYNC => self.auto_clipboard_sync,
+            crate::features::LINKS_AUTO_OPEN => self.open_links_automatically,
+            crate::features::NOTIF_SHOW => self.mirror_notifications,
+            crate::features::MEDIA_SHARE => self.media_share,
+            crate::features::MEDIA_SHOW => self.media_show,
+            crate::features::PRESENCE_SHARE => self.presence_share_battery,
+            crate::features::PRESENCE_SHOW => self.presence_show_phone,
+            crate::features::PRESENCE_NUDGE => self.low_battery_nudge,
+            _ => false,
+        }
+    }
+
     /// Reads the settings out of a JSON text. The second value lists what was wrong, for the log.
     pub fn from_json(text: &str) -> (Settings, Vec<String>) {
         let mut settings = Settings::default();
@@ -204,6 +238,9 @@ impl Settings {
             ("mirrorTextOnly", &mut settings.mirror_text_only),
             ("mediaShare", &mut settings.media_share),
             ("mediaShow", &mut settings.media_show),
+            ("presenceShareBattery", &mut settings.presence_share_battery),
+            ("presenceShowPhone", &mut settings.presence_show_phone),
+            ("lowBatteryNudge", &mut settings.low_battery_nudge),
         ] {
             match obj.get(key) {
                 None | Some(Value::Null) => {}
@@ -215,6 +252,18 @@ impl Settings {
             None | Some(Value::Null) => {}
             Some(Value::String(s)) => settings.device_name = clean_device_name(s),
             Some(_) => problems.push("deviceName must be a string".to_string()),
+        }
+        match obj.get("pause") {
+            None | Some(Value::Null) => {}
+            Some(v) => match PauseState::from_json(v) {
+                Some(p) => settings.pause = Some(p),
+                None => problems.push("pause must be {\"until\": <Unix ms>} or {\"untilResumed\": true}".to_string()),
+            },
+        }
+        match obj.get("featureOverrides") {
+            None | Some(Value::Null) => {}
+            Some(v @ Value::Object(_)) => settings.feature_overrides = crate::features::overrides_from_json(v),
+            Some(_) => problems.push("featureOverrides must be an object".to_string()),
         }
         (settings, problems)
     }
@@ -234,6 +283,11 @@ impl Settings {
             "mirrorTextOnly": self.mirror_text_only,
             "mediaShare": self.media_share,
             "mediaShow": self.media_show,
+            "presenceShareBattery": self.presence_share_battery,
+            "presenceShowPhone": self.presence_show_phone,
+            "lowBatteryNudge": self.low_battery_nudge,
+            "pause": self.pause.map(|p| p.to_json()),
+            "featureOverrides": crate::features::overrides_to_json(&self.feature_overrides),
         })
     }
 
@@ -283,6 +337,31 @@ mod tests {
         assert_eq!(problems.len(), 1);
         let v = Settings::default().to_json();
         assert_eq!((v["mediaShare"].as_bool(), v["mediaShow"].as_bool()), (Some(false), Some(false)));
+    }
+
+    #[test]
+    fn the_presence_switches_are_on_by_default_and_the_pause_and_overrides_are_empty() {
+        let s = Settings::default();
+        assert!(
+            s.presence_share_battery && s.presence_show_phone && s.low_battery_nudge,
+            "battery sharing and the nudge are on (decision Q5)"
+        );
+        assert_eq!((s.pause, s.feature_overrides.len()), (None, 0));
+        let v = s.to_json();
+        assert_eq!(v["pause"], Value::Null);
+        assert_eq!(v["featureOverrides"], json!({}));
+        let (s, problems) = Settings::from_json(
+            r#"{ "pause": {"until": 1760000000000}, "lowBatteryNudge": false, "presenceShowPhone": "x", "featureOverrides": {"a": {"media.show": true}} }"#,
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(s.pause, Some(PauseState::Until(1_760_000_000_000)));
+        assert!(!s.low_battery_nudge && s.presence_show_phone);
+        assert!(!s.feature_default(crate::features::PRESENCE_NUDGE) && !s.feature_default("no.such.feature"));
+        assert!(crate::features::resolve(crate::features::MEDIA_SHOW, Some("a"), s.media_show, &s.feature_overrides));
+        let (s, problems) = Settings::from_json(r#"{ "pause": {"untilResumed": true} }"#);
+        assert!(problems.is_empty() && s.pause == Some(PauseState::UntilResumed));
+        let (_, problems) = Settings::from_json(r#"{ "pause": "1h" }"#);
+        assert_eq!(problems.len(), 1);
     }
 
     #[test]
@@ -442,6 +521,11 @@ mod tests {
             mirror_text_only: true,
             media_share: true,
             media_show: true,
+            presence_share_battery: false,
+            presence_show_phone: false,
+            low_battery_nudge: false,
+            pause: Some(PauseState::Until(1_760_000_000_000)),
+            feature_overrides: crate::features::overrides_from_json(&json!({ "dev-a": { "clipboard.sync": false } })),
         };
         s.save(dir.path()).unwrap();
         assert_eq!(Settings::load(dir.path()), s);

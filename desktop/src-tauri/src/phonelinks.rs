@@ -11,7 +11,7 @@
 //!
 //! Either way the link is stored in the history (like a text) and never goes to the clipboard by itself. The URL is never logged: a log line has
 //! its length and what was done with it.
-use crate::core::{Core, Event, lock, short};
+use crate::core::{Core, Event, short};
 use crate::encoding::unix_ms;
 use crate::links::link_address;
 use crate::quiet::UserState;
@@ -92,7 +92,13 @@ impl Core {
         ) {
             log::debug!("the link {id} is not added to the history again: {e}");
         }
-        let open_automatically = lock(&self.settings).open_links_automatically;
+        // Quiet arrival while this PC is paused (2B.4): in the history above, and that is all: no browser, no toast.
+        if self.paused() {
+            log::info!("link {id} from device {}: arrived while paused, handled quietly (history only)", short(device_id));
+            self.presence_note_quiet_arrival();
+            return;
+        }
+        let open_automatically = self.feature_enabled(crate::features::LINKS_AUTO_OPEN, Some(device_id));
         let state = self.user_state().state();
         let decision = decide(open_automatically, state, link_address(&url).warn);
         let mut opened = false;

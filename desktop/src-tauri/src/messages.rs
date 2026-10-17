@@ -104,6 +104,16 @@ pub enum Action {
     /// A `media.*` message dropped silently (no reply, no error): the receiver's own `hello` or the sender's didn't list `media`, or it was an image that failed its
     /// checks. Counted.
     MediaDropped,
+    /// A `presence` or a `ring.status` (changelog 58) that passed validation. Neither is acked or remembered.
+    Presence(crate::presence::wire::PresenceMsg),
+    /// A `presence` or `ring.status` dropped silently (no reply, no error): the receiver's own `hello` or the sender's didn't list `presence`. Counted.
+    PresenceDropped,
+    /// A `ring.start` or `ring.stop` (PC to phone only, so only the vectors reach it on the PC's receiver): acked, and never queued or re-sent. `start`: whether
+    /// it is a start (else a stop).
+    RingCommand {
+        id: String,
+        start: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,6 +147,11 @@ impl Action {
             Action::NotifDropped(_) => "notif_dropped",
             Action::Media(m) => crate::media::wire::vector_name(&m.msg),
             Action::MediaDropped => "media_dropped",
+            Action::Presence(crate::presence::wire::PresenceMsg::Presence(_)) => "presence",
+            Action::Presence(crate::presence::wire::PresenceMsg::RingStatus(_)) => "ring_status",
+            Action::PresenceDropped => "presence_dropped",
+            Action::RingCommand { start: true, .. } => "ring_start",
+            Action::RingCommand { start: false, .. } => "ring_stop",
         })
     }
 }
@@ -235,9 +250,10 @@ impl Peer {
     }
 }
 
-/// What this PC says it can do in its own `hello`: `link`, and `media` always (changelog 57: the switches of media travel in `media.status`, not in a new `hello`).
-/// `notif` is added by the core while "Show phone notifications" is on.
-pub const CAPABILITIES: &[&str] = &["link", "media"];
+/// What this PC says it can do in its own `hello`: `link`, `media` always (changelog 57: the switches of media travel in `media.status`, not in a new `hello`)
+/// and `presence` always (changelog 58: the switches travel as what a snapshot contains). The PC lists nothing for `ring`. `notif` is added by the core while
+/// "Show phone notifications" is on.
+pub const CAPABILITIES: &[&str] = &["link", "media", "presence"];
 
 /// The capabilities of a `hello`: an array of strings, anything else counts as none and entries that are not strings are skipped. A bad
 /// value never fails a `hello`.
@@ -260,6 +276,8 @@ pub struct Receiver {
     peer: Option<Peer>,
     /// The capabilities of this side's own latest `hello` (what it said it can do), for step 6b of the validation order.
     own_capabilities: Vec<String>,
+    /// The phone's ring budget is spent (see `set_ring_budget_spent`).
+    ring_budget_spent: bool,
 }
 
 /// Message types and which role may receive them. `complete` only goes phone -> PC, `clipboard` and `offer` only
@@ -273,6 +291,13 @@ fn receivable(role: Role, ty: &str) -> bool {
     if crate::media::wire::is_media(ty) {
         return true;
     }
+    // `presence` goes both ways (changelog 58); `ring.start` and `ring.stop` are received by the phone, `ring.status` by the PC.
+    match ty {
+        "presence" => return true,
+        "ring.start" | "ring.stop" => return role == Role::Phone,
+        "ring.status" => return role == Role::Pc,
+        _ => {}
+    }
     match ty {
         "hello" | "ack" | "error" | "text" | "link" | "cancel" | "unpair" | "ping" => true,
         "complete" => role == Role::Pc,
@@ -283,7 +308,7 @@ fn receivable(role: Role, ty: &str) -> bool {
 
 impl Receiver {
     pub fn new(role: Role) -> Self {
-        Receiver { role, state: State::BeforeHello, peer: None, own_capabilities: Vec::new() }
+        Receiver { role, state: State::BeforeHello, peer: None, own_capabilities: Vec::new(), ring_budget_spent: false }
     }
 
     /// What this side lists in its own `hello` (changelog 56: a `notif.*` message is dropped unless both sides list `notif`). The PC sets it from the
@@ -349,6 +374,12 @@ impl Receiver {
         if crate::media::wire::is_media(ty) {
             return self.media(ty, &obj, text.len(), reference);
         }
+        if crate::presence::wire::is_presence_type(ty) {
+            return self.presence(ty, &obj, text.len(), reference);
+        }
+        if crate::presence::wire::is_ring_command(ty) {
+            return self.ring_command(ty, text.len(), reference, dedup);
+        }
         match ty {
             "hello" => self.hello(&obj, reference),
             "ack" => ack(&obj),
@@ -410,6 +441,59 @@ impl Receiver {
                 Outcome { reply: None, action: Action::Media(wire::Inbound { id, msg }), close: None }
             }
         }
+    }
+
+    /// A `presence` or `ring.status` (validation step 6d, changelog 58): dropped silently unless both sides list `presence`, then the 4 KiB rule (2 KiB for
+    /// `ring.status`), then the fields. Neither is acked, remembered or de-duplicated: a repeated `id` is processed again.
+    fn presence(&mut self, ty: &str, obj: &Map<String, Value>, frame_bytes: usize, reference: Option<&str>) -> Outcome {
+        use crate::presence::wire;
+        let capable =
+            self.own_capabilities.iter().any(|c| c == wire::CAPABILITY) && self.peer.as_ref().is_some_and(|p| p.has(wire::CAPABILITY));
+        if !capable {
+            return Outcome { reply: None, action: Action::PresenceDropped, close: None };
+        }
+        if frame_bytes > wire::frame_limit(ty) {
+            let message = format!("A {ty} message can be at most {} KiB.", wire::frame_limit(ty) / 1024);
+            return Outcome::error("too_large", &message, reference, None);
+        }
+        match wire::parse(ty, obj) {
+            wire::Parsed::Bad => bad_fields(reference),
+            wire::Parsed::Ok(msg) => Outcome { reply: None, action: Action::Presence(msg), close: None },
+        }
+    }
+
+    /// A `ring.start` or `ring.stop` (the phone's side of the rules, kept here so the vectors can run on it): never dropped, because it is acked. The 2 KiB rule, the
+    /// `id`, the duplicate check (a repeat gets the first answer and rings nothing again), then for a start: `disabled` if this side's own `hello` doesn't list
+    /// `ring`, `rate_limited` if its budget is spent. An error answer is not remembered. A stop is always acked, also with the switch off.
+    fn ring_command(&mut self, ty: &str, frame_bytes: usize, reference: Option<&str>, dedup: &mut dyn Dedup) -> Outcome {
+        use crate::presence::wire;
+        if frame_bytes > wire::MAX_RING_FRAME_BYTES {
+            return Outcome::error("too_large", "A ring message can be at most 2 KiB.", reference, None);
+        }
+        let Some(id) = reference else {
+            return bad_fields(None);
+        };
+        let start = ty == "ring.start";
+        if let Some(first) = dedup.lookup(id) {
+            let reply = serde_json::from_str(&first).unwrap_or_else(|_| ack_message(id));
+            return Outcome { reply: Some(reply), action: Action::IgnoreDuplicate, close: None };
+        }
+        if start {
+            if !self.own_capabilities.iter().any(|c| c == wire::RING_CAPABILITY) {
+                return Outcome::error("disabled", "Ringing is turned off on this phone.", reference, None);
+            }
+            if self.ring_budget_spent {
+                return Outcome::error("rate_limited", "Too many ring requests.", reference, None);
+            }
+        }
+        let reply = ack_message(id);
+        dedup.remember(id, &reply.to_string());
+        Outcome { reply: Some(reply), action: Action::RingCommand { id: id.to_string(), start }, close: None }
+    }
+
+    /// For the vectors: the phone's ring budget is spent (3 starts in the last 60 s, or inside the lock-out). The app (Android) keeps the real budget.
+    pub fn set_ring_budget_spent(&mut self, spent: bool) {
+        self.ring_budget_spent = spent;
     }
 
     fn hello(&mut self, obj: &Map<String, Value>, reference: Option<&str>) -> Outcome {

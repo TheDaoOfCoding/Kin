@@ -139,9 +139,9 @@ pub async fn copy_pairing_link(window: WebviewWindow, state: State<'_, AppState>
 
 /// The "Remove this device" button of the "New device paired" notice.
 #[tauri::command]
-pub fn remove_device(window: WebviewWindow, state: State<'_, AppState>, device_id: String) -> Result<(), String> {
+pub async fn remove_device(window: WebviewWindow, state: State<'_, AppState>, device_id: String) -> Result<(), String> {
     only(&window, &[PAIRING_WINDOW, SETTINGS_WINDOW], "remove_device")?;
-    state.core.remove_device(&device_id).map(|_| ()).map_err(|e| e.to_string())
+    state.core.remove_device(&device_id).await.map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// Closes (destroys) the window that asked.
@@ -251,6 +251,11 @@ pub const DEBUG_WINDOW: &str = "debug";
 
 /// Opens a window of the page `index.html?w=<label>`, or brings it to the front. It is destroyed when it is closed, like the others.
 fn open_page(app: &AppHandle, label: &'static str, title: &'static str, size: (f64, f64), min: (f64, f64)) {
+    open_page_at(app, label, title, size, min, None);
+}
+
+/// Like [`open_page`], with a `#fragment` for the page to read when it starts (`#unlink=<deviceId>`).
+fn open_page_at(app: &AppHandle, label: &'static str, title: &'static str, size: (f64, f64), min: (f64, f64), fragment: Option<String>) {
     let state = app.state::<AppState>();
     if state.core.config.dev_no_windows {
         log::info!("{label} window skipped (--dev-no-windows)");
@@ -263,9 +268,13 @@ fn open_page(app: &AppHandle, label: &'static str, title: &'static str, size: (f
     }
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let url = match &fragment {
+            Some(f) => format!("index.html?w={label}#{f}"),
+            None => format!("index.html?w={label}"),
+        };
         let built = with_instance_data(
             &app,
-            WebviewWindowBuilder::new(&app, label, WebviewUrl::App(format!("index.html?w={label}").into()))
+            WebviewWindowBuilder::new(&app, label, WebviewUrl::App(url.into()))
                 .title(title)
                 .inner_size(size.0, size.1)
                 .min_inner_size(min.0, min.1)
@@ -284,6 +293,17 @@ pub fn open_history_window(app: &AppHandle) {
 
 pub fn open_settings_window(app: &AppHandle) {
     open_page(app, SETTINGS_WINDOW, "Settings", (480.0, 780.0), (420.0, 420.0));
+}
+
+/// The tray's "Unlink phone...": the Settings window with the confirmation for this phone already open (`#unlink=<deviceId>`). A window that is open already is
+/// told with an event, since its page has been read.
+pub fn open_unlink(app: &AppHandle, device_id: &str) {
+    if app.get_webview_window(SETTINGS_WINDOW).is_some() {
+        open_settings_window(app);
+        let _ = app.emit_to(SETTINGS_WINDOW, "unlink-requested", device_id.to_string());
+        return;
+    }
+    open_page_at(app, SETTINGS_WINDOW, "Settings", (480.0, 780.0), (420.0, 420.0), Some(format!("unlink={device_id}")));
 }
 
 pub fn open_debug_window(app: &AppHandle) {
@@ -404,6 +424,41 @@ pub async fn set_media_option(window: WebviewWindow, state: State<'_, AppState>,
         "show" => tauri::async_runtime::spawn_blocking(move || core.set_media_show(on)).await.map_err(|e| e.to_string()),
         other => Err(format!("no such option: {other}")),
     }
+}
+
+/// Pause Kin (2B.4) from the Settings or the drop window: `1h`, `tomorrow`, `resumed` (until the user resumes) or `resume` (end the pause).
+#[tauri::command]
+pub async fn set_pause(window: WebviewWindow, state: State<'_, AppState>, choice: String) -> Result<(), String> {
+    only(&window, &[SETTINGS_WINDOW, DROP_WINDOW], "set_pause")?;
+    let choice = if choice == "resume" {
+        None
+    } else {
+        Some(crate::presence::pause::PauseChoice::parse(&choice).ok_or_else(|| format!("no such pause: {choice}"))?)
+    };
+    // A pause takes the media session down and puts it back, which touches Windows and starts threads: not on the thread that runs the window.
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || core.set_pause(choice)).await.map_err(|e| e.to_string())
+}
+
+/// "Ring my phone" / "Stop ringing phone" (2B.4). The answer is the line the window shows. The PC makes no sound: this is a message to the phone.
+#[tauri::command]
+pub async fn ring_phone(window: WebviewWindow, state: State<'_, AppState>, start: bool) -> Result<String, String> {
+    only(&window, &[SETTINGS_WINDOW, DROP_WINDOW], "ring_phone")?;
+    let core = state.core.clone();
+    Ok(if start { core.ring_start().await } else { core.ring_stop().await })
+}
+
+/// The three switches of "Presence" (2B.4), each on by default: `shareBattery`, `showPhone` and `lowBatteryNudge`.
+#[tauri::command]
+pub fn set_presence_option(window: WebviewWindow, state: State<'_, AppState>, name: String, on: bool) -> Result<(), String> {
+    only(&window, &[SETTINGS_WINDOW], "set_presence_option")?;
+    match name.as_str() {
+        "shareBattery" => state.core.set_presence_share_battery(on),
+        "showPhone" => state.core.set_presence_show_phone(on),
+        "lowBatteryNudge" => state.core.set_low_battery_nudge(on),
+        other => return Err(format!("no such option: {other}")),
+    }
+    Ok(())
 }
 
 /// The buttons of the drop window's media strip: `toggle`, `next` and `prev` of the phone's media (a `media.cmd` to the phone), `seek` (a position in ms) and

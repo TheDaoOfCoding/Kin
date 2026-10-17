@@ -55,7 +55,7 @@ $Aumid = $null; $Clsid = $null; $kin = $null; $fakeProc = $null; $backup = $null
 try {
     # the switch is on from the start; no hotkey, no automatic clipboard sync (the clipboard is only touched by Copy)
     '{ "mirrorNotifications": true, "hotkey": "", "autoClipboardSync": false }' | Set-Content (Join-Path $Data 'settings.json') -Encoding ASCII
-    $kin = Start-DevKin @('--data-dir', $Data, '--dev-bind', '127.0.0.1', '--dev-print-pair-url', '--dev-toast-quiet', '--dev-no-open', '--dev-no-windows')
+    $kin = Start-DevKin @('--data-dir', ('"{0}"' -f $Data),'--dev-bind', '127.0.0.1', '--dev-print-pair-url', '--dev-toast-quiet', '--dev-no-open', '--dev-no-windows')
     $log = Join-Path $Data 'logs\kin.log'
     $ready = Wait-Until { (Test-Path $log) -and ((Get-Content $log -Raw -ErrorAction SilentlyContinue) -match 'activator class') } 30 'phone notifications to start'
     Check 'the dev Kin started with phone notifications on' $ready

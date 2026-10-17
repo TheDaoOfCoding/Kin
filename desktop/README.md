@@ -162,6 +162,19 @@ Both directions are off by default (`mediaShare` and `mediaShow` in `settings.js
 | The whole check against the real Windows | `tools\check-2b3-desktop.ps1` (a debug build and the examples; about 1 minute; silent, refuses to run while a game is running, checks that the real volume is unchanged and the installed Kin untouched) |
 | `status.json` | `media.view` (the switches, `mode` installed or test, whether the reader and the flyout run, a line per phone, `none\|playing\|paused` for each direction) and `media.counts` (sent, received, commands, drops: numbers only). `--dev-dump-view media` also writes the panel the drop window shows, with every title, artist, app name and picture replaced by `<redacted>` (shape, states, positions and volume stay) |
 
+### Presence, Pause and Ring (2B.4)
+
+Pause is `settings.json` (`"pause": {"until": <Unix ms>}` or `{"untilResumed": true}`), the three presence switches are `presenceShareBattery`, `presenceShowPhone` and `lowBatteryNudge` (all on by default), and `featureOverrides` (empty, no UI) is the per-peer store behind `Core::feature_enabled`. **Nothing here makes a sound** and no test touches the real clipboard, volume or media.
+
+| What | How |
+|---|---|
+| Pause, resume, ring (the same as the tray, for a script; no input injection) | `Kin.exe --data-dir <dir> --pause 1h\|tomorrow\|resumed\|resume`, `--ring`, `--ring-stop` (a second launch hands them to the running Kin of **the same program file and data directory**; the result is in `status.json`: `pause`, `ring`) |
+| A fake battery for this PC (a desktop has none) | `--dev-battery 62:charging\|9:unplugged\|none` (`KIN_DEV_BATTERY`; a developer setting, so it needs a data directory of its own), or at run time `--dev-set devBattery 40:charging` |
+| The presence switches, unlinking without a window | `--dev-set presenceShareBattery\|presenceShowPhone\|lowBatteryNudge true\|false`, `--dev-set unlinkDevice <deviceId>` |
+| The phone | `fake_phone --presence` / `--ring` (capabilities), `--presence-send '{"battery":{"level":14,"charging":false},"pause":{"remainingMs":3600000}}'`, `--ring-status ringing\|ringing,false\|stopped,timeout`, `--ring-error <code>`, `--ring-no-ack`, `--upload <file> --upload-origin screenshot\|camera`; it prints `received presence ...`, `received ring.start id=..`, `received ring.stop id=..` |
+| `status.json` | `pause` (`on`, `untilResumed`, `untilMs`, `quietArrivals`, `quietSensitive`), `presence` (`phone.level/charging/paused` as **numbers**, the switches, `hasBattery`, `counts`) and `ring` (`state`, `counts`). Never a phone name with a level, never a pause time of the phone |
+| The whole check against the real Windows | `tools\check-2b4-desktop.ps1` (a debug build and the examples; silent; refuses to run while a game is running; saves and restores the clipboard; checks the installed Kin's PIDs are unchanged) |
+
 ### Settings (first launch)
 
 A flag wins over its environment variable.

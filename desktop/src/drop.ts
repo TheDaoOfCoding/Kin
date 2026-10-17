@@ -7,7 +7,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { button } from "./dom";
+import { button, sensitiveWhilePausedText } from "./dom";
 
 type Transfer = {
   id: string;
@@ -43,7 +43,21 @@ type Media = {
   volume: { level: number; muted: boolean } | null;
   testMode: boolean;
 };
-type View = { phone: string | null; connected: boolean; active: Transfer[]; recent: Transfer[]; folder: string; media: Media };
+/** The phone strip (2B.4): the phone's battery, the pause of both devices, Ring my phone and Pause. (The same shape as the Settings window's `Presence`.) */
+type Presence = {
+  pause: { on: boolean; untilResumed: boolean; text: string | null; quietArrivals: number; quietSensitive: number };
+  phone: {
+    name: string | null;
+    connected: boolean;
+    battery: { level: number; charging: boolean } | null;
+    lastKnown: { level: number; charging: boolean } | null;
+    paused: boolean;
+    pausedText: string | null;
+  };
+  ring: { can: boolean; active: boolean; text: string | null; reason: string | null };
+  showPhone: boolean;
+};
+type View = { phone: string | null; connected: boolean; active: Transfer[]; recent: Transfer[]; folder: string; media: Media; presence: Presence };
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, props: Partial<HTMLElementTagNameMap[K]> = {}, ...children: (Node | string)[]): HTMLElementTagNameMap[K] {
   const node = Object.assign(document.createElement(tag), props);
@@ -87,7 +101,55 @@ export function startDropWindow(root: HTMLElement): void {
   const list = el("div", { className: "transfers" });
   const folder = el("p", { className: "hint small" });
   const media = el("div", { className: "media" });
-  root.append(el("h1", {}, "Send to phone"), media, zone, status, list, folder);
+  const strip = el("div", { className: "phonestrip" });
+  root.append(el("h1", {}, "Send to phone"), strip, media, zone, status, list, folder);
+
+  /** The phone strip: name and battery, "Paused until 14:30" chips for both devices, Ring my phone and Pause. Nothing runs while the window is closed. */
+  const drawStrip = (p: Presence) => {
+    const name = p.phone.name;
+    if (!name) {
+      strip.replaceChildren();
+      strip.hidden = true;
+      return;
+    }
+    strip.hidden = false;
+    const bat = p.phone.connected ? p.phone.battery : p.phone.lastKnown;
+    const batText = p.showPhone && bat ? ` · ${bat.level}%${bat.charging ? " ⚡" : ""}${p.phone.connected ? "" : " (last known)"}` : "";
+    const chips: HTMLElement[] = [];
+    if (p.pause.on) chips.push(el("span", { className: "chip" }, `This PC paused ${p.pause.text ?? ""}`));
+    if (p.phone.connected && p.phone.paused) chips.push(el("span", { className: "chip" }, `${name} paused ${p.phone.pausedText ?? ""}`));
+    const say = el("span", { className: "hint small" }, p.ring.active ? (p.ring.text ?? "") : p.ring.can ? "" : p.ring.reason ?? "");
+    const act = async (command: string, args: Record<string, unknown>) => {
+      try {
+        say.textContent = String((await invoke<string | null>(command, args)) ?? "");
+      } catch (e) {
+        say.textContent = String(e);
+      }
+      void refresh();
+    };
+    const ring = p.ring.active
+      ? button("Stop ringing phone", () => void act("ring_phone", { start: false }), "small")
+      : (() => {
+          const b = button("Ring my phone", () => void act("ring_phone", { start: true }), "secondary small");
+          b.disabled = !p.ring.can;
+          return b;
+        })();
+    const pauseButtons = p.pause.on
+      ? [button("Resume Kin", () => void act("set_pause", { choice: "resume" }), "small")]
+      : [
+          button("Pause 1 h", () => void act("set_pause", { choice: "1h" }), "secondary small"),
+          button("Until tomorrow", () => void act("set_pause", { choice: "tomorrow" }), "secondary small"),
+          button("Until I resume", () => void act("set_pause", { choice: "resumed" }), "secondary small"),
+        ];
+    strip.replaceChildren(
+      el("strong", {}, `${name}${batText}`),
+      ...chips,
+      el("div", { className: "row left" }, ring, ...pauseButtons),
+      say,
+      p.pause.on && p.pause.quietArrivals ? el("span", { className: "hint small" }, `${p.pause.quietArrivals} received while paused`) : "",
+      p.pause.on && p.pause.quietSensitive ? el("span", { className: "hint small" }, sensitiveWhilePausedText(p.pause.quietSensitive)) : "",
+    );
+  };
 
   const command = (action: string, value?: number) => void invoke("media_command", { action, value: value ?? null });
   const time = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
@@ -189,6 +251,7 @@ export function startDropWindow(root: HTMLElement): void {
     list.replaceChildren(...view.active.map(row), ...view.recent.filter((t) => !view.active.some((a) => a.id === t.id)).slice(0, 5).map(row));
     folder.textContent = `Received files go to ${view.folder}`;
     drawMedia(view.media);
+    drawStrip(view.presence);
   };
 
   let busy = false;

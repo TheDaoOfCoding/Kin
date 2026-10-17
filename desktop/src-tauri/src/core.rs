@@ -113,6 +113,8 @@ pub struct Snapshot {
     pub queued: usize,
     /// While a phone's media is shown on this PC: `playing` or `paused` (never the title: the tray is visible to anyone near the PC).
     pub media: Option<&'static str>,
+    /// The phone's battery and pause, this PC's pause and the ring (2B.4): what the tooltip, the status line and the icon say.
+    pub presence: crate::presence::PresenceView,
 }
 
 impl Snapshot {
@@ -211,6 +213,8 @@ pub struct Core {
     pub(crate) mirror: crate::mirror::Mirror,
     /// Media controls in both directions (2B.3, media/). In memory only, and nothing about what plays is ever stored or logged.
     pub(crate) media: crate::media::Media,
+    /// Presence, Pause and Ring (2B.4, presence/). In memory only: a battery level or a pause of the phone is never stored or logged.
+    pub(crate) presence: crate::presence::Presence,
     pub(crate) next_toast_id: AtomicU32,
     pub(crate) clipboard: Arc<dyn Clipboard>,
     pub(crate) opener: Arc<dyn UrlOpener>,
@@ -288,12 +292,17 @@ impl Core {
             queue: crate::queue::QueueState::default(),
             mirror: crate::mirror::Mirror::new(&config_for_hooks.data_dir),
             media: crate::media::Media::new(),
+            presence: crate::presence::Presence::new(),
             next_toast_id: AtomicU32::new(0),
             clipboard: services.clipboard,
             opener: services.opener,
             clock: services.clock,
             user_state: Mutex::new(Arc::new(crate::quiet::WindowsUserState)),
         };
+        // `--dev-battery`: a fake power source, so a run on a desktop (or beside the installed Kin) can test the battery path.
+        if let Some(fake) = core.config.dev_battery {
+            core.set_power_source(Arc::new(crate::presence::battery::FakePower::new(fake)));
+        }
         core.recover_transfers();
         core.prune_storage(unix_ms() as i64);
         core
@@ -364,6 +373,7 @@ impl Core {
             transfers: self.transfer_summary(),
             queued: self.queue_len(),
             media: self.media_tray_state(),
+            presence: self.presence_view(),
         }
     }
 
@@ -374,6 +384,7 @@ impl Core {
         let pairing_expires_ms =
             lock(&self.pairing).active_expiry(now).map(|e| unix_ms() + e.saturating_duration_since(now).as_millis() as u64);
         let sync = self.sync_status();
+        let presence = self.presence_status_json();
         let last_ping = lock(&self.last_ping).as_ref().map(|(at, report)| {
             let mut v = json!({ "at": at, "result": report.text() });
             if let PingReport::Rtt(d) = report {
@@ -403,6 +414,9 @@ impl Core {
             "transfers": self.transfers_status(),
             "mirror": { "view": self.mirror_view(), "counts": self.mirror.counters_json() },
             "media": { "view": self.media_view(), "counts": self.media.counters_json() },
+            "pause": presence["pause"],
+            "presence": presence["presence"],
+            "ring": presence["ring"],
             "updatedAtMs": unix_ms(),
         })
     }
@@ -642,12 +656,38 @@ impl Core {
 
     /// Removes a paired device. If it's connected it gets an `unpair` message (or a 4003 close if its `hello` isn't
     /// accepted yet), as protocol.md describes.
-    pub fn remove_device(&self, device_id: &str) -> Result<bool> {
+    ///
+    /// **Unlink (2B.4, design 6.5): the phone stops working at once, even if it is offline or in the middle of an upload.** In this order:
+    /// 1. the removal is **durable** (`Db::remove_device` writes at `synchronous = FULL`: a power cut can not bring the phone back);
+    /// 2. the pending cancels, the notification toasts, what the PC knows of the phone (battery, pause, ring) and its per-feature overrides go;
+    /// 3. its connection is told (`unpair`, or a 4003 close);
+    /// 4. its running transfers stop: a writer stops, a stream ends, the `.part` files go, the transfer is `failed` with `peer_removed`;
+    /// 5. what waited for it in the queue fails as `peer_changed`.
+    ///
+    /// From step 1 on every request with its key is `401` (authorization is per request, so an already-open TLS connection gets it too).
+    pub async fn remove_device(self: &Arc<Self>, device_id: &str) -> Result<bool> {
+        self.forget_device(device_id, true).await
+    }
+
+    /// The steps of [`Core::remove_device`]. `revoke`: tell the phone (an `unpair` or a close). Not when the phone is the one that unlinked: it has asked, and has
+    /// had its answer.
+    pub(crate) async fn forget_device(self: &Arc<Self>, device_id: &str, revoke: bool) -> Result<bool> {
         let removed = self.db.remove_device(device_id)?;
         let _ = self.db.delete_pending_cancels_of(device_id);
         self.mirror_forget_device(device_id);
+        self.presence_forget_device(device_id);
         log::info!("device {} removed: {removed}", short(device_id));
-        self.connections.revoke(device_id);
+        if revoke {
+            self.connections.revoke(device_id);
+        }
+        self.abort_device(device_id).await;
+        let failed = self.fail_queued_of(device_id);
+        if failed > 0 {
+            log::info!("unlink: {failed} queued item(s) of device {} failed (peer_changed)", short(device_id));
+        }
+        // On the blocking pool: ending the pause starts the media source again (WinRT), which must not run on an async worker.
+        let core = self.clone();
+        let _ = tokio::task::spawn_blocking(move || core.clear_pause_if_no_phone_left()).await;
         self.emit(Event::PairingChanged);
         self.emit(Event::StateChanged);
         Ok(removed)

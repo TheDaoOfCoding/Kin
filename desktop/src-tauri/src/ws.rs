@@ -121,6 +121,10 @@ enum Timer {
 /// Runs a connection until it ends. `device_id` comes from the TLS client certificate, and the caller has checked
 /// that it is paired.
 pub async fn run(core: Arc<Core>, socket: WebSocket, device_id: String, remote: SocketAddr) {
+    let delay = core.hooks.ws_register_delay_ms.load(std::sync::atomic::Ordering::Relaxed);
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
     let (conn_id, mut commands) = core.connections.register(&device_id);
     log::info!("websocket opened: device {} from {remote}", short(&device_id));
     let now = Instant::now();
@@ -141,7 +145,14 @@ pub async fn run(core: Arc<Core>, socket: WebSocket, device_id: String, remote: 
         hello_accepted: false,
         unpaired: false,
     };
-    let end = conn.drive(&mut commands).await;
+    // The upgrade checked the pairing, but the connection is only known to `connections` from here: an unlink in between had no connection
+    // to tell. The removal is in the database before anything is revoked, so a check now sees it. Nothing of this phone is handled.
+    let end = if conn.core.db.is_paired(&conn.device_id).unwrap_or(false) {
+        conn.drive(&mut commands).await
+    } else {
+        log::info!("device {} was unlinked while its WebSocket was opening: closed", short(&conn.device_id));
+        End::Close { code: messages::CLOSE_UNAUTHORIZED, reason: close_reason(messages::CLOSE_UNAUTHORIZED).into() }
+    };
     conn.finish(end).await;
 }
 
@@ -297,9 +308,8 @@ impl Conn {
             }
             Action::RemovePeerAndClose => {
                 self.unpaired = true;
-                let _ = self.core.db.delete_pending_cancels_of(&self.device_id);
-                self.core.mirror_forget_device(&self.device_id);
-                match self.core.db.remove_device(&self.device_id) {
+                // The same as removing it on the PC, except that there is no `unpair` to send back: the phone is the one that asked.
+                match self.core.forget_device(&self.device_id, false).await {
                     Ok(_) => log::info!("device {} unpaired itself", short(&self.device_id)),
                     Err(e) => log::error!("removing the unpaired device failed: {e}"),
                 }
@@ -326,6 +336,18 @@ impl Conn {
                 }
             }
             Action::MediaDropped => self.core.media_dropped_by_receiver(),
+            // The phone's battery and pause (changelog 58), or what its ring says. The only thing that can come back is a `rate_limited` error (no `ref`), at most
+            // one per 10 seconds.
+            Action::Presence(msg) => {
+                if let Some(frame) = self.core.presence_message(&self.device_id, msg)
+                    && let Err(e) = self.send(&frame).await
+                {
+                    return Some(End::Error(e));
+                }
+            }
+            Action::PresenceDropped => self.core.presence_dropped_by_receiver(),
+            // `ring.start` and `ring.stop` go PC to phone only: the PC answers `unsupported_type` before it gets here.
+            Action::RingCommand { .. } => {}
             // `clipboard` and `offer` only go PC to phone: the receiver answers `unsupported_type` before it gets here.
             Action::None
             | Action::ShowErrorOnly
@@ -351,6 +373,8 @@ impl Conn {
         if self.hello_accepted {
             // Media (changelog 57): after each accepted `hello` the peer is told this side's `media.status` again.
             self.core.media_peer_hello(&self.device_id, false);
+            // Presence (changelog 58): a later `hello` may add the capability (an update): a connection that had none starts with a snapshot then.
+            self.core.presence_peer_hello(&self.device_id, false);
             return;
         }
         self.hello_accepted = true;
@@ -358,6 +382,8 @@ impl Conn {
         self.core.connections.mark_open(&self.device_id, self.conn_id);
         // Media (changelog 57): a new connection starts with nothing known about the peer, and tells it this side's `media.status`.
         self.core.media_peer_hello(&self.device_id, true);
+        // Presence (changelog 58): a new connection starts with nothing known about the peer, and sends it this PC's snapshot (battery, pause).
+        self.core.presence_peer_hello(&self.device_id, true);
         log::info!(
             "phone connected: {:?} ({}, app {}, capabilities {:?}) device {} from {}",
             peer.name,
@@ -403,6 +429,8 @@ impl Conn {
             }
             ConnCommand::Notif { frame, reply } => self.send_notif(frame, reply).await,
             ConnCommand::Media { frame } => self.send_media(frame).await,
+            ConnCommand::Presence { frame } => self.send_presence(frame).await,
+            ConnCommand::Ring { frame, reply } => self.send_capable(crate::presence::wire::RING_CAPABILITY, frame, reply).await,
             ConnCommand::Unpair => {
                 let id = uuid_v7(unix_ms());
                 match self.send(&json!({ "type": "unpair", "id": id })).await {
@@ -420,7 +448,30 @@ impl Conn {
     /// A `notif.*` message to the phone. Sent only if the phone's latest `hello` lists `notif` (else dropped). A `notif.action` (it has a `reply`) waits for its
     /// `ack` for 5 seconds and is never sent again.
     async fn send_notif(&mut self, frame: serde_json::Value, reply: Option<oneshot::Sender<SendOutcome>>) -> Option<End> {
-        let listed = self.receiver.is_open() && self.receiver.peer().is_some_and(|p| p.has(crate::mirror::wire::CAPABILITY));
+        self.send_capable(crate::mirror::wire::CAPABILITY, frame, reply).await
+    }
+
+    /// A `presence` to the phone (changelog 58). Sent only if the phone's latest `hello` lists `presence` (else dropped, silently). Ephemeral: no ack, no queue,
+    /// no re-send. Only the type is logged, and only as a count by the presence module (never a level or a pause).
+    async fn send_presence(&mut self, frame: serde_json::Value) -> Option<End> {
+        if !(self.receiver.is_open() && self.receiver.peer().is_some_and(|p| p.has(crate::presence::wire::CAPABILITY))) {
+            return None;
+        }
+        match self.send(&frame).await {
+            Ok(()) => None,
+            Err(e) => Some(End::Error(e)),
+        }
+    }
+
+    /// A message that goes only to a peer whose latest `hello` lists `capability`: a `notif.*` (`notif`) or a `ring.start`/`ring.stop` (`ring`). With a `reply` it is
+    /// acked, the `ack` is waited for 5 seconds and **not** sent again, and no answer does not close the connection.
+    async fn send_capable(
+        &mut self,
+        capability: &str,
+        frame: serde_json::Value,
+        reply: Option<oneshot::Sender<SendOutcome>>,
+    ) -> Option<End> {
+        let listed = self.receiver.is_open() && self.receiver.peer().is_some_and(|p| p.has(capability));
         if !listed {
             if let Some(reply) = reply {
                 let _ = reply.send(SendOutcome::NotConnected);
@@ -500,6 +551,8 @@ impl Conn {
         // What the phone's media showed on this PC goes with the connection (a newer connection of the same phone keeps what it has).
         if current {
             self.core.media_connection_closed(&self.device_id);
+            // What the phone said about its pause goes (nothing is paused as far as this side knows); its last battery stays for "last seen".
+            self.core.presence_connection_closed(&self.device_id);
         }
         if self.hello_accepted {
             let _ = self.core.db.touch(&self.device_id, unix_ms() as i64, None);

@@ -174,7 +174,7 @@ Response when Kin is running:
 | `devices[].online` | boolean | `true` while the device's WebSocket is open |
 | `devices[].queuedCount` | integer | Items waiting in the queue for that device (texts, links, offers) |
 | `defaultDeviceId` | string | Optional. The device a `send` without `deviceId` goes to: the only paired device, or with several the one that connected last |
-| `paused` | boolean | Optional (2B.4). `true` while the user has paused Kin. The extension shows "Paused" and still sends (a manual send isn't blocked by a pause) |
+| `paused` | boolean | Optional (2B.4, sent by Kin from 0.2.0). Present and `true` only while the user has paused Kin on this PC (left out when not paused, so an extension that doesn't know the field sees the body it always saw). The extension shows "Paused" and still sends (a manual send isn't blocked by a pause) |
 
 **When Kin isn't running** the host answers (this is **not** an error):
 

@@ -310,7 +310,7 @@ impl Core {
 
     /// The setting "Show phone notifications".
     pub fn mirror_on(&self) -> bool {
-        lock(&self.settings).mirror_notifications
+        self.feature_enabled(crate::features::NOTIF_SHOW, None)
     }
 
     fn phone_label(&self, device_id: &str) -> String {
@@ -320,6 +320,12 @@ impl Core {
     /// A `notif.*` message that the receiver let through (validation step 7 and later). Returns a frame to send back, if one is due (`rate_limited`).
     pub async fn mirror_message(&self, device_id: &str, msg: NotifMsg) -> Option<Value> {
         if !self.mirror_on() || !self.mirror.has_surface() {
+            self.mirror.count(|c| c.dropped_feature_off += 1);
+            return None;
+        }
+        // Pause (2B.4): a paused PC drops a `notif.post` silently. The cleanup (`notif.remove`, `notif.sync`) still flows, so toasts that were removed on the phone
+        // while this PC was paused go (protocol.md, "Pause: what stops, what still arrives").
+        if self.paused() && matches!(msg, NotifMsg::Post(_)) {
             self.mirror.count(|c| c.dropped_feature_off += 1);
             return None;
         }

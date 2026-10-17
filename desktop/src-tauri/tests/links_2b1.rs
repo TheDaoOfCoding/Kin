@@ -186,7 +186,11 @@ async fn the_pcs_hello_says_it_understands_links() {
     let w = World::new().await;
     w.pair().await;
     let (_ws, hello) = open_ws_with(&w, None).await;
-    assert_eq!(hello["capabilities"], json!(["link", "media"]), "link, and (2B.3) media, which every 0.2.0 build lists");
+    assert_eq!(
+        hello["capabilities"],
+        json!(["link", "media", "presence"]),
+        "link, and (2B.3) media and (2B.4) presence, which every 0.2.0 build lists"
+    );
 }
 
 // ===== the extension: status, open, protocol errors ========================================================================

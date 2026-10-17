@@ -82,7 +82,7 @@ try {
     $PcSid = Get-Sid $TestAumid
 
     '{ "mediaShare": true, "mediaShow": true, "hotkey": "", "autoClipboardSync": false }' | Set-Content (Join-Path $Data 'settings.json') -Encoding ASCII
-    $kin = Start-DevKin @('--data-dir', $Data, '--dev-bind', '127.0.0.1', '--dev-print-pair-url', '--dev-toast-quiet', '--dev-no-open', '--dev-no-windows', '--dev-media-aumid', $TestAumid)
+    $kin = Start-DevKin @('--data-dir', ('"{0}"' -f $Data),'--dev-bind', '127.0.0.1', '--dev-print-pair-url', '--dev-toast-quiet', '--dev-no-open', '--dev-no-windows', '--dev-media-aumid', $TestAumid)
     $log = Join-Path $Data 'logs\kin.log'
     $up = Wait-Until { (Test-Path $log) -and ((Get-Content $log -Raw -ErrorAction SilentlyContinue) -match "sharing the PC's media with the phone") } 30 'the media reader to start'
     Check 'the dev Kin started sharing the PC media, as a TEST run' ($up -and ((Get-Content $log -Raw) -match 'sharing the PC''s media with the phone \(test run\)'))
@@ -141,7 +141,7 @@ try {
     $wrongInstalledCode = $LASTEXITCODE
     $ErrorActionPreference = $savedPreference
     Check 'the tool refuses an AUMID that is not a test session or a dev Kin (no other session can be read or controlled with it)' ($wrongCode -ne 0 -and $wrong -match 'refused') "$wrongCode $wrong"
-    Check 'the tool refuses the installed Kin''s own AUMID (app.kinrelay.desktop): it would show the user''s real phone' ($wrongInstalledCode -ne 0 -and $wrongInstalled -match 'refused' -and $wrongInstalled -notmatch 'SESSION|NOSESSION') "$wrongInstalledCode $wrongInstalled"
+    Check 'the tool refuses the installed Kin''s own AUMID (app.kinrelay.desktop): it would show the user''s real phone' ($wrongInstalledCode -ne 0 -and $wrongInstalled -match 'refused' -and $wrongInstalled -cnotmatch 'SESSION') "$wrongInstalledCode $wrongInstalled"
 
     # --- the status and the privacy of the run
     Start-Sleep -Seconds 1
@@ -162,6 +162,8 @@ try {
 
     # --- the real-Windows test of Kin's flyout session (tests\media_surface_real.rs: #[ignore] in `cargo test`): its own hidden window and AUMID, Paused, no audio,
     # read back by its own AUMID only. Debug build only (never --release: that would replace Kin.exe).
+    # The dev Kin is stopped first: cargo test relinks target\debug\Kin.exe, and Windows refuses to replace a running program file (os error 5).
+    Stop-DevKin
     Push-Location (Join-Path $Repo 'desktop\src-tauri')
     try {
         $savedPreference = $ErrorActionPreference

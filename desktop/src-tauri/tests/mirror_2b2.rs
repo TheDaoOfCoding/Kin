@@ -54,7 +54,7 @@ impl Rig {
         let mut ws = w.try_open_ws().await.expect("the upgrade works for a paired phone");
         let hello = next_json(&mut ws).await;
         assert_eq!(hello["type"], "hello");
-        assert_eq!(hello["capabilities"], json!(["link", "media", "notif"]), "the PC lists notif while the switch is on");
+        assert_eq!(hello["capabilities"], json!(["link", "media", "presence", "notif"]), "the PC lists notif while the switch is on");
         send_json(&mut ws, &hello_with(json!(["link", "notif"]))).await;
         w.wait_for_state(LinkState::PhoneConnected).await;
         let short = short_of(&w.phone.device_id).unwrap();
@@ -143,21 +143,21 @@ async fn the_pcs_hello_lists_notif_only_while_the_switch_is_on_and_a_new_hello_s
     w.pair().await;
     // Off (the default): `link` and `media` (2B.3: every 0.2.0 build lists it), no `notif`.
     let mut ws = w.try_open_ws().await.unwrap();
-    assert_eq!(next_json(&mut ws).await["capabilities"], json!(["link", "media"]));
+    assert_eq!(next_json(&mut ws).await["capabilities"], json!(["link", "media", "presence"]));
     send_json(&mut ws, &hello_with(json!(["link", "notif"]))).await;
     w.wait_for_state(LinkState::PhoneConnected).await;
-    assert!(w.core().capabilities() == ["link", "media"]);
+    assert!(w.core().capabilities() == ["link", "media", "presence"]);
     // On: a new `hello` goes out on the open connection.
     let surface = Arc::new(FakeSurface::default());
     w.core().mirror_for_tests(surface);
     w.core().connections.send_hello_to_all();
     let second = next_json(&mut ws).await;
     assert_eq!(second["type"], "hello");
-    assert_eq!(second["capabilities"], json!(["link", "media", "notif"]));
+    assert_eq!(second["capabilities"], json!(["link", "media", "presence", "notif"]));
     // Off again: the toasts go and the next `hello` drops `notif`.
     w.env.core.set_mirror_notifications(false);
     let third = next_json(&mut ws).await;
-    assert_eq!(third["capabilities"], json!(["link", "media"]));
+    assert_eq!(third["capabilities"], json!(["link", "media", "presence"]));
 }
 
 // ----- post, update, remove ----------------------------------------------------------------------------------------------
@@ -306,7 +306,7 @@ async fn with_the_switch_off_everything_is_dropped_without_a_word() {
     let mut r = Rig::new().await;
     r.core().set_mirror_notifications(false);
     let hello = next_json(&mut r.ws).await;
-    assert_eq!(hello["capabilities"], json!(["link", "media"]));
+    assert_eq!(hello["capabilities"], json!(["link", "media", "presence"]));
     r.post(NID, json!({ "title": "x" })).await;
     r.send(json!({ "type": "notif.status", "id": uuid(), "enabled": true, "access": "granted", "apps": 1 })).await;
     r.send(json!({ "type": "notif.post", "id": uuid(), "app": "no nid, and invalid on top" })).await;
@@ -323,7 +323,7 @@ async fn a_phone_that_did_not_list_notif_is_not_obeyed() {
     let surface = Arc::new(FakeSurface::default());
     w.core().mirror_for_tests(surface.clone());
     let mut ws = w.try_open_ws().await.unwrap();
-    assert_eq!(next_json(&mut ws).await["capabilities"], json!(["link", "media", "notif"]));
+    assert_eq!(next_json(&mut ws).await["capabilities"], json!(["link", "media", "presence", "notif"]));
     send_json(&mut ws, &phone_hello()).await;
     w.wait_for_state(LinkState::PhoneConnected).await;
     send_json(&mut ws, &json!({ "type": "notif.post", "id": uuid(), "nid": NID, "app": "Chat", "title": "x" })).await;
@@ -414,9 +414,28 @@ async fn unpairing_the_phone_removes_its_toasts_and_the_icons() {
     r.send(json!({ "type": "notif.icon", "id": uuid(), "hash": hash, "png": base64url(&png) })).await;
     r.post(NID, json!({ "title": "Alice" })).await;
     r.shown(NID).await;
-    r.core().remove_device(&r.w.phone.device_id).unwrap();
+    r.w.env.core.remove_device(&r.w.phone.device_id).await.unwrap();
     assert!(r.surface.find(NID).is_none(), "its toasts go");
     assert!(!r.core().mirror_icon_dir().exists(), "and the cache, because no phone is left");
+}
+
+/// 2B.4: a paused PC drops a `notif.post` silently (nothing is shown, nothing is stored), and the cleanup (`notif.remove`) still flows.
+#[tokio::test]
+async fn a_paused_pc_drops_posts_silently_and_a_removal_still_goes_through() {
+    use kin_lib::presence::pause::PauseChoice;
+    let mut r = Rig::new().await;
+    r.post(NID, json!({ "title": "Alice" })).await;
+    r.shown(NID).await;
+    r.core().set_pause(Some(PauseChoice::UntilResumed));
+    r.post(NID2, json!({ "title": "Bob" })).await;
+    r.wait_for("the drop to be counted", || r.core().mirror_counters().dropped_feature_off >= 1).await;
+    assert!(r.surface.find(NID2).is_none(), "nothing is shown while paused");
+    r.send(json!({ "type": "notif.remove", "id": uuid(), "nid": NID })).await;
+    r.gone(NID).await;
+    // A resume: posts show again.
+    r.core().set_pause(None);
+    r.post(NID2, json!({ "title": "Bob" })).await;
+    r.shown(NID2).await;
 }
 
 // ----- what the user does ------------------------------------------------------------------------------------------------
@@ -762,12 +781,12 @@ async fn turning_the_switch_on_registers_a_dev_identity_and_turning_it_off_remov
     assert_eq!(identity.kind, Kind::Dev, "a test's data directory is never the installed Kin's");
     assert_ne!(identity.aumid, registration::RELEASE_AUMID);
     let result = std::panic::AssertUnwindSafe(async {
-        assert!(core.capabilities() == ["link", "media"], "off by default");
+        assert!(core.capabilities() == ["link", "media", "presence"], "off by default");
         assert!(registration::leftovers(&identity).is_empty());
         core.set_mirror_notifications(true);
         assert!(core.mirror_view()["running"] == true, "{}", core.mirror_view());
         assert!(core.mirror_view()["activator"] == true, "the COM class is registered: {}", core.mirror_view());
-        assert!(core.capabilities() == ["link", "media", "notif"]);
+        assert!(core.capabilities() == ["link", "media", "presence", "notif"]);
         let (command, activator) = registration::registered(&identity);
         assert!(command.unwrap().ends_with("--toast-activated"));
         assert_eq!(activator.as_deref(), Some(identity.clsid.as_str()));
@@ -775,7 +794,7 @@ async fn turning_the_switch_on_registers_a_dev_identity_and_turning_it_off_remov
         let arguments = ToastArgs::new("ABCD2345", NID, ToastAction::Tap, None).to_arguments();
         kin_lib::mirror::activator::call_class(identity.clsid_u128(), &identity.aumid, &arguments, &[]).expect("the COM class answers");
         core.set_mirror_notifications(false);
-        assert!(core.capabilities() == ["link", "media"]);
+        assert!(core.capabilities() == ["link", "media", "presence"]);
         assert!(core.mirror_view()["running"] == false);
     });
     let outcome = futures_util::FutureExt::catch_unwind(result).await;

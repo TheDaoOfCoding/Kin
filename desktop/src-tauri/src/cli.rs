@@ -34,6 +34,9 @@ pub struct Config {
     pub dev_media_real_volume: bool,
     /// Developer setting (2B.3): the media flyout never shows `Playing`. A test run does that anyway; the flag only says it out loud.
     pub dev_media_quiet: bool,
+    /// Developer setting (2B.4): a fake battery for this PC instead of the real power status: `Some(Some(battery))` (`--dev-battery 9:unplugged`) or `Some(None)`
+    /// (`--dev-battery none`: no battery, whatever the machine has). The real call is read-only and safe, this is for a test that needs a laptop.
+    pub dev_battery: Option<Option<crate::presence::wire::Battery>>,
     /// Developer setting: received files go here instead of `Downloads\Kin` (and instead of `receivedFolder` of settings.json), so
     /// a test never writes to the real Downloads folder.
     pub dev_received_dir: Option<PathBuf>,
@@ -66,6 +69,7 @@ impl Config {
             dev_media_aumid: None,
             dev_media_real_volume: false,
             dev_media_quiet: false,
+            dev_battery: None,
             dev_received_dir: None,
             dev_free_bytes: None,
             dev_clock_offset_secs: None,
@@ -96,6 +100,7 @@ impl Config {
             || self.dev_media_aumid.is_some()
             || self.dev_media_real_volume
             || self.dev_media_quiet
+            || self.dev_battery.is_some()
             || self.dev_received_dir.is_some()
             || self.dev_free_bytes.is_some()
             || self.dev_clock_offset_secs.is_some()
@@ -192,6 +197,13 @@ pub enum Command {
     /// <level>`, `volume-delta <n>`, `mute`, `unmute`. It sends the `media.cmd` to the phone the phone's media is shown from. Refused unless the app was started with a
     /// developer setting.
     DevMedia { action: String, arg: Option<String> },
+    /// Pause Kin (2B.4): `--pause 1h`, `--pause tomorrow`, `--pause resumed` (until the user resumes) or `--pause resume` (end the pause). The same as the tray's
+    /// "Pause Kin": it gives a script a way to act without any input injection. The result is in `status.json` (`pause`).
+    Pause(Option<crate::presence::pause::PauseChoice>),
+    /// Ring my phone (2B.4): `Kin.exe --ring`, the same as the tray item. The PC makes no sound.
+    Ring,
+    /// Stop ringing the phone: `Kin.exe --ring-stop`.
+    RingStop,
     /// Quit.
     Quit,
 }
@@ -218,6 +230,10 @@ impl Command {
             Command::DevHistory { .. } => "dev history",
             Command::DevToast { .. } => "dev toast",
             Command::DevMedia { .. } => "dev media",
+            Command::Pause(Some(_)) => "pause",
+            Command::Pause(None) => "resume",
+            Command::Ring => "ring",
+            Command::RingStop => "ring stop",
             Command::Quit => "quit",
         }
     }
@@ -264,6 +280,7 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
     let mut media_aumid = env("KIN_DEV_MEDIA_AUMID");
     let mut media_real_volume = truthy(env("KIN_DEV_MEDIA_REAL_VOLUME"));
     let mut media_quiet = truthy(env("KIN_DEV_MEDIA_QUIET"));
+    let mut dev_battery = env("KIN_DEV_BATTERY");
     let mut received_dir = env("KIN_DEV_RECEIVED_DIR").map(PathBuf::from);
     let mut free_bytes = env("KIN_DEV_FREE_BYTES");
     let mut clock_offset = env("KIN_DEV_CLOCK_OFFSET");
@@ -292,6 +309,28 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
             "--dev-media-aumid" => media_aumid = Some(value(name)?),
             "--dev-media-real-volume" => media_real_volume = true,
             "--dev-media-quiet" => media_quiet = true,
+            // `--dev-battery 9:unplugged`, `--dev-battery 62:charging` or `--dev-battery none` (the two-word form `9 unplugged` is read too).
+            "--dev-battery" => {
+                let mut v = value(name)?;
+                if let Some(state) = it.next_if(|a| matches!(a.as_str(), "charging" | "unplugged")) {
+                    v = format!("{v}:{state}");
+                }
+                dev_battery = Some(v);
+            }
+            "--pause" => {
+                let v = value(name)?;
+                let choice = if v == "resume" {
+                    None
+                } else {
+                    Some(
+                        crate::presence::pause::PauseChoice::parse(&v)
+                            .ok_or_else(|| format!("--pause: {v:?} is not one of 1h, tomorrow, resumed, resume"))?,
+                    )
+                };
+                commands.push(Command::Pause(choice));
+            }
+            "--ring" => commands.push(Command::Ring),
+            "--ring-stop" => commands.push(Command::RingStop),
             "--dev-media" => {
                 let action = value(name)?;
                 let arg = it.next_if(|a| !a.starts_with("--")).cloned();
@@ -402,6 +441,12 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
     config.dev_media_aumid = media_aumid.filter(|a| !a.is_empty());
     config.dev_media_real_volume = media_real_volume;
     config.dev_media_quiet = media_quiet;
+    if let Some(v) = dev_battery.filter(|v| !v.is_empty()) {
+        config.dev_battery = Some(
+            crate::presence::battery::parse_dev_battery(&v)
+                .ok_or_else(|| format!("--dev-battery: {v:?} is not <level>:charging, <level>:unplugged or none"))?,
+        );
+    }
     config.dev_received_dir = received_dir;
     if let Some(v) = free_bytes {
         config.dev_free_bytes = Some(v.parse().map_err(|_| format!("--dev-free-bytes: {v:?} is not a number of bytes"))?);
@@ -639,6 +684,50 @@ mod tests {
         assert!(p.config.instance_key().is_some());
         assert!(!p.config.is_dev_network());
         assert!(!p.config.advertises_on_lan(), "a Kin with its own data directory is never found by the user's phone");
+    }
+
+    /// 2B.4: `--pause`, `--ring`, `--ring-stop` are commands for the running Kin (no developer setting), and `--dev-battery` is a developer setting.
+    #[test]
+    fn the_pause_and_ring_commands_and_the_dev_battery_parse() {
+        use crate::presence::pause::PauseChoice;
+        use crate::presence::wire::Battery;
+        let args = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        let p =
+            parse(&args("--data-dir x --pause 1h --pause tomorrow --pause resumed --pause resume --ring --ring-stop"), &no_env).unwrap();
+        assert_eq!(
+            p.commands,
+            [
+                Command::Pause(Some(PauseChoice::OneHour)),
+                Command::Pause(Some(PauseChoice::Tomorrow)),
+                Command::Pause(Some(PauseChoice::UntilResumed)),
+                Command::Pause(None),
+                Command::Ring,
+                Command::RingStop,
+            ]
+        );
+        assert!(!p.config.dev_hooks_enabled(), "a user's own command is not a developer setting");
+        assert!(parse(&args("--pause 2h"), &no_env).unwrap_err().contains("--pause"), "a choice that does not exist is refused");
+        assert!(parse(&args("--pause"), &no_env).is_err());
+        let names: Vec<&str> = p.commands.iter().map(Command::name).collect();
+        assert_eq!(names, ["pause", "pause", "pause", "resume", "ring", "ring stop"]);
+        // The fake battery: one word, or the two-word form.
+        let b = |level, charging| Some(Some(Battery { level, charging, saver: None }));
+        let p = parse(&args("--data-dir x --dev-battery 9:unplugged"), &no_env).unwrap();
+        assert_eq!(p.config.dev_battery, b(9, false));
+        assert!(p.config.dev_hooks_enabled());
+        assert_eq!(parse(&args("--data-dir x --dev-battery 62 charging"), &no_env).unwrap().config.dev_battery, b(62, true));
+        assert_eq!(parse(&args("--data-dir x --dev-battery none"), &no_env).unwrap().config.dev_battery, Some(None));
+        assert_eq!(parse(&args("--data-dir x"), &no_env).unwrap().config.dev_battery, None, "the real power status unless asked");
+        assert!(parse(&args("--dev-battery 101:charging"), &no_env).is_err());
+        let env = |k: &str| (k == "KIN_DEV_BATTERY").then(|| "30:charging".to_string());
+        assert_eq!(parse(&args("--data-dir x"), &env).unwrap().config.dev_battery, b(30, true));
+        let appdata = |k: &str| (k == "APPDATA").then(|| "C:\\Users\\x\\AppData\\Roaming".to_string());
+        let installed = parse(&args("--dev-battery none"), &appdata).unwrap();
+        assert!(
+            crate::instance::dev_settings_refusal(installed.config.dev_hooks_enabled(), installed.config.instance_key().as_deref())
+                .is_some(),
+            "like every developer setting it needs a data directory of its own"
+        );
     }
 
     #[test]

@@ -268,8 +268,8 @@ impl Drop for Watch {
 mod tests {
     use super::*;
     use windows::Win32::System::Com::{
-        APTTYPE, APTTYPE_CURRENT, APTTYPE_STA, APTTYPEQUALIFIER_IMPLICIT_MTA, APTTYPEQUALIFIER_NONE, COINIT_APARTMENTTHREADED,
-        CoGetApartmentType,
+        APTTYPE, APTTYPE_CURRENT, APTTYPE_MAINSTA, APTTYPE_STA, APTTYPEQUALIFIER_IMPLICIT_MTA, APTTYPEQUALIFIER_NONE,
+        COINIT_APARTMENTTHREADED, CoGetApartmentType,
     };
 
     #[test]
@@ -354,7 +354,13 @@ mod tests {
             assert!(unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok());
             let _ = WinVolume.get();
             let _ = WinVolume.steps();
-            assert_eq!(apartment_of_this_thread(), Some(APTTYPE_STA), "the thread's own apartment is untouched");
+            // Windows reports the first single-threaded apartment of a process as the *main* one (`APTTYPE_MAINSTA`), a later one as `APTTYPE_STA`: either is
+            // the thread's own apartment, untouched (a test run in parallel with others can be the first or not).
+            let apartment = apartment_of_this_thread();
+            assert!(
+                apartment == Some(APTTYPE_STA) || apartment == Some(APTTYPE_MAINSTA),
+                "the thread's own apartment is untouched: {apartment:?}"
+            );
             // SAFETY: balances the call above (and nothing else: the volume calls did not start COM here).
             unsafe { CoUninitialize() };
             assert_eq!(apartment_of_this_thread(), None, "and not left started by the volume call either");

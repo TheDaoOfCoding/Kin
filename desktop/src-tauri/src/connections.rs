@@ -49,6 +49,17 @@ pub enum ConnCommand {
     Media {
         frame: serde_json::Value,
     },
+    /// Send a `presence` (changelog 58): only to a peer whose latest `hello` lists `presence` (else it is dropped, silently). Never acked, never queued, never
+    /// re-sent: a fresh snapshot goes after each reconnect.
+    Presence {
+        frame: serde_json::Value,
+    },
+    /// Send a `ring.start` or `ring.stop` (changelog 58): only to a peer whose latest `hello` lists `ring` (else `reply` hears `NotConnected`). Acked, never queued,
+    /// never re-sent: with a `reply` the `ack` or `error` is reported, no `ack` in 5 seconds is `NoReply` **without** closing the connection.
+    Ring {
+        frame: serde_json::Value,
+        reply: Option<oneshot::Sender<SendOutcome>>,
+    },
     /// Send a new `hello` (the name of this PC changed, or the setting "Show phone notifications" did).
     Hello,
     /// Tell the phone it was removed: an `unpair` message, then close after the `ack` (or 5 seconds).

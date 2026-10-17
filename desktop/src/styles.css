@@ -38,6 +38,12 @@ button.small { padding: 2px 10px; font-size: 12px; }
 .media input[type="range"] { flex: 1; min-width: 0; }
 .media label.hint { display: flex; align-items: center; gap: 8px; text-align: left; }
 
+/* The phone strip of the drop window (2B.4): the phone and its battery, the pause chips, Ring my phone and Pause */
+.phonestrip { margin: 0 0 12px; padding: 8px 12px; border-radius: 10px; background: rgba(128, 128, 128, 0.12); display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.phonestrip[hidden] { display: none; }
+.phonestrip .row { margin-top: 0; flex-wrap: wrap; }
+.phonestrip .hint { text-align: left; }
+
 /* The history, settings and debug windows (1.4) */
 main.list { text-align: left; padding: 16px 20px; }
 main.list h1 { text-align: left; }
@@ -69,8 +75,9 @@ input.key { max-width: 260px; text-align: center; font-family: Consolas, monospa
 .toggle input { margin-top: 3px; }
 .toggle small { display: block; opacity: 0.7; font-size: 12px; }
 .path { display: block; word-break: break-all; padding: 6px 8px; border-radius: 6px; background: rgba(128, 128, 128, 0.15); font-size: 12px; }
-.device { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 6px 0; }
-.confirm { display: inline-flex; gap: 6px; align-items: center; }
+.device { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; margin: 6px 0; }
+.device .hint { flex-basis: 100%; margin: 2px 0 0; }
+.confirm { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .debug .big { font-size: 34px; font-weight: 600; margin: 4px 0; text-align: left; }
 .debug table { border-collapse: collapse; width: 100%; font-size: 13px; }
 .debug th, .debug td { text-align: left; padding: 3px 10px 3px 0; font-weight: 400; }

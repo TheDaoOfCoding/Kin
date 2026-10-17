@@ -816,7 +816,7 @@ async fn the_export_takes_out_the_name_of_a_phone_that_was_unpaired_too() {
     std::fs::create_dir_all(&logs).unwrap();
     std::fs::write(logs.join("kin.log"), "2026 INFO kin: phone connected: \"Test Phone\"\n").unwrap();
     // The phone is unpaired: its row is gone from the device list, and the log line that names it is still in the log.
-    assert!(w.core().remove_device(&w.phone.device_id).unwrap());
+    assert!(w.env.core.remove_device(&w.phone.device_id).await.unwrap());
     assert!(w.core().snapshot().devices.is_empty());
     let files = w.core().export_files(json!({ "networks": [] }));
     let log = files.iter().find(|(n, _)| n == "logs/kin.log").map(|(_, d)| String::from_utf8_lossy(d).to_string()).unwrap();

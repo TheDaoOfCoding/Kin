@@ -129,6 +129,11 @@ impl Api {
         if let Some(default) = self.core.queue_target() {
             body["defaultDeviceId"] = json!(default);
         }
+        // 2B.4: `paused: true` while this PC is paused. The extension shows "Paused" and keeps sending: a manual send is never blocked by a pause. (Left out when not
+        // paused, so an extension that doesn't know the field sees the body it always saw.)
+        if self.core.presence_paused_for_extension() {
+            body["paused"] = json!(true);
+        }
         body
     }
 

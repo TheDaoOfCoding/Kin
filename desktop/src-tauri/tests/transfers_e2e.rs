@@ -532,7 +532,7 @@ async fn after_a_restart_the_transfer_is_there_with_what_was_stored() {
     let (data, recv) = (root.path().join("data"), root.path().join("recv"));
     let pat = Pattern::new(16);
     let size = 5 * MIB;
-    let request = kin_lib::transfers::UploadRequest { id: "restart".into(), files: vec![spec("f", "movie.mkv", size)] };
+    let request = kin_lib::transfers::UploadRequest { id: "restart".into(), files: vec![spec("f", "movie.mkv", size)], origin: None };
     {
         let core = core_at(&data, &recv);
         core.upload_post("phone", &request).await.unwrap();
@@ -564,6 +564,7 @@ async fn the_disk_is_the_check_after_a_restart_a_part_file_that_is_short_or_long
     let request = kin_lib::transfers::UploadRequest {
         id: "disk".into(),
         files: vec![spec("f", "a.bin", size), spec("g", "b.bin", size), spec("h", "c.bin", size)],
+        origin: None,
     };
     {
         let core = core_at(&data, &recv);
@@ -596,7 +597,7 @@ async fn part_files_are_kept_a_day_and_then_cleaned_up() {
     let (data, recv) = (root.path().join("data"), root.path().join("recv"));
     let pat = Pattern::new(18);
     let core = core_at(&data, &recv);
-    let request = kin_lib::transfers::UploadRequest { id: "old".into(), files: vec![spec("f", "a.bin", 5_000)] };
+    let request = kin_lib::transfers::UploadRequest { id: "old".into(), files: vec![spec("f", "a.bin", 5_000)], origin: None };
     core.upload_post("phone", &request).await.unwrap();
     let _ = core.upload_put("phone", "old", "f", put_params(0, 5_000), body_of(&pat, 0, 2_000, true)).await;
     // A .part file that no record names (a download of another program, say), and a file of the user's that isn't one.
@@ -604,7 +605,7 @@ async fn part_files_are_kept_a_day_and_then_cleaned_up() {
     std::fs::write(recv.join("keep.txt"), "mine").unwrap();
     // A finished file that is *named* like a .part file is the user's, however old: a transfer recorded it.
     let pat2 = Pattern::new(19);
-    let request2 = kin_lib::transfers::UploadRequest { id: "named".into(), files: vec![spec("f", "backup.part", 100)] };
+    let request2 = kin_lib::transfers::UploadRequest { id: "named".into(), files: vec![spec("f", "backup.part", 100)], origin: None };
     core.upload_post("phone", &request2).await.unwrap();
     core.upload_put("phone", "named", "f", put_params(0, 100), body_of(&pat2, 0, 100, false)).await.unwrap();
     assert!(recv.join("backup.part").exists());

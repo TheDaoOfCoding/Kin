@@ -564,7 +564,10 @@ fn every_command_checks_the_label_of_the_window_that_called_it() {
         assert!(body.contains("only(&window"), "{name} checks the label of the window first");
         commands += 1;
     }
-    assert_eq!(commands, 30, "the 30 commands of the app (2B.3 added set_media_option and media_command)");
+    assert_eq!(
+        commands, 33,
+        "the 33 commands of the app (2B.3 added set_media_option and media_command, 2B.4 set_pause, ring_phone and set_presence_option)"
+    );
 }
 
 #[test]

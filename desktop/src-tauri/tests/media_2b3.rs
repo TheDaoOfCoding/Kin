@@ -74,7 +74,11 @@ impl Rig {
         let mut ws = w.try_open_ws().await.expect("the upgrade works for a paired phone");
         let hello = next_json(&mut ws).await;
         assert_eq!(hello["type"], "hello");
-        assert_eq!(hello["capabilities"], json!(["link", "media"]), "the PC always lists media (and notif only while its switch is on)");
+        assert_eq!(
+            hello["capabilities"],
+            json!(["link", "media", "presence"]),
+            "the PC always lists media and presence (and notif only while its switch is on)"
+        );
         let mut phone = phone_hello();
         phone["capabilities"] = json!(["link", "media"]);
         send_json(&mut ws, &phone).await;
@@ -356,6 +360,28 @@ async fn a_picture_and_the_volume_of_the_phones_session_arrive_and_a_bad_picture
     rig.wait_for("the drop to be counted", || rig.core().media_counters().dropped_by_receiver >= 1).await;
 }
 
+/// 2B.4: a pause acts as both switches off for as long as it lasts: the PC's source sends one `media.clear` and says so in `media.status`, and what the phone
+/// showed here is taken down and the rest is dropped.
+#[tokio::test]
+async fn a_pause_takes_the_phones_media_down_and_stops_sharing_the_pcs() {
+    use kin_lib::presence::pause::PauseChoice;
+    let mut rig = Rig::new().await;
+    rig.phone_status(true, true).await;
+    rig.phone_plays(json!({})).await;
+    rig.wait_for("the flyout", || rig.surface.current().is_some()).await;
+    rig.core().set_pause(Some(PauseChoice::UntilResumed));
+    // The source: one `media.clear`, and the new status says it neither shows nor shares.
+    let _clear = rig.next_of("media.clear").await;
+    let status = rig.next_of("media.status").await;
+    assert_eq!((status["show"].as_bool(), status["share"].as_bool()), (Some(false), Some(false)));
+    // The viewer: the flyout session is gone, and what the phone still sends is dropped.
+    rig.wait_for("the flyout to go", || rig.surface.current().is_none()).await;
+    rig.phone_plays(json!({})).await;
+    rig.wait_for("the drop to be counted", || rig.core().media_counters().dropped_viewer_off >= 1).await;
+    assert!(rig.surface.current().is_none());
+    assert!(!rig.core().media_share_on() && !rig.core().media_show_on(), "a pause acts as the switches off");
+}
+
 #[tokio::test]
 async fn a_viewer_with_show_off_drops_what_arrives_silently() {
     let mut rig = Rig::new().await;
@@ -433,7 +459,7 @@ async fn both_directions_are_off_by_default_and_the_pc_still_lists_the_capabilit
     let w = World::new().await;
     let core = w.core();
     assert!(!core.media_share_on() && !core.media_show_on());
-    assert_eq!(core.capabilities(), ["link", "media"]);
+    assert_eq!(core.capabilities(), ["link", "media", "presence"]);
     assert_eq!(core.media_view()["share"], false);
     assert_eq!(core.media_view()["show"], false);
     assert_eq!(core.media_view()["reading"], false, "nothing is read until share is on");

@@ -98,4 +98,6 @@ windows = { version = "0.62.2", features = [
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
     "Win32_System_RemoteDesktop",
+    # Presence (2B.4): this PC's battery (`GetSystemPowerStatus`, read-only).
+    "Win32_System_Power",
 ] }

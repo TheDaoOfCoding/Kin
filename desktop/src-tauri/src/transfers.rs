@@ -277,6 +277,9 @@ pub struct Entry {
     pub dropped: AtomicBool,
     /// In: the phone had to ask again (a `POST` for a transfer that was already there), so it was not a first-try success (metrics.rs).
     pub resumed: AtomicBool,
+    /// In (2B.4): what the phone said about where the file came from (`origin` of `POST /v1/transfers`: an auto-sent screenshot or camera photo). The first
+    /// value stays (a resume's is ignored). It decides the toast's wording and the clipboard rule, nothing else.
+    pub origin: Mutex<Option<crate::arrival::Origin>>,
 }
 
 impl Entry {
@@ -302,6 +305,7 @@ impl Entry {
             canceled: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
             resumed: AtomicBool::new(false),
+            origin: Mutex::new(None),
         })
     }
 
@@ -439,6 +443,9 @@ pub struct Hooks {
     /// How long a writer must have been quiet before a `POST` stops it (`TAKEOVER_IDLE_MS`); a test makes it long so that a writer it
     /// has paused is never taken for a dead connection on a slow machine.
     pub takeover_idle_ms: AtomicU64,
+    /// Test hook: a WebSocket waits this many milliseconds after its upgrade before it is registered, so a test can unlink the phone in
+    /// the gap between the pairing check and the registration. Zero (the default) outside tests.
+    pub ws_register_delay_ms: AtomicU64,
 }
 
 impl Default for Hooks {
@@ -449,6 +456,7 @@ impl Default for Hooks {
             fail_internal: AtomicBool::new(false),
             finalize_delay_ms: AtomicU64::new(0),
             takeover_idle_ms: AtomicU64::new(TAKEOVER_IDLE_MS),
+            ws_register_delay_ms: AtomicU64::new(0),
         }
     }
 }
@@ -487,6 +495,8 @@ pub struct FileSpec {
 pub struct UploadRequest {
     pub id: String,
     pub files: Vec<FileSpec>,
+    /// The optional `origin` of the body (2B.4): `screenshot` or `camera`; anything else is absent.
+    pub origin: Option<crate::arrival::Origin>,
 }
 
 /// What a `PUT` carries besides the body: the raw `offset` text and the `Content-Length` (`None` when it is missing or isn't a
@@ -672,6 +682,7 @@ impl Core {
                 .collect();
             let expires = row.expires_at.map_or(u64::MAX, |e| e as u64);
             let entry = Entry::new(&row.id, &row.device_id, direction, row.created_at as u64, expires, dest, shared);
+            *lock(&entry.origin) = self.db.transfer_origin(&row.id).and_then(|o| crate::arrival::Origin::from_db(&o));
             entry.set_status(status, row.finished_at.map_or(now, |f| f as u64), row.error_code.as_deref());
             self.transfers.insert(entry);
         }
@@ -742,7 +753,15 @@ impl Core {
                 }
                 e
             }
-            None => self.create_upload(device_id, req.id.as_str(), &req.files).await?,
+            None => {
+                let created = self.create_upload(device_id, req.id.as_str(), &req.files).await?;
+                // `origin` is kept from the first `POST` only (a resume's is ignored, so it can't change what the file is called after the fact).
+                if let Some(origin) = req.origin {
+                    *lock(&created.origin) = Some(origin);
+                    let _ = self.db.set_transfer_origin(&created.id, origin.as_str());
+                }
+                created
+            }
         };
         let answer = req
             .files
@@ -1348,6 +1367,31 @@ impl Core {
         self.emit(Event::StateChanged);
     }
 
+    /// The phone was unlinked (2B.4, design 6.5): everything it is moving stops **now**. A running upload's writer stops (the `PUT` is answered `404` and writes no
+    /// more bytes), a running download's stream ends, the `.part` files go by the usual rule (only paths a record names), and each transfer is marked `failed`
+    /// with `peer_removed`. A transfer that is already done stays done. Returns how many were stopped.
+    pub async fn abort_device(self: &Arc<Self>, device_id: &str) -> usize {
+        let entries: Vec<Arc<Entry>> =
+            self.transfers.all().into_iter().filter(|e| e.device_id == device_id && e.status() == Status::Active).collect();
+        let mut stopped = 0;
+        for entry in entries {
+            // An offer that is still `queued` in the database (served for the send that was under way) fails like the rest of the queue: `peer_changed`.
+            let queued = entry.direction == Direction::Out
+                && self.db.get_transfer(&entry.id).ok().flatten().is_some_and(|(row, _)| row.status == "queued");
+            let code = if queued { "peer_changed" } else { "peer_removed" };
+            if self.drop_transfer(&entry, Status::Failed, Some(code)).await {
+                stopped += 1;
+            }
+            if queued {
+                self.queue.forget(&entry.id);
+            }
+        }
+        if stopped > 0 {
+            log::info!("unlink: {stopped} running transfer(s) of device {} stopped", short(device_id));
+        }
+        stopped
+    }
+
     /// A `cancel` message from the phone. For a transfer it doesn't know or doesn't own it is acked and ignored (the receiver
     /// already acked); this does the work for one it owns. It is the same as `DELETE`, for an upload. The reason is text from the phone:
     /// it is cleaned (no control characters, at most 32 characters) before it is logged or stored.
@@ -1478,6 +1522,7 @@ impl Core {
             "recent": status["recent"],
             "folder": status["receivedFolder"],
             "media": self.media_panel(),
+            "presence": self.presence_panel(),
         })
     }
 

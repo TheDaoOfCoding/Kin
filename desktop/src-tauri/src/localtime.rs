@@ -35,6 +35,31 @@ pub fn last_seen_text(seen: &LocalTime, now: &LocalTime) -> String {
     }
 }
 
+/// "14:30" when `target` is on the same day as `now`, "tomorrow 08:00" the next day, "Mon 08:00" within a week, else "12 Oct 08:00": where a time **ahead** is
+/// shown (the end of a pause).
+pub fn clock_text(target: &LocalTime, now: &LocalTime) -> String {
+    let clock = format!("{:02}:{:02}", target.hour, target.minute);
+    match day_number(target) - day_number(now) {
+        0 => clock,
+        1 => format!("tomorrow {clock}"),
+        2..=6 => format!("{} {clock}", WEEKDAYS[(target.weekday % 7) as usize]),
+        _ => format!("{} {} {clock}", target.day, MONTHS[((target.month.clamp(1, 12)) - 1) as usize]),
+    }
+}
+
+/// The end of a pause (Unix ms) as the user's clock shows it, as of `now_ms`.
+pub fn clock_text_for(target_ms: i64, now_ms: i64) -> Option<String> {
+    Some(clock_text(&local_time(target_ms)?, &local_time(now_ms)?))
+}
+
+/// The offset of the user's time zone from UTC at a Unix time (local time = UTC + offset), with daylight saving as Windows says for that moment. Whole minutes.
+pub fn local_offset_ms(unix_ms: i64) -> Option<i64> {
+    let lt = local_time(unix_ms)?;
+    let days = crate::presence::pause::days_from_civil(i64::from(lt.year), i64::from(lt.month), i64::from(lt.day));
+    let local_minute = days * 86_400_000 + i64::from(lt.hour) * 3_600_000 + i64::from(lt.minute) * 60_000;
+    Some(local_minute - unix_ms.div_euclid(60_000) * 60_000)
+}
+
 /// The user's local time for a Unix time in milliseconds, from Windows.
 pub fn local_time(unix_ms: i64) -> Option<LocalTime> {
     use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
@@ -85,6 +110,28 @@ mod tests {
         assert_eq!(last_seen_text(&t(2026, 10, 8, 4, 14, 32), &now), "8 Oct 14:32", "a week ago has the date");
         assert_eq!(last_seen_text(&t(2025, 12, 31, 3, 7, 0), &t(2026, 1, 1, 4, 7, 0)), "yesterday 07:00", "across a year");
         assert_eq!(last_seen_text(&t(2024, 2, 29, 4, 7, 0), &t(2024, 3, 1, 5, 7, 0)), "yesterday 07:00", "across a leap day");
+    }
+
+    #[test]
+    fn a_time_ahead_is_shown_with_its_day_when_it_is_not_today() {
+        let now = t(2026, 10, 15, 4, 20, 0); // a Thursday
+        assert_eq!(clock_text(&t(2026, 10, 15, 4, 21, 5), &now), "21:05");
+        assert_eq!(clock_text(&t(2026, 10, 16, 5, 8, 0), &now), "tomorrow 08:00");
+        assert_eq!(clock_text(&t(2026, 10, 19, 1, 8, 0), &now), "Mon 08:00");
+        assert_eq!(clock_text(&t(2026, 10, 30, 5, 8, 0), &now), "30 Oct 08:00");
+        assert_eq!(clock_text(&t(2026, 1, 1, 4, 8, 0), &t(2025, 12, 31, 3, 23, 0)), "tomorrow 08:00", "across a year");
+    }
+
+    #[test]
+    fn the_offset_from_windows_is_a_whole_number_of_minutes_and_agrees_with_the_local_time() {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let off = local_offset_ms(now).expect("the conversion works");
+        assert_eq!(off % 60_000, 0);
+        assert!(off.abs() <= 14 * 3_600_000, "{off}");
+        // local = UTC + offset gives the local hour Windows says.
+        let lt = local_time(now).unwrap();
+        let from_offset = (now + off).div_euclid(3_600_000).rem_euclid(24);
+        assert_eq!(i64::from(lt.hour), from_offset);
     }
 
     #[test]

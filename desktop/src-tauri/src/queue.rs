@@ -496,6 +496,17 @@ impl Core {
         Some(result)
     }
 
+    /// The phone was unlinked: what still waited for it in the queue is not sent to anybody else and not kept for a phone that may pair again as a stranger.
+    /// Each item fails as `peer_changed`. Returns how many.
+    pub(crate) fn fail_queued_of(&self, device_id: &str) -> usize {
+        let items = self.db.queued_items(device_id).unwrap_or_default();
+        for item in &items {
+            self.fail_item(&item.id, if item.kind == "text" { "text" } else { "offer" }, "peer_changed");
+            self.queue.forget(&item.id);
+        }
+        items.len()
+    }
+
     /// An item that ends as failed: its row, its record, its temporary files.
     fn fail_item(&self, id: &str, kind: &str, code: &str) {
         let now = unix_ms() as i64;

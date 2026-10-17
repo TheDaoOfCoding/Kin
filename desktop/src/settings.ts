@@ -1,9 +1,10 @@
 // The settings window: device name, automatic clipboard sync, images to the clipboard, the received folder, the hotkey (with conflict
-// detection: if another program has the key, the old one stays and the window says so), start with Windows, and unpair.
+// detection: if another program has the key, the old one stays and the window says so), start with Windows, Pause, the phone's battery, and Unlink (2B.4: one word,
+// a confirmation that says what happens, and a "Lost your phone?" line with Ring).
 // The backend (src-tauri/src/prefs.rs, app.rs) saves each change at once and applies it.
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { button, el, flash } from "./dom";
+import { button, el, flash, sensitiveWhilePausedText } from "./dom";
 
 type Device = { deviceId: string; name: string; platform: string; connected: boolean };
 type Mirror = {
@@ -35,6 +36,27 @@ type Media = {
   pcMedia: string;
   phones: { name: string; status: string }[];
 };
+type Battery = { level: number; charging: boolean } | null;
+/** Presence, Pause and Ring (2B.4): what the Settings window shows. The window may show the phone's level; no log and no `status.json` ever has it. */
+export type Presence = {
+  pause: { on: boolean; untilResumed: boolean; text: string | null; quietArrivals: number; quietSensitive: number };
+  phone: {
+    name: string | null;
+    deviceId: string | null;
+    connected: boolean;
+    battery: Battery;
+    lastKnown: Battery;
+    paused: boolean;
+    pausedText: string | null;
+    /** The phone's Kin lists `presence`: it can be told about a pause. */
+    knowsPause: boolean;
+  };
+  ring: { can: boolean; active: boolean; text: string | null; reason: string | null };
+  shareBattery: boolean;
+  showPhone: boolean;
+  lowBatteryNudge: boolean;
+  hasBattery: boolean;
+};
 type View = {
   deviceName: string;
   customDeviceName: string | null;
@@ -44,6 +66,7 @@ type View = {
   openLinksAutomatically: boolean;
   mirror: Mirror;
   media: Media;
+  presence: Presence;
   receivedFolder: string;
   receivedFolderIsDefault: boolean;
   hotkey: { accelerator: string; registered: boolean; error: string | null };
@@ -80,11 +103,32 @@ function section(heading: string, ...children: (Node | string)[]): HTMLElement {
   return el("section", {}, el("h2", {}, heading), ...children);
 }
 
+/** "62% charging", "14%": the battery as a person reads it. */
+export function batteryText(b: Battery): string {
+  return b ? (b.charging ? `${b.level}% charging` : `${b.level}%`) : "";
+}
+
+/** The device id of `#unlink=<deviceId>` (the tray's "Unlink phone…" opens the window with it), or null. Device IDs are base64url, so nothing else is let through. */
+export function unlinkFromHash(hash: string): string | null {
+  const m = /^#unlink=([A-Za-z0-9_-]{1,64})$/.exec(hash);
+  return m ? m[1] : null;
+}
+
+/** The text of the confirmation of Unlink: what happens, and for an offline phone when it finds out. */
+export function unlinkText(name: string, connected: boolean): string {
+  return (
+    `Unlink ${name}? This phone stops working with Kin right away: nothing more can be sent, shown or rung, even if it is offline. You can pair it again later with a new code.` +
+    (connected ? "" : " It will find out the next time it connects.")
+  );
+}
+
 export function startSettingsWindow(root: HTMLElement): void {
   root.className = "list settings";
   const note = el("p", { className: "flash" });
   const body = el("div", {});
   root.append(el("h1", {}, "Settings"), body, note);
+  // The device whose "Unlink" confirmation is open. The tray's "Unlink phone…" opens the window with `#unlink=<deviceId>`, or tells an open one with an event.
+  let unlinkOpen: string | null = unlinkFromHash(window.location.hash);
 
   const call = async (command: string, args: Record<string, unknown> = {}): Promise<boolean> => {
     try {
@@ -174,16 +218,67 @@ export function startSettingsWindow(root: HTMLElement): void {
       void refresh();
     };
 
+    const p = v.presence;
+    const ringNow = async (start: boolean) => {
+      try {
+        flash(note, await invoke<string>("ring_phone", { start }));
+      } catch (e) {
+        flash(note, String(e), true);
+      }
+      void refresh();
+    };
+    const ringButton = (): HTMLElement =>
+      p.ring.active
+        ? button("Stop ringing phone", () => void ringNow(false), "small")
+        : el("span", {}, button("Ring my phone", () => void ringNow(true), "small"), ...(p.ring.can ? [] : [el("small", { className: "hint" }, ` ${p.ring.reason ?? "Ringing isn't available."}`)]));
     const devices = v.devices.length
       ? v.devices.map((d) => {
-          const unpair = button("Unpair", () => {
-            unpair.replaceWith(
-              el("span", { className: "confirm" }, `Unpair ${d.name}? `, button("Yes, unpair", () => void call("remove_device", { deviceId: d.deviceId }).then(() => refresh()), "small"), button("No", () => void refresh(), "secondary small")),
-            );
+          const here = p.phone.deviceId === d.deviceId;
+          const details: HTMLElement[] = [];
+          if (here) {
+            const bat = d.connected ? p.phone.battery : p.phone.lastKnown;
+            if (p.showPhone && bat) details.push(el("small", {}, ` ${d.connected ? "" : "last known "}${batteryText(bat)}`));
+            if (d.connected && p.phone.paused) details.push(el("small", {}, ` Kin paused on the phone ${p.phone.pausedText ?? ""}`));
+          }
+          const unlink = button("Unlink", () => {
+            unlinkOpen = d.deviceId;
+            void refresh();
           }, "secondary small");
-          return el("div", { className: "device" }, el("span", {}, `${d.name} `, el("small", {}, d.connected ? "connected" : "offline")), unpair);
+          const confirm = el(
+            "span",
+            { className: "confirm" },
+            unlinkText(d.name, d.connected),
+            " ",
+            button("Yes, unlink", () => void call("remove_device", { deviceId: d.deviceId }).then(() => { unlinkOpen = null; return refresh(); }), "small"),
+            button("No", () => { unlinkOpen = null; void refresh(); }, "secondary small"),
+          );
+          const lost = el(
+            "p",
+            { className: "hint" },
+            "Lost your phone? Unlink it here: it stops working at once, even if it is offline. If it is connected you can ring it first. ",
+            here ? ringButton() : "",
+          );
+          return el("div", { className: "device" }, el("span", {}, `${d.name} `, el("small", {}, d.connected ? "connected" : "offline"), ...details), unlinkOpen === d.deviceId ? confirm : unlink, lost);
         })
       : [el("p", { className: "hint" }, "No phone is paired.")];
+
+    const choice = (label: string, which: string) => button(label, () => void call("set_pause", { choice: which }).then(() => refresh()), "small");
+    const pauseSection = section(
+      "Pause",
+      el("p", { className: "hint" }, "While paused Kin sends and shows nothing by itself: no automatic clipboard, phone notifications, media or screenshots. Things you send by hand still arrive, quietly, in the history. Ringing your phone still works."),
+      p.pause.on
+        ? el("p", {}, el("strong", {}, `Paused ${p.pause.text ?? ""}. `), button("Resume Kin", () => void call("set_pause", { choice: "resume" }).then(() => refresh()), "small"), p.pause.quietArrivals ? el("small", { className: "hint" }, ` ${p.pause.quietArrivals} received while paused`) : "", p.pause.quietSensitive ? el("small", { className: "hint" }, ` ${sensitiveWhilePausedText(p.pause.quietSensitive)}`) : "")
+        : el("div", { className: "row left" }, choice("Pause for 1 hour", "1h"), choice("Until tomorrow", "tomorrow"), choice("Until I resume", "resumed")),
+      ...(v.devices.length && !p.phone.knowsPause && p.phone.connected ? [el("p", { className: "hint bad" }, `${p.phone.name ?? "The phone"} doesn't know about pausing: update Kin there.`)] : []),
+    );
+    const shareBox = el("input", { type: "checkbox", checked: p.shareBattery && p.hasBattery, disabled: !p.hasBattery });
+    shareBox.addEventListener("change", () => void call("set_presence_option", { name: "shareBattery", on: shareBox.checked }));
+    const presenceSection = section(
+      "Phone battery",
+      toggle("Show my phone's battery here", "In the tray icon's tooltip and the panel. When the phone is offline the last level it told is shown with the time.", p.showPhone, (on) => void call("set_presence_option", { name: "showPhone", on })),
+      toggle("Warn me when the phone's battery is low", "One notice when it drops to 15 % or less and is not charging.", p.lowBatteryNudge, (on) => void call("set_presence_option", { name: "lowBatteryNudge", on })),
+      el("label", { className: "toggle" }, shareBox, el("span", {}, el("strong", {}, "Share this PC's battery with the phone"), el("small", {}, p.hasBattery ? "The phone's notification and home screen show it." : "No battery: this PC is not a laptop."))),
+    );
 
     const folder = el("code", { className: "path" }, v.receivedFolder);
     const startHint = v.startWithWindowsIsReal ? "Kin starts when you sign in and waits in the tray." : "Developer run: a file stands in for Windows' startup list, which is never changed.";
@@ -223,6 +318,8 @@ export function startSettingsWindow(root: HTMLElement): void {
         el("div", { className: "row left" }, button("Set", () => void setHotkey(pending ?? v.hotkey.accelerator), "small"), button("Turn off", () => void setHotkey(""), "secondary small"), button(`Default (${v.defaultHotkey})`, () => void setHotkey(v.defaultHotkey), "secondary small")),
       ),
       section("Start with Windows", toggle("Start Kin when I sign in", startHint, v.startWithWindows === true, (on) => void call("set_start_with_windows", { on }).then(() => refresh()))),
+      pauseSection,
+      presenceSection,
       section("Phone", ...devices),
       el("div", { className: "row left" }, button("Debug…", () => void call("open_window", { name: "debug" }), "secondary small"), el("span", { className: "hint" }, `Kin ${v.version}`)),
     );
@@ -238,6 +335,10 @@ export function startSettingsWindow(root: HTMLElement): void {
       busy = false;
     }
   };
+  void listen<string>("unlink-requested", (event) => {
+    unlinkOpen = /^[A-Za-z0-9_-]{1,64}$/.test(event.payload) ? event.payload : null;
+    void refresh();
+  });
   void listen("settings-changed", () => {
     // Don't redraw while a field has the focus: that would throw away what is being typed.
     if (!document.activeElement || document.activeElement === document.body) void refresh();

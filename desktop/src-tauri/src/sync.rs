@@ -194,8 +194,9 @@ impl Tap {
 impl Core {
     // ----- settings and hotkey -------------------------------------------------------------------------------------
 
+    /// The switch "Automatic clipboard sync" (the tray's check item). **Not** the gate: a pause is checked next to it (`process_clipboard_change`).
     pub fn auto_clipboard_sync(&self) -> bool {
-        lock(&self.settings).auto_clipboard_sync
+        self.feature_enabled(crate::features::CLIPBOARD_SYNC, None)
     }
 
     /// The tray check item. The choice is written to `settings.json`.
@@ -506,6 +507,13 @@ impl Core {
             log::debug!("clipboard changed: automatic sync is off");
             return;
         }
+        // Pause (2B.4): this PC is paused, or the phone says it is: an automatic send waits for nobody and is not queued.
+        let target = self.queue_target();
+        if self.paused() || target.as_deref().is_some_and(|d| self.peer_paused(d)) {
+            log::debug!("clipboard changed: paused, not sent");
+            self.skip("paused");
+            return;
+        }
         let read = {
             let clipboard = self.clipboard.clone();
             tokio::task::spawn_blocking(move || clipboard.read()).await
@@ -572,6 +580,22 @@ impl Core {
     /// toast says "Text from <phone>" with no preview and no way to open it, and nothing about the text (not even its length) is
     /// logged or kept in `status.json`.
     pub async fn receive_text(&self, device_id: &str, from: &str, id: &str, text: String, is_url: bool, sensitive: bool) {
+        // Quiet arrival while this PC is paused (2B.4, protocol.md "Pause"): the item is in the history and **nothing visible happens by itself**: no toast, no
+        // clipboard write (the user's clipboard is not touched), no link to open. A sensitive text is never stored, so only a count of it is kept
+        // ("1 sensitive text arrived while paused (not kept)": no content, no length).
+        if self.paused() {
+            if sensitive {
+                log::info!("text {id} from device {}: sensitive, arrived while paused (not kept)", short(device_id));
+                self.presence_note_quiet_sensitive();
+                return;
+            }
+            if let Err(e) = self.db.insert_text_item(id, device_id, "in", "done", unix_ms() as i64, None, &text, is_url, None) {
+                log::debug!("the text {id} is not added to the history again: {e}");
+            }
+            log::info!("text {id} from device {}: arrived while paused, handled quietly (history only)", short(device_id));
+            self.presence_note_quiet_arrival();
+            return;
+        }
         let chars = text.chars().count();
         let hash = clipboard::short_hash(&text);
         // The loop guard remembers the wire form (what the phone sent), and the clipboard gets Windows line ends.

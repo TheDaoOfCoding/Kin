@@ -102,7 +102,17 @@ pub async fn post_transfers(
         Ok(r) => r,
         Err(message) => return plain(ApiError::BadRequest, message),
     };
-    match core.upload_post(&peer.device_id, &request).await {
+    // The body can be slow: an unlink while it arrived must not leave an upload behind (the check at the top was before it).
+    if let Err(r) = require_paired(&core, &peer) {
+        return r;
+    }
+    let result = core.upload_post(&peer.device_id, &request).await;
+    // And one more look after the upload exists: an unlink that stopped the device's transfers before this one was registered missed it.
+    if result.is_ok() && !core.db.is_paired(&peer.device_id).unwrap_or(false) {
+        core.abort_device(&peer.device_id).await;
+        return plain(ApiError::Unauthorized, "This device is not paired.");
+    }
+    match result {
         Ok(offsets) => {
             let files: Vec<Value> = offsets.into_iter().map(|(file_id, offset)| json!({ "fileId": file_id, "offset": offset })).collect();
             json_ok(&json!({ "id": request.id, "files": files }))
@@ -145,7 +155,9 @@ fn parse_upload_request(obj: &serde_json::Map<String, Value>) -> Result<UploadRe
         let mime = f.get("mime").and_then(Value::as_str).ok_or("Missing or invalid field: mime.")?;
         specs.push(FileSpec { file_id: file_id.to_string(), name: name.to_string(), size, mime: mime.to_string() });
     }
-    Ok(UploadRequest { id: id.to_string(), files: specs })
+    // `origin` is optional (2B.4): `screenshot` or `camera`; any other value, or one of another type, is ignored as absent.
+    let origin = obj.get("origin").and_then(crate::arrival::Origin::parse);
+    Ok(UploadRequest { id: id.to_string(), files: specs, origin })
 }
 
 // ----- PUT /v1/transfers/{id}/files/{fileId} ---------------------------------------------------------------------------

@@ -136,6 +136,8 @@ impl Db {
         ensure_column(&conn, "transfer_files", "finalizing_name", "TEXT")?;
         ensure_column(&conn, "transfers", "sent_at", "INTEGER")?;
         ensure_column(&conn, "transfers", "retry_of", "TEXT")?;
+        // 2B.4: where an upload came from when the phone sent it by itself (`screenshot` or `camera`), for the wording of its toast and the clipboard rule.
+        ensure_column(&conn, "transfers", "origin", "TEXT")?;
         // 2B.1: a text item may be a link (its body is the URL), with the title and the app that shared it.
         ensure_column(&conn, "transfer_texts", "is_link", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "transfer_texts", "link_title", "TEXT")?;
@@ -163,16 +165,50 @@ impl Db {
         self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Adds a device, or updates the record of one that pairs again.
-    pub fn upsert_device(&self, d: &NewDevice<'_>, now_ms: i64) -> Result<()> {
+    /// Runs a write that has to survive a power cut (2B.4, R38): the list of paired devices. The database runs with `synchronous = NORMAL`
+    /// (`Db::open`), where a commit is not on the disk until the log is checkpointed, so a removal could be undone by a power cut and a removed
+    /// phone would work again. For the duration of this write the connection is `FULL` (the commit is synced), and it is `NORMAL` again after,
+    /// whatever the outcome. The connection lock is held all the time, so no other write runs at the `FULL` level by accident or at `NORMAL`
+    /// in the middle of this one. The write is one transaction.
+    fn durable<T>(&self, write: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let conn = self.conn();
-        conn.execute(
-            "INSERT INTO devices (device_id, name, platform, model, app_version, paired_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(device_id) DO UPDATE SET name = ?2, platform = ?3, model = ?4, app_version = ?5, paired_at = ?6",
-            params![d.device_id, d.name, d.platform, d.model, d.app_version, now_ms],
-        )?;
-        conn.execute("INSERT OR IGNORE INTO device_names (device_id, name) VALUES (?1, ?2)", params![d.device_id, d.name])?;
-        Ok(())
+        conn.execute_batch("PRAGMA synchronous = FULL;")?;
+        let result = (|| -> Result<T> {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            match write(&conn) {
+                Ok(value) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(value)
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })();
+        if let Err(e) = conn.execute_batch("PRAGMA synchronous = NORMAL;") {
+            log::warn!("putting the database back to synchronous = NORMAL failed: {e}");
+        }
+        result
+    }
+
+    /// The `synchronous` level of the connection now (0 OFF, 1 NORMAL, 2 FULL), for the tests of `durable`.
+    #[doc(hidden)]
+    pub fn synchronous_level(&self) -> i64 {
+        self.conn().query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap_or(-1)
+    }
+
+    /// Adds a device, or updates the record of one that pairs again. **Durable**: a pairing the user saw is still there after a power cut.
+    pub fn upsert_device(&self, d: &NewDevice<'_>, now_ms: i64) -> Result<()> {
+        self.durable(|conn| {
+            conn.execute(
+                "INSERT INTO devices (device_id, name, platform, model, app_version, paired_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(device_id) DO UPDATE SET name = ?2, platform = ?3, model = ?4, app_version = ?5, paired_at = ?6",
+                params![d.device_id, d.name, d.platform, d.model, d.app_version, now_ms],
+            )?;
+            conn.execute("INSERT OR IGNORE INTO device_names (device_id, name) VALUES (?1, ?2)", params![d.device_id, d.name])?;
+            Ok(())
+        })
     }
 
     /// Every phone name this PC has known, paired now or not, and every earlier name of a phone that was renamed: what the log export
@@ -200,11 +236,28 @@ impl Db {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    /// Removes the device and the message IDs remembered for it. `true` if it was there.
+    /// Removes the device and the message IDs remembered for it. `true` if it was there. **Durable** (see `durable`): a removal that was
+    /// acted on (the phone's connection closed, its key refused) is on the disk before this returns, so a power cut cannot bring the phone back.
     pub fn remove_device(&self, device_id: &str) -> Result<bool> {
-        let conn = self.conn();
-        conn.execute("DELETE FROM seen_messages WHERE device_id = ?1", [device_id])?;
-        Ok(conn.execute("DELETE FROM devices WHERE device_id = ?1", [device_id])? > 0)
+        self.durable(|conn| {
+            conn.execute("DELETE FROM seen_messages WHERE device_id = ?1", [device_id])?;
+            Ok(conn.execute("DELETE FROM devices WHERE device_id = ?1", [device_id])? > 0)
+        })
+    }
+
+    /// Remembers where an upload came from (`screenshot` or `camera`, 2B.4).
+    pub fn set_transfer_origin(&self, id: &str, origin: &str) -> Result<()> {
+        self.conn().execute("UPDATE transfers SET origin = ?2 WHERE id = ?1", params![id, origin])?;
+        Ok(())
+    }
+
+    pub fn transfer_origin(&self, id: &str) -> Option<String> {
+        self.conn()
+            .query_row("SELECT origin FROM transfers WHERE id = ?1", [id], |r| r.get::<_, Option<String>>(0))
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
     }
 
     pub fn update_name(&self, device_id: &str, name: &str) -> Result<()> {
@@ -633,6 +686,47 @@ mod tests {
         assert!(db.remove_device("a").unwrap());
         assert!(db.seen_response("a", "m1").unwrap().is_none());
         assert!(!db.remove_device("a").unwrap());
+    }
+
+    /// R38: the list of devices is written at `synchronous = FULL`, and the connection goes back to `NORMAL` after, whatever the outcome.
+    #[test]
+    fn a_write_of_the_device_list_is_full_inside_and_normal_before_and_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("kin.db")).unwrap();
+        assert_eq!(db.synchronous_level(), 1, "NORMAL: the speed setting of v0.1.1 stays for everything else");
+        let inside = db.durable(|conn| Ok(conn.query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))?)).unwrap();
+        assert_eq!(inside, 2, "FULL inside the helper");
+        assert_eq!(db.synchronous_level(), 1, "NORMAL again after it");
+        // A write that fails is rolled back and the level is still put back.
+        let failed: Result<()> = db.durable(|conn| {
+            conn.execute("INSERT INTO devices (device_id, name, platform, paired_at) VALUES ('x', 'X', 'android', 1)", [])?;
+            Err("the write failed half way".into())
+        });
+        assert!(failed.is_err());
+        assert_eq!(db.synchronous_level(), 1);
+        assert!(!db.is_paired("x").unwrap(), "the half-done write was rolled back");
+        // Pairing and removing both go through it, and neither leaves the level up.
+        db.upsert_device(&device("a", "Phone"), 1).unwrap();
+        assert_eq!(db.synchronous_level(), 1);
+        assert!(db.remove_device("a").unwrap());
+        assert_eq!(db.synchronous_level(), 1);
+    }
+
+    /// The removal is in the file: a second connection to the same file sees it at once, and so does a new `Db` on it.
+    #[test]
+    fn a_removal_is_visible_to_a_second_connection_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kin.db");
+        let db = Db::open(&path).unwrap();
+        db.upsert_device(&device("a", "Phone"), 1).unwrap();
+        let other = Connection::open(&path).unwrap();
+        let paired =
+            |c: &Connection| c.query_row("SELECT COUNT(*) FROM devices WHERE device_id = 'a'", [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(paired(&other), 1, "a pairing is visible at once too");
+        assert!(db.remove_device("a").unwrap());
+        assert_eq!(paired(&other), 0);
+        drop(db);
+        assert!(!Db::open(&path).unwrap().is_paired("a").unwrap());
     }
 
     #[test]

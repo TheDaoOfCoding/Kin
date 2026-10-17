@@ -105,6 +105,9 @@ pub fn run(parsed: Parsed) {
             ui::set_mirror_option,
             ui::set_media_option,
             ui::media_command,
+            ui::set_pause,
+            ui::ring_phone,
+            ui::set_presence_option,
             ui::choose_received_folder,
             ui::reset_received_folder,
             ui::set_hotkey,
@@ -247,6 +250,18 @@ fn setup(app: &mut tauri::App, parsed: Parsed, aumid: std::result::Result<(), St
     // Media controls (2B.3): the reader of the PC's sessions and the flyout session, only for the switches that are on.
     core.media.set_runtime(tauri::async_runtime::block_on(async { tokio::runtime::Handle::current() }));
     core.media_start();
+    // Presence (2B.4): the one task that wakes at the next due time (a trailing send, the end of a pause, the battery poll while a phone is connected).
+    core.presence.set_runtime(tauri::async_runtime::block_on(async { tokio::runtime::Handle::current() }));
+    core.ensure_presence_pump();
+    // A timer does not count the time asleep: after a wake the pause is looked at again and the tray redrawn (a pause that ended in its sleep).
+    {
+        let weak = Arc::downgrade(&core);
+        crate::powerwatch::watch(Arc::new(move || {
+            if let Some(core) = weak.upgrade() {
+                core.presence_system_resumed();
+            }
+        }));
+    }
 
     let handle = app.handle().clone();
     tauri::async_runtime::spawn(event_loop(handle.clone(), core.clone(), events_rx));
@@ -669,6 +684,21 @@ pub fn on_menu(app: &AppHandle, id: &str) {
                 state.core.media_press(name);
             }
         }
+        // Pause Kin and Ring my phone (2B.4).
+        tray::MENU_PAUSE_1H => handle_commands(app, &[Command::Pause(Some(crate::presence::pause::PauseChoice::OneHour))]),
+        tray::MENU_PAUSE_TOMORROW => handle_commands(app, &[Command::Pause(Some(crate::presence::pause::PauseChoice::Tomorrow))]),
+        tray::MENU_PAUSE_RESUMED => handle_commands(app, &[Command::Pause(Some(crate::presence::pause::PauseChoice::UntilResumed))]),
+        tray::MENU_RESUME => handle_commands(app, &[Command::Pause(None)]),
+        tray::MENU_RING => handle_commands(app, &[Command::Ring]),
+        tray::MENU_RING_STOP => handle_commands(app, &[Command::RingStop]),
+        // The Settings window, with the confirmation of "Unlink" already open for the phone the tray talks about.
+        tray::MENU_UNLINK => {
+            if let Some(state) = app.try_state::<AppState>()
+                && let Some(device) = state.core.snapshot().headline_device()
+            {
+                ui::open_unlink(app, &device.device_id);
+            }
+        }
         tray::MENU_PAIR => handle_commands(app, &[Command::Pair]),
         tray::MENU_HISTORY => handle_commands(app, &[Command::History]),
         tray::MENU_SETTINGS => handle_commands(app, &[Command::Settings]),
@@ -746,6 +776,22 @@ pub fn handle_commands(app: &AppHandle, commands: &[Command]) {
                 tauri::async_runtime::spawn(async move { core.mirror_dev_toast(&action, &nid, arg).await });
             }
             Command::DevMedia { action, arg } => core.media_dev(action, arg.clone()),
+            // Pause Kin and Ring my phone (2B.4): the same as the tray items, for a script. No input is injected: these are messages to the running Kin.
+            Command::Pause(choice) => {
+                let choice = *choice;
+                // Not on the menu's thread, nor on an async worker: a pause takes the media session down and puts it back (Windows calls, threads).
+                tauri::async_runtime::spawn_blocking(move || core.set_pause(choice));
+            }
+            Command::Ring => {
+                tauri::async_runtime::spawn(async move {
+                    core.ring_start().await;
+                });
+            }
+            Command::RingStop => {
+                tauri::async_runtime::spawn(async move {
+                    core.ring_stop().await;
+                });
+            }
             Command::DevSetClipboard { text, mark } => {
                 let (text, mark) = (text.clone(), *mark);
                 tauri::async_runtime::spawn(async move { core.dev_set_clipboard(text, mark).await });
@@ -850,6 +896,8 @@ async fn dev_dump_view(app: &AppHandle, core: &Arc<Core>, name: &str) {
         "settings" => {
             let mut v = core.settings_view(state.autostart.is_enabled().ok());
             v["startWithWindowsIsReal"] = serde_json::json!(state.autostart.is_real());
+            // The file lands in the data directory: no battery level of the phone goes into it.
+            crate::presence::redact_panel(&mut v["presence"]);
             v
         }
         "debug" => ui::debug_json(core).await,
@@ -947,6 +995,35 @@ fn dev_set(app: &AppHandle, core: &Arc<Core>, key: &str, value: &str) {
         "mediaShow" => {
             core.set_media_show(on);
             write(true, on.to_string());
+        }
+        // Presence (2B.4): the three switches, each on by default.
+        "presenceShareBattery" => {
+            core.set_presence_share_battery(on);
+            write(true, on.to_string());
+        }
+        "presenceShowPhone" => {
+            core.set_presence_show_phone(on);
+            write(true, on.to_string());
+        }
+        "lowBatteryNudge" => {
+            core.set_low_battery_nudge(on);
+            write(true, on.to_string());
+        }
+        // A fake battery for this PC while the app runs: `62:charging`, `9:unplugged` or `none`.
+        "devBattery" => match crate::presence::battery::parse_dev_battery(value) {
+            Some(b) => {
+                core.dev_set_battery(b);
+                write(true, value.to_string());
+            }
+            None => write(false, "expected <level>:charging, <level>:unplugged or none".to_string()),
+        },
+        // Unlink a phone without a window (the device ID is in `status.json`): what the Unlink button of the settings window does.
+        "unlinkDevice" => {
+            let (core, value) = (core.clone(), value.to_string());
+            match tauri::async_runtime::block_on(async move { core.remove_device(&value).await }) {
+                Ok(removed) => write(true, format!("removed: {removed}")),
+                Err(e) => write(false, e.to_string()),
+            }
         }
         "receivedFolder" => match core.set_received_folder(Some(value)) {
             Ok(path) => write(true, path.to_string_lossy().into_owned()),

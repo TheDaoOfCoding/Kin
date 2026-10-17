@@ -50,3 +50,8 @@ export function flash(target: HTMLElement, text: string, bad = false): void {
     if (target.textContent === text) target.textContent = "";
   }, 5000);
 }
+
+/** "1 sensitive text arrived while paused (not kept)": a count only, never any content. */
+export function sensitiveWhilePausedText(n: number): string {
+  return n === 1 ? "1 sensitive text arrived while paused (not kept)" : `${n} sensitive texts arrived while paused (not kept)`;
+}

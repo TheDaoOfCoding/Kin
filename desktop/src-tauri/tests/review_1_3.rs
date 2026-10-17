@@ -96,7 +96,7 @@ fn spec(id: &str, name: &str, size: u64) -> FileSpec {
 }
 
 fn request(id: &str, files: Vec<FileSpec>) -> UploadRequest {
-    UploadRequest { id: id.into(), files }
+    UploadRequest { id: id.into(), files, origin: None }
 }
 
 fn put_params(offset: u64, length: u64) -> PutParams {
