@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A throwaway test app for tools/e2e-2b-2.ps1: posts notifications of kinds the shell's `cmd notification post` cannot (call, alarm,
+     foreground-service, ongoing, summary, secret, media, progress), from a package whose name has the whole word "bank" in it, so Kin's
+     AppCatalog flags it as likely sensitive. It has no network permission and does nothing else. Never shipped. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="test.bank.demo">
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <application android:label="Demo Bank" android:allowBackup="false">
+        <activity android:name=".Main" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <service android:name=".FgsService" android:exported="true" android:foregroundServiceType="shortService" />
+        <receiver android:name=".PostReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="test.bank.demo.POST" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

@@ -610,29 +610,26 @@ function Run-S4b {
 
 # ================================================================ S6 URL edge cases on both sides
 function U([int[]]$cps) { -join ($cps | ForEach-Object { [char]$_ }) }
-# The real display_host of the PC's toast (desktop\src-tauri\src\phonelinks.rs), cut out of the source and compiled on its own: toasts are only logged by a test Kin, so this is how "what the PC shows" is read.
-function Get-PcDisplayHosts([string[]]$Urls) {
-    $src = Get-Content (Join-Path $Repo 'desktop\src-tauri\src\phonelinks.rs') -Raw
-    $m = [regex]::Match($src, '(?s)pub fn display_host\(url: &str\) -> String \{.*?\n\}\n')
-    if (-not $m.Success) { return $null }
-    $dir = Join-Path $Work 'displayhost'; New-Item -ItemType Directory -Force $dir | Out-Null
-    $rs = @"
-$($m.Value)
-fn unhex(s: &str) -> String { let b: Vec<u8> = (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect(); String::from_utf8(b).unwrap() }
-fn main() {
-    let text = std::fs::read_to_string(std::env::args().nth(1).unwrap()).unwrap();
-    for line in text.lines() { if line.is_empty() { continue; } let url = unhex(line); println!("{}|{}", line, display_host(&url)); }
-}
-"@
-    [IO.File]::WriteAllText((Join-Path $dir 'main.rs'), $rs, (New-Object Text.UTF8Encoding($false)))
+# What the PC's toast shows for each URL, and whether the address has a warning, read from the real code (`links::link_address`, the 2B.1 review's rule: the browser's
+# reading of the host, marked): desktop\src-tauri\examples\link_address.rs, built and run with cargo. (The old `display_host` of phonelinks.rs is gone.) Returns a
+# hashtable keyed by the hex of the URL's UTF-8 bytes: @{ Shown = '...'; Warn = $true/$false }. Toasts are only logged by a test Kin, so this is how "what the PC shows" is read.
+function Get-PcLinkAddresses([string[]]$Urls) {
+    $dir = Join-Path $Work 'linkaddress'; New-Item -ItemType Directory -Force $dir | Out-Null
     $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
     if (-not (($env:Path -split ';') | Where-Object { $_.TrimEnd('\') -ieq $cargoBin })) { $env:Path = "$cargoBin;$env:Path" }
-    & rustc --edition 2021 -O -o (Join-Path $dir 'display.exe') (Join-Path $dir 'main.rs') 2>&1 | Out-Null
-    if (-not (Test-Path (Join-Path $dir 'display.exe'))) { return $null }
-    $hex = $Urls | ForEach-Object { -join ([Text.Encoding]::UTF8.GetBytes($_) | ForEach-Object { $_.ToString('x2') }) }
-    [IO.File]::WriteAllLines((Join-Path $dir 'in.txt'), @($hex))
+    $hexOf = { param([string]$t) -join ([Text.Encoding]::UTF8.GetBytes($t) | ForEach-Object { $_.ToString('x2') }) }
+    $lines = @($Urls | ForEach-Object { & $hexOf $_ })
+    [IO.File]::WriteAllLines((Join-Path $dir 'in.txt'), $lines)
+    Push-Location (Join-Path $Repo 'desktop\src-tauri')
+    try { $out = & cargo run --quiet --example link_address -- (Join-Path $dir 'in.txt') 2>$null } finally { Pop-Location }
+    if ($LASTEXITCODE -ne 0 -or -not $out) { return $null }
     $h = @{}
-    foreach ($l in (& (Join-Path $dir 'display.exe') (Join-Path $dir 'in.txt'))) { $p = $l.Split('|', 2); $h[$p[0]] = $p[1] }
+    foreach ($l in $out) {
+        $p = "$l".Split('|')
+        if ($p.Count -ne 3 -or $p[2] -eq 'error') { continue }
+        $shown = if ($p[1]) { [Text.Encoding]::UTF8.GetString([byte[]]($p[1] -split '(?<=\G..)(?!$)' | ForEach-Object { [Convert]::ToByte($_, 16) })) } else { '' }
+        $h[$p[0]] = @{ Shown = $shown; Warn = ($p[2] -eq 'true') }
+    }
     $h
 }
 # What a browser (WHATWG URL, bun's) navigates to for each URL.
@@ -671,7 +668,7 @@ function Run-S6 {
         $in = if ($u.synthesize) { $s = $u.synthesize; $s.prefix + ([string]$s.fill * [int]$s.fillCount) + $s.suffix } else { [string]$u.input }
         $entries.Add([pscustomobject]@{ Name = $u.name; Input = $in; Valid = [bool]$u.valid; Unchanged = [bool]$u.unchanged; Extra = $false })
     }
-    # the display cases: all pass the openable-URL rule
+    # the display cases: since changelog 55 only the IDN, homograph, case and IP ones pass the openable-URL rule; the backslash, userinfo and %-escape ones are texts on both sides (the table says so)
     $cy = U 0x430, 0x440, 0x440, 0x4CF, 0x435      # Cyrillic a, r, r, palochka, e: "apple" to the eye
     $extras = @(
         @('x-backslash-authority', 'https://evil.example\@google.com'),
@@ -720,8 +717,8 @@ function Run-S6 {
 
     # --- the display cases, one at a time (the phone shows at most 10 link notifications): what the phone's notification says
     $browser = Get-BrowserReading @($displayCases | ForEach-Object { $_.Input })
-    $pcShown = Get-PcDisplayHosts @($displayCases | ForEach-Object { $_.Input })
-    Check 'S6 the PC toast function (display_host) was compiled from the source and run' ($null -ne $pcShown)
+    $pcShown = Get-PcLinkAddresses @($displayCases | ForEach-Object { $_.Input })
+    Check 'S6 the PC toast address function (links::link_address) was built from the source and run' ($null -ne $pcShown)
     $i = 0
     foreach ($e in $displayCases) {
         Clear-Notifs
@@ -733,7 +730,7 @@ function Run-S6 {
         $e | Add-Member -NotePropertyName PhoneBig -NotePropertyValue $(if ($n -and $n -match '(?s)android\.bigText=String \((.*?)\)\r?\n\s+android\.infoText') { ($Matches[1] -replace "`r?`n", ' / ') } else { '' }) -Force
         $hexIn = -join ([Text.Encoding]::UTF8.GetBytes($e.Input) | ForEach-Object { $_.ToString('x2') })
         $e | Add-Member -NotePropertyName Browser -NotePropertyValue $browser[$i].host -Force
-        $e | Add-Member -NotePropertyName PcShows -NotePropertyValue $(if ($pcShown) { $pcShown[$hexIn] } else { '?' }) -Force
+        $e | Add-Member -NotePropertyName PcShows -NotePropertyValue $(if ($pcShown -and $pcShown[$hexIn]) { $pcShown[$hexIn].Shown } else { '?' }) -Force
         $i++
     }
 
@@ -741,11 +738,15 @@ function Run-S6 {
     Pc-Setting 'openLinksAutomatically' 'true' | Out-Null
     $o0 = Pc-Opened
     $all = $entries.ToArray()
+    # What the PC must NOT open by itself (the 2B.1 review's rule): a link whose address has a warning is offered in a toast, never opened. The warning comes from the real code.
+    $expectTrimmed = @($all | ForEach-Object { Trim-Spec $_.Input } | Where-Object { Test-OpenableSpec $_ } | Select-Object -Unique)
+    $addresses = Get-PcLinkAddresses $expectTrimmed
+    Check 'S6 the PC address function answered for every link of the table' ($null -ne $addresses -and $addresses.Count -ge ($expectTrimmed.Count - 1)) "$($addresses.Count) of $($expectTrimmed.Count)"
     foreach ($e in $all) { Share-Url $e.Input $e.Name; Start-Sleep -Milliseconds 1100 }
     Start-Sleep -Seconds 8
     $h = Get-PcView 'history'
     $histIn = @($h.items | Where-Object { $_.direction -eq 'in' })
-    $expectLinks = 0; $bad = @()
+    $expectLinks = 0; $expectWarned = 0; $bad = @()
     foreach ($e in $all) {
         $t = Trim-Spec $e.Input
         $expectLink = ((Test-OpenableSpec $t))
@@ -756,7 +757,14 @@ function Run-S6 {
         $e | Add-Member -NotePropertyName PhoneToPcExact -NotePropertyValue ([bool]($link -and $link.text -ceq $t)) -Force
         # (the history view of the PC shows at most a preview of a long text, so the two 8,192-byte URLs are checked by the length the PC logged when it opened them)
         $isLong = [Text.Encoding]::UTF8.GetByteCount($t) -gt 1000
-        if ($expectLink) { $expectLinks++; if ($where -ne 'link' -or (-not $isLong -and $link.text -cne $t)) { $bad += "$($e.Name): expected a link '$($t.Substring(0, [Math]::Min(40, $t.Length)))', got $where" } }
+        if ($expectLink) {
+            $expectLinks++
+            $hexT = -join ([Text.Encoding]::UTF8.GetBytes($t) | ForEach-Object { $_.ToString('x2') })
+            $warned = [bool]($addresses -and $addresses[$hexT] -and $addresses[$hexT].Warn)
+            if ($warned) { $expectWarned++ }
+            $e | Add-Member -NotePropertyName PcWarned -NotePropertyValue $warned -Force
+            if ($where -ne 'link' -or (-not $isLong -and $link.text -cne $t)) { $bad += "$($e.Name): expected a link '$($t.Substring(0, [Math]::Min(40, $t.Length)))', got $where" }
+        }
         else { if ($where -eq 'link') { $bad += "$($e.Name): became a link on the PC but is not a web link" } }
     }
     $upRows = @(Phone-DbTexts | Where-Object { $_.Dir -eq 'up' })
@@ -765,7 +773,9 @@ function Run-S6 {
     $opened = (Pc-Opened) - $o0
     Check "S6 phone -> PC: exactly the URLs that are web links after trimming ($expectLinks) became links on the PC, byte for byte; everything else stayed a text or was refused" ($bad.Count -eq 0) ($bad -join '; ')
     Check 'S6 phone -> PC: the two 8,192-byte links were opened with all 8,192 characters' ((Pc-LogCount 'link \S+ from device \S+: 8192 characters, opened in the default browser') -ge 2)
-    Check "S6 phone -> PC: the PC asked its opener once per link and for nothing else ($opened of $expectLinks)" ($opened -eq $expectLinks)
+    $expectOpened = $expectLinks - $expectWarned
+    Check "S6 phone -> PC: the PC asked its opener once per link WITHOUT a warning and for nothing else ($opened of $expectOpened; the $expectWarned links with a warning were offered in a toast and not opened)" ($opened -eq $expectOpened)
+    Check 'S6 phone -> PC: a link with a warning was logged as not opened (the address has a warning)' ($expectWarned -eq 0 -or (Pc-LogCount 'not opened \(the address has a warning') -ge $expectWarned)
     $script:Edge = $all
     # --- the table
     $md = New-Object System.Collections.Generic.List[string]
@@ -797,7 +807,7 @@ function Test-OpenableSpec([string]$t) {
     foreach ($ch in $t.ToCharArray()) { if ($script:SpecWhite -contains [int]$ch) { return $false } }
     $rest = $t.Substring($t.IndexOf('://') + 3)
     $auth = ($rest -split '[/?#]', 2)[0]
-    $at = $auth.LastIndexOf('@'); if ($at -ge 0) { $auth = $auth.Substring($at + 1) }
+    if ($auth -match '[@\\%]') { return $false }   # changelog 55, step 4: no user information, no backslash and no percent-encoding in the authority: not openable, as a text or as a link
     if ($auth.StartsWith('[')) {
         $close = $auth.IndexOf(']'); if ($close -lt 2) { return $false }
         if ($auth.Substring(1, $close - 1) -match '[\[\]]') { return $false }
@@ -809,6 +819,7 @@ function Test-OpenableSpec([string]$t) {
         $colon = $auth.IndexOf(':')
         if ($colon -ge 0) { $hostPart = $auth.Substring(0, $colon); $port = $auth.Substring($colon + 1) } else { $hostPart = $auth; $port = $null }
         if ($hostPart -eq '' -or $hostPart -match '^\.+$') { return $false }
+        if ($hostPart -match '[\[\]<>^|]') { return $false }   # step 5: a host that is not a bracketed IPv6 literal has none of [ ] < > ^ |
     }
     if ($null -ne $port) {
         if ($port -notmatch '^[0-9]+$') { return $false }

@@ -21,6 +21,8 @@ The full run (`tools\e2e-2b-1.ps1`, no arguments, about 15 minutes) passed every
 
 ## Bugs and interop findings (not fixed, for the reviewer)
 
+> **Update (2026-10-17, after the review): B1 and B2 are fixed in protocol changelog 55** (the rule now rejects `@`, `\` and `%` in the authority and a browser-refused host; the PC shows the browser's reading of the host, marks it with a warning, and never opens a link with a warning by itself). The text below is what the run found, kept as it was. Desktop details: [phase-2b-1-desktop.md](phase-2b-1-desktop.md); the S6 script was brought up to date in 2B.2 (`tools/e2e-2b-1.ps1` reads what the PC shows from `links::link_address`, through `desktop/src-tauri/examples/link_address.rs`, and expects a link with a warning not to be opened).
+
 ### B1 (security-relevant, real): the PC shows a different host than the one a browser opens, for a backslash in the authority
 
 `https://evil.example\@google.com` passes the openable-URL rule on both sides (a backslash is neither whitespace nor a control character), so Kin accepts it, sends it and **opens it automatically by default**. A browser (WHATWG) treats `\` as the end of the authority and goes to **`evil.example`**.
@@ -105,7 +107,7 @@ New: `tools/e2e-2b-1.ps1`, `tools/e2e-2b-1-extension.ts`, a `tools/README.md` se
 - **The old PC** is built from `git archive v0.1.1 desktop` (a tarball extracted to `%LOCALAPPDATA%\Temp\kin-e2e2b1-oldpc`, `cargo build --bin kin` with its own `CARGO_TARGET_DIR`, 1 m 16 s). `-Build` does this when it is missing; the main tree was never checked out. Its copy must be called `Kin.exe`: `kin-dev.ps1` finds a test Kin's processes by that name, and my first copy (`Kin-v0.1.1.exe`) was never seen, never quit, and four of them were left running by the first runs (stopped by PID after checking their paths; the script now fails if anything of its run is left).
 - **Windows PowerShell 5.1 drops embedded double quotes** in arguments to `adb.exe`, which split a shared URL with a space; the URL and title now go to the phone as files read by a small script on the phone (this is what lets the control-character and NBSP cases through unchanged).
 - The phone's database is read with `run-as sqlite3` (debug build, the system image's sqlite3) with `hex()` for exact bytes; the PC's with `--dev-dump-view history`.
-- S6 reads "what the PC shows" by compiling the real `display_host` out of `phonelinks.rs` (regex cut, `rustc`), and "what a browser does" with bun's WHATWG `URL`.
+- S6 reads "what the PC shows" by compiling the real `display_host` out of `phonelinks.rs` (regex cut, `rustc`), and "what a browser does" with bun's WHATWG `URL`. (Out of date since the B1/B2 fix: `display_host` is gone, see the update at the top of "Bugs and interop findings".)
 - A shared lock, `COMPUTERNAME=DESK-PC` for the run, a copy of `Kin.exe` for the run, `autoClipboardSync` off in the test Kin's throwaway settings.
 
 Re-run: `powershell -ExecutionPolicy Bypass -File tools\e2e-2b-1.ps1` (add `-Build` after a code change, `-Avd kin_api29` for the Android 10 pass; capture the output to a file as the other e2e scripts' notes say). Exit code 0 only if everything passed.

@@ -176,6 +176,10 @@ Queue (Wi-Fi off, then on): arrived after __ s
 Kin memory after 1 h idle: __ MB
 ```
 
+### Phone notifications on the PC (0.2.0): a limit of Android 10 and 11
+
+On **Android 10 and 11** the phone can't tell a notification button that opens an app (an activity) from one that does something in the background (Android only added the question in 12), so it offers both. A button such as **"Open"** therefore **appears on the PC's toast, and pressing it shows "Sent to <phone>"** (the phone really did fire it and said so), **but Android silently blocks the app from starting**, so nothing happens on the phone. This is Android's rule for apps started from the background, not a fault in Kin, and the PC cannot know. On Android 12 and later such buttons are not offered at all. Note it in the results sheet if you see it; don't count it as a failed send.
+
 ## 7. The 3-day soak
 
 The soak test asks: **does an always-on connection survive on a real phone without hurting the battery?** It is the biggest open question of the project. For **at least 3 days**, use the phone and the PC normally (carry the phone around, let it sleep overnight, leave the PC on or put it to sleep as you always do). **Don't** open Kin to "keep it alive": that spoils the test.
