@@ -195,8 +195,10 @@ function Read-Identity {
 function Quiet-Settle([int]$Seconds = 4) { Start-Sleep -Seconds $Seconds }
 function Icon-Files { @(Get-ChildItem (Join-Path $Data 'notif-icons') -File -ErrorAction SilentlyContinue).Count }
 function Clean-All {
-    # CLEAR_ALL cancels through the listener (reason LISTENER_CANCEL(_ALL): the phone does not echo those as notif.remove, by design), so the PC's toasts stay:
-    # the dev identity's toasts are removed by the probe (test hygiene; Kin's ledger is stale after it, which no later step relies on)
+    # MIRROR_CLEAR_ALL (the debug build's DebugCommandReceiver) clears the shade in two ways: the listener's cancelAllNotifications for every other app's
+    # notification (reason LISTENER_CANCEL(_ALL): the phone does not echo those as notif.remove, by design), and the NotificationManager for Kin's OWN debug test posts
+    # (channel kin_debug_mirror*), which the listener skips (rule 1 of MirrorFilter) and which would otherwise stay in the shade for the next step. Either way the
+    # PC's toasts stay: the dev identity's toasts are removed by the probe (test hygiene; Kin's ledger is stale after it, which no later step relies on)
     Phone-Cmd 'MIRROR_CLEAR_ALL' '' 1200
     Invoke-Probe clear $script:Aumid | Out-Null
 }
