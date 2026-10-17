@@ -547,12 +547,15 @@ type Role = "phone" | "pc";
 const MAX_FRAME = 1048576;
 const MAX_OFFER_FILES = 800; // more files in one offer: the receiver answers error too_large
 const TRANSFER_ID = /^[A-Za-z0-9_-]{1,64}$/;
-const INT_FIELDS = ["protocol", "size", "totalSize", "offset", "received", "sentAt", "importance", "apps", "i"];
+const INT_FIELDS = ["protocol", "size", "totalSize", "offset", "received", "sentAt", "importance", "apps", "i", "durationMs", "positionMs", "rateMilli", "seekMs", "level", "delta"];
+const SIGNED_INT_FIELDS = new Set(["delta"]); // the one integer of the protocol that may be negative (media.cmd, changelog 57)
 const DIRECTION: Record<string, Role | "both"> = {
   hello: "both", ack: "both", error: "both", text: "both", link: "both", clipboard: "pc", offer: "pc",
   complete: "phone", cancel: "both", unpair: "both", ping: "both",
   // changelog 56: the value is the SENDER's role
   "notif.status": "phone", "notif.icon": "phone", "notif.post": "phone", "notif.remove": "phone", "notif.sync": "phone", "notif.dismiss": "pc", "notif.action": "pc",
+  // changelog 57: both sides send and receive every media.* type (each is the source of one direction and the viewer of the other); none is acked
+  "media.status": "both", "media.state": "both", "media.image": "both", "media.clear": "both", "media.volume": "both", "media.cmd": "both",
 };
 // notif.action is the one notif message that is acked; the other six are ephemeral (no ack, no de-duplication, never stored)
 const ACKED = new Set(["text", "link", "clipboard", "offer", "complete", "cancel", "unpair", "ping", "notif.action"]);
@@ -562,8 +565,11 @@ const ACTION: Record<string, string> = {
   hello: "handshake_ok", ack: "mark_delivered", error: "mark_failed", text: "deliver_text", link: "deliver_link", clipboard: "set_clipboard",
   offer: "start_download", complete: "mark_transfer_done", cancel: "cancel_transfer", unpair: "remove_peer_and_close", ping: "show_ping_toast",
   "notif.status": "notif_status", "notif.icon": "notif_icon", "notif.post": "notif_post", "notif.remove": "notif_remove", "notif.sync": "notif_sync", "notif.dismiss": "notif_dismiss", "notif.action": "notif_action",
+  "media.status": "media_status", "media.state": "media_state", "media.image": "media_image", "media.clear": "media_clear", "media.volume": "media_volume", "media.cmd": "media_cmd",
 };
-type Outcome = { reply: "ack" | "error" | "none"; action?: string; code?: string; ref?: string | null; close: number | null; sensitive?: boolean; link?: any; notif?: any };
+const MAX_MEDIA_FRAME = 32768; // a received media.state or any other media.* frame over this is error too_large
+const MAX_MEDIA_IMAGE_FRAME = 49152; // a 24,576-byte image is 32,768 base64url characters
+type Outcome = { reply: "ack" | "error" | "none"; action?: string; code?: string; ref?: string | null; close: number | null; sensitive?: boolean; link?: any; notif?: any; media?: any };
 const isObj = (x: any) => x !== null && typeof x === "object" && !Array.isArray(x);
 const isStr = (x: any) => typeof x === "string";
 const isNonEmptyStr = (x: any) => typeof x === "string" && x.length > 0;
@@ -780,6 +786,351 @@ function notifOf(type: string, o: any, badInts: Set<string>): any {
   return "bad";
 }
 
+// ------------------------------------------------------------------ media controls (changelog 57)
+const MEDIA_LIMITS = {
+  app: 40, title: 150, artist: 100, album: 100, actions: 8, durationMs: 86400000, positionMs: 86400000, rateMilli: 4000, seekMs: 86400000, level: 100, delta: 100,
+  stateFrameSend: 16384, stateFrameRecv: 32768, imageFrame: 49152, imageBytes: 24576, artPixels: 256, iconPixels: 128, imageMinPixels: 16,
+  pausedExpiryMs: 1800000, clearDebounceMs: 1500, positionJumpMs: 1500, endGraceMs: 5000, throttleMs: 250,
+};
+// the limiters: a token bucket (capacity, tokens per second) or a sliding window (max in windowMs); an error answer at most once per errorSpacingMs
+const MEDIA_LIMITERS: Record<string, any> = {
+  sourceState: { type: "bucket", capacity: 10, perSecond: 4 },
+  viewerState: { type: "bucket", capacity: 20, perSecond: 5, errorSpacingMs: 10000 },
+  sourceCmd: { type: "bucket", capacity: 20, perSecond: 2, errorSpacingMs: 10000 },
+  viewerCmd: { type: "window", max: 20, windowMs: 10000 },
+  image: { type: "window", max: 20, windowMs: 60000 },
+};
+const MEDIA_STATES = ["playing", "paused", "buffering", "stopped"];
+const MEDIA_ACTIONS = ["play", "pause", "toggle", "next", "prev", "seek"]; // the canonical order of `actions`
+const MEDIA_CMDS = ["play", "pause", "toggle", "next", "prev", "seek", "volume"];
+const HEX32 = /^[0-9a-f]{32}$/;
+// the first 32 hex characters of SHA-256 of the UTF-8 bytes of the app's identity (package name or SourceAppUserModelId)
+const sidOf = (identity: string) => createHash("sha256").update(identity, "utf8").digest("hex").slice(0, 32);
+// PNG or JPEG: the format and the size from the headers (a JPEG: the first SOF marker), or null. Nothing is decoded.
+function mediaImageInfo(b: Uint8Array): { format: "png" | "jpeg"; w: number; h: number } | null {
+  const png = pngSize(b);
+  if (png) return { format: "png", ...png };
+  if (b.length < 4 || b[0] !== 0xff || b[1] !== 0xd8) return null;
+  let pos = 2;
+  while (pos + 4 <= b.length) {
+    if (b[pos] !== 0xff) return null;
+    while (pos < b.length && b[pos] === 0xff) pos++; // fill bytes
+    const marker = b[pos];
+    pos++;
+    if (marker === 0xd9 || marker === 0xda) return null; // end or scan before any frame header
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd8)) continue; // no length
+    if (pos + 2 > b.length) return null;
+    const len = (b[pos] << 8) | b[pos + 1];
+    if (len < 2) return null;
+    const sof = marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+    if (sof) {
+      if (pos + 7 > b.length) return null;
+      return { format: "jpeg", h: (b[pos + 3] << 8) | b[pos + 4], w: (b[pos + 5] << 8) | b[pos + 6] };
+    }
+    pos += len;
+  }
+  return null;
+}
+// the wire form of the image's validity: bytes, format, and the size rule of its kind (null = fine)
+function mediaImageProblem(bytes: Uint8Array, kind: string): string | null {
+  if (bytes.length > MEDIA_LIMITS.imageBytes) return "too_big";
+  const info = mediaImageInfo(bytes);
+  if (!info) return "not_png_or_jpeg";
+  if (info.w < MEDIA_LIMITS.imageMinPixels || info.h < MEDIA_LIMITS.imageMinPixels) return "too_small";
+  if (Math.max(info.w, info.h) > (kind === "art" ? MEDIA_LIMITS.artPixels : MEDIA_LIMITS.iconPixels)) return "too_large_pixels";
+  return null;
+}
+// "ok" content, "bad" (bad_request), or "drop" (silently dropped and counted), for one media.* frame that passed steps 1 to 6c
+function mediaOf(type: string, o: any, badInts: Set<string>): any {
+  const L = MEDIA_LIMITS;
+  const optStr = (v: any, max: number): string | undefined => {
+    if (v === undefined || v === null) return undefined;
+    if (typeof v !== "string") throw BAD;
+    return cleanLinkText(v, max) ?? undefined;
+  };
+  const int = (v: any, field: string, lo: number, hi: number): number => {
+    if (badInts.has(field) || typeof v !== "number" || !Number.isSafeInteger(v) || v < lo || v > hi) throw BAD;
+    return v;
+  };
+  const optInt = (v: any, field: string, lo: number, hi: number): number | undefined => (v === undefined || v === null ? undefined : int(v, field, lo, hi));
+  const bool = (v: any): boolean => {
+    if (typeof v !== "boolean") throw BAD;
+    return v;
+  };
+  const hex32 = (v: any): string => {
+    if (typeof v !== "string" || !HEX32.test(v)) throw BAD;
+    return v;
+  };
+  try {
+    if (!validMsgId(o.id)) throw BAD;
+    switch (type) {
+      case "media.status": {
+        const out: any = { show: bool(o.show), share: bool(o.share) };
+        if (o.access !== undefined && o.access !== null) {
+          if (o.access !== "granted" && o.access !== "missing") throw BAD;
+          out.access = o.access;
+        }
+        return out;
+      }
+      case "media.clear":
+        return {};
+      case "media.volume":
+        return { level: int(o.level, "level", 0, L.level), muted: bool(o.muted) };
+      case "media.state": {
+        const out: any = { sid: hex32(o.sid) };
+        if (typeof o.app !== "string") throw BAD;
+        const app = cleanLinkText(o.app, L.app);
+        if (app === null) throw BAD;
+        out.app = app;
+        if (typeof o.state !== "string" || !MEDIA_STATES.includes(o.state)) throw BAD;
+        out.state = o.state;
+        for (const [k, max] of [["title", L.title], ["artist", L.artist], ["album", L.album]] as const) {
+          const v = optStr(o[k], max);
+          if (v !== undefined) out[k] = v;
+        }
+        const duration = optInt(o.durationMs, "durationMs", 1, L.durationMs);
+        if (duration !== undefined) out.durationMs = duration;
+        let position = optInt(o.positionMs, "positionMs", 0, L.positionMs);
+        if (position !== undefined) out.positionMs = duration !== undefined ? Math.min(position, duration) : position;
+        const rate = o.rateMilli === undefined || o.rateMilli === null ? undefined : int(o.rateMilli, "rateMilli", 0, Number.MAX_SAFE_INTEGER);
+        out.rateMilli = rate === undefined ? 1000 : Math.min(rate, L.rateMilli);
+        // actions: only the first 8 entries are looked at, each a string; unknown ones are ignored; the result is in the canonical order; seek needs a duration
+        let actions: string[] = [];
+        if (o.actions !== undefined && o.actions !== null) {
+          if (!Array.isArray(o.actions)) throw BAD;
+          const first = o.actions.slice(0, L.actions);
+          if (!first.every((a: any) => typeof a === "string")) throw BAD;
+          actions = MEDIA_ACTIONS.filter((a) => first.includes(a));
+        }
+        if (duration === undefined) actions = actions.filter((a) => a !== "seek");
+        out.actions = actions;
+        if (o.artHash !== undefined && o.artHash !== null) out.artHash = hex32(o.artHash);
+        if (o.iconHash !== undefined && o.iconHash !== null) out.iconHash = hex32(o.iconHash);
+        if (o.volume !== undefined && o.volume !== null) {
+          if (!isObj(o.volume)) throw BAD;
+          out.volume = { level: int(o.volume.level, "level", 0, L.level), muted: bool(o.volume.muted) };
+        }
+        return out;
+      }
+      case "media.image": {
+        const hash = hex32(o.hash);
+        if (o.kind !== "art" && o.kind !== "icon") throw BAD;
+        if (typeof o.data !== "string") throw BAD;
+        // data that is not base64url, over 24,576 bytes, not a PNG or JPEG, the wrong size, or with a hash that doesn't match: dropped silently
+        if (!/^[A-Za-z0-9_-]*$/.test(o.data) || o.data.length % 4 === 1 || o.data.length > Math.ceil((L.imageBytes * 4) / 3) + 4) return "drop";
+        const bytes = new Uint8Array(Buffer.from(o.data, "base64url"));
+        if (hex(sha256(bytes)).slice(0, 32) !== hash || mediaImageProblem(bytes, o.kind) !== null) return "drop";
+        return { hash, kind: o.kind, bytes: bytes.length };
+      }
+      case "media.cmd": {
+        if (typeof o.cmd !== "string" || !MEDIA_CMDS.includes(o.cmd)) throw BAD;
+        const out: any = { cmd: o.cmd };
+        const hasSid = o.sid !== undefined && o.sid !== null;
+        if (hasSid) out.sid = hex32(o.sid);
+        else if (o.cmd !== "volume") throw BAD;
+        const present = (k: string) => o[k] !== undefined && o[k] !== null;
+        if (o.cmd === "seek") {
+          if (!present("seekMs")) throw BAD;
+          out.seekMs = int(o.seekMs, "seekMs", 0, L.seekMs);
+        } else if (present("seekMs")) throw BAD;
+        if (o.cmd === "volume") {
+          const given = ["level", "delta", "mute"].filter(present);
+          if (given.length !== 1) throw BAD;
+          if (given[0] === "level") out.level = int(o.level, "level", 0, L.level);
+          if (given[0] === "delta") {
+            out.delta = int(o.delta, "delta", -L.delta, L.delta);
+            if (out.delta === 0) throw BAD;
+          }
+          if (given[0] === "mute") out.mute = bool(o.mute);
+        } else if (present("level") || present("delta") || present("mute")) throw BAD;
+        return out;
+      }
+    }
+  } catch (e) {
+    if (e === BAD) return "bad";
+    throw e;
+  }
+  return "bad";
+}
+
+// ---- media: position (3.4), the active session (3.5), the maps (3.3, 5.2, 4.2), volume steps and the limiters
+// what the viewer shows `elapsedMs` after it received a state: position, and the state it shows (a playing state past the end by more than 5 s is shown paused at the end; rate 0 is paused)
+function mediaShown(c: { state: string; positionMs?: number; rateMilli?: number; durationMs?: number; elapsedMs: number }): { positionMs: number | null; state: string } {
+  const rate = Math.min(c.rateMilli ?? 1000, MEDIA_LIMITS.rateMilli);
+  if (c.positionMs === undefined) return { positionMs: null, state: c.state === "playing" && rate === 0 ? "paused" : c.state };
+  const cap = (p: number) => (c.durationMs !== undefined ? Math.min(c.durationMs, p) : p);
+  if (c.state !== "playing") return { positionMs: cap(c.positionMs), state: c.state };
+  if (rate === 0) return { positionMs: cap(c.positionMs), state: "paused" };
+  const raw = c.positionMs + Math.floor((c.elapsedMs * rate) / 1000);
+  if (c.durationMs !== undefined && raw > c.durationMs + MEDIA_LIMITS.endGraceMs) return { positionMs: c.durationMs, state: "paused" };
+  return { positionMs: cap(raw), state: "playing" };
+}
+// the source's own position for "now": Android (PlaybackState position and lastPositionUpdateTime, both elapsedRealtime ms; speed as a number) and Windows (timeline Position and LastUpdatedTime in 100 ns ticks)
+function mediaSourcePosition(c: any): number | null {
+  const clamp = (p: number) => Math.max(0, c.durationMs !== undefined && c.durationMs !== null ? Math.min(c.durationMs, p) : p);
+  if (c.platform === "android") {
+    if (c.positionMs < 0) return null;
+    const speedMilli = Math.round(c.speed * 1000);
+    const extra = c.state === "playing" ? Math.floor(((c.nowMs - c.updateTimeMs) * speedMilli) / 1000) : 0;
+    return clamp(c.positionMs + Math.max(0, extra));
+  }
+  // ticks are decimal strings in the vectors: a FILETIME today is over 2^53
+  const rate = BigInt(c.rateMilli ?? 1000);
+  const base = BigInt(c.positionTicks) / 10000n;
+  const last = BigInt(c.lastUpdatedTicks);
+  const diff = BigInt(c.nowTicks) - last;
+  const extra = c.state === "playing" && last > 0n && diff > 0n ? (diff * rate) / 10000000n : 0n;
+  return clamp(Number(base + extra));
+}
+// 3.5: the session to show, or null (= clear). sessions are in the platform's priority order.
+function mediaPick(sessions: { sid: string; own?: boolean; title: boolean; state: string; pausedMs?: number }[], current: string | null): string | null {
+  const candidates = sessions.filter((s) => !s.own && s.title && ["playing", "paused", "buffering"].includes(s.state) && !(s.state === "paused" && (s.pausedMs ?? 0) >= MEDIA_LIMITS.pausedExpiryMs));
+  const cur = candidates.find((s) => s.sid === current);
+  if (cur && cur.state === "playing") return cur.sid;
+  const playing = candidates.find((s) => s.state === "playing");
+  if (playing) return playing.sid;
+  if (cur) return cur.sid;
+  return candidates[0]?.sid ?? null;
+}
+// the 1.5 s debounce of a clear: events in time order, present = a candidate exists after the event; returns the times at which a clear goes out
+function mediaClearTimes(events: { t: number; present: boolean }[]): number[] {
+  const out: number[] = [];
+  let pending: number | null = null;
+  let shown = true; // a session is on the viewer when the run starts
+  for (const e of events) {
+    if (pending !== null && e.t - pending >= MEDIA_LIMITS.clearDebounceMs) {
+      out.push(pending + MEDIA_LIMITS.clearDebounceMs);
+      pending = null;
+      shown = false;
+    }
+    if (e.present) {
+      pending = null;
+      shown = true;
+    } else if (shown && pending === null) pending = e.t;
+  }
+  return out;
+}
+// throttle with a trailing edge: the first event goes at once if the last send was 250 ms ago or more, else the latest value is held and goes at last + 250; a value equal to the last sent one is not sent
+function mediaThrottle(events: { t: number; value: string }[]): { t: number; value: string }[] {
+  const out: { t: number; value: string }[] = [];
+  let lastT = -Infinity;
+  let lastValue: string | null = null;
+  let pending: string | null = null;
+  const flushUntil = (t: number) => {
+    if (pending !== null && lastT + MEDIA_LIMITS.throttleMs <= t) {
+      const at = lastT + MEDIA_LIMITS.throttleMs;
+      out.push({ t: at, value: pending });
+      lastT = at;
+      lastValue = pending;
+      pending = null;
+    }
+  };
+  for (const e of events) {
+    flushUntil(e.t);
+    if (e.value === lastValue) {
+      pending = null;
+      continue;
+    }
+    if (e.t - lastT >= MEDIA_LIMITS.throttleMs) {
+      out.push({ t: e.t, value: e.value });
+      lastT = e.t;
+      lastValue = e.value;
+      pending = null;
+    } else pending = e.value;
+  }
+  flushUntil(Infinity);
+  return out;
+}
+// the limiters of 3.6: outcomes per event, and the times an error answer goes out
+function mediaLimiter(name: string, events: { t: number }[]): { outcomes: string[]; errorsAt: number[] } {
+  const p = MEDIA_LIMITERS[name];
+  const outcomes: string[] = [];
+  const errorsAt: number[] = [];
+  let lastError: number | null = null;
+  const times: number[] = [];
+  let tokens = p.type === "bucket" ? p.capacity * 1000 : 0;
+  let last = 0;
+  for (const e of events) {
+    let ok: boolean;
+    if (p.type === "bucket") {
+      tokens = Math.min(p.capacity * 1000, tokens + (e.t - last) * p.perSecond);
+      last = e.t;
+      ok = tokens >= 1000;
+      if (ok) tokens -= 1000;
+    } else {
+      while (times.length > 0 && e.t - times[0] >= p.windowMs) times.shift();
+      ok = times.length < p.max;
+      if (ok) times.push(e.t);
+    }
+    outcomes.push(ok ? "accepted" : "dropped");
+    if (!ok && p.errorSpacingMs !== undefined && (lastError === null || e.t - lastError >= p.errorSpacingMs)) {
+      errorsAt.push(e.t);
+      lastError = e.t;
+    }
+  }
+  return { outcomes, errorsAt };
+}
+const ANDROID_ACTION_BITS: Record<string, number> = { play: 4, pause: 2, toggle: 512, next: 32, prev: 16, seek: 256 };
+const ANDROID_STATE: Record<number, string | null> = { 0: null, 1: null, 2: "paused", 3: "playing", 4: "playing", 5: "playing", 6: "buffering", 7: null, 8: "buffering", 9: "buffering", 10: "buffering", 11: "buffering" };
+const ANDROID_STATE_OUT: Record<string, number> = { playing: 3, paused: 2, buffering: 6, stopped: 1 };
+// PlaybackState (state int, actions mask, speed) -> the wire; `hasDuration`: seek is only offered with a duration
+function androidToWire(c: { state: number; actions: number; speed: number; hasDuration: boolean }) {
+  const state = ANDROID_STATE[c.state] ?? null;
+  const actions = MEDIA_ACTIONS.filter((a) => (c.actions & ANDROID_ACTION_BITS[a]) !== 0 && (a !== "seek" || c.hasDuration));
+  return { candidate: state !== null, ...(state !== null ? { state } : {}), actions, rateMilli: Math.min(Math.max(Math.round(c.speed * 1000), 0), MEDIA_LIMITS.rateMilli) };
+}
+const wireToAndroid = (c: { state: string; actions: string[] }) => ({ state: ANDROID_STATE_OUT[c.state], actions: c.actions.reduce((m, a) => m | (ANDROID_ACTION_BITS[a] ?? 0), 0) });
+// GSMTC PlaybackStatus (Closed 0, Opened 1, Changing 2, Stopped 3, Playing 4, Paused 5) and Controls -> the wire
+function windowsToWire(c: { status: number; controls: Record<string, boolean>; durationMs: number }) {
+  const state = ({ 2: "buffering", 4: "playing", 5: "paused" } as Record<number, string>)[c.status] ?? null;
+  const flags: Record<string, boolean> = { play: c.controls.play, pause: c.controls.pause, toggle: c.controls.toggle, next: c.controls.next, prev: c.controls.prev, seek: c.controls.position && c.durationMs > 0 };
+  return { candidate: state !== null, ...(state !== null ? { state } : {}), actions: MEDIA_ACTIONS.filter((a) => flags[a] === true) };
+}
+// the wire -> SystemMediaTransportControls; a test run never shows Playing
+function wireToSmtc(c: { state: string; actions: string[]; testMode: boolean }) {
+  const status = c.state === "playing" ? (c.testMode ? "Paused" : "Playing") : c.state === "buffering" ? "Changing" : c.state === "paused" ? "Paused" : "Stopped";
+  const has = (a: string) => c.actions.includes(a);
+  return { status, playEnabled: has("play") || has("toggle"), pauseEnabled: has("pause") || has("toggle"), nextEnabled: has("next"), prevEnabled: has("prev") };
+}
+// native volume: Windows works on the scalar (0 to 1) of an endpoint with n steps, Android on an index 0..max
+const volumeLevelOf = (c: any) => (c.platform === "windows" ? Math.round(c.scalar * 100) : Math.round((c.index * 100) / c.max));
+function volumeSet(c: any): { level?: number; index?: number; muted?: boolean } {
+  const op = c.op;
+  if (op.mute !== undefined) return { muted: op.mute };
+  if (c.platform === "windows") {
+    const n = c.steps - 1;
+    if (op.level !== undefined) return { level: op.level };
+    const step = Math.round((c.level * n) / 100);
+    const move = Math.max(1, Math.round((Math.abs(op.delta) * n) / 100));
+    const next = Math.min(n, Math.max(0, step + Math.sign(op.delta) * move));
+    return { level: Math.round((next * 100) / n) };
+  }
+  // Android: never index 0 by level or delta (mute is its own command)
+  const n = c.max;
+  const target = op.level !== undefined ? Math.round((op.level * n) / 100) : c.index + Math.sign(op.delta) * Math.max(1, Math.round((Math.abs(op.delta) * n) / 100));
+  return { index: Math.min(n, Math.max(1, target)) };
+}
+// 3.1: may a source send media.state/image/clear/volume, or a viewer send media.cmd? `hellos`: the capability lists of the peer's accepted hellos, `status`: the peer's latest media.status
+function mediaMaySend(c: { kind: string; ownShare: boolean; hellos: string[][]; status: { show?: boolean; share?: boolean } | null; shareJustTurnedOff?: boolean }): boolean {
+  const listed = c.hellos.length > 0 && c.hellos[c.hellos.length - 1].includes("media");
+  if (!listed) return false;
+  if (c.kind === "cmd") return c.status?.share === true;
+  if (c.kind === "status") return true;
+  if (c.kind === "clear" && c.shareJustTurnedOff) return c.status?.show === true;
+  return c.ownShare && c.status?.show === true;
+}
+// what a source answers to a media.cmd (3.6), in this order
+function mediaCmdResult(c: { ownShare: boolean; rateOk: boolean; active: { sid: string; actions: string[] } | null; cmd: { sid?: string; cmd: string }; systemOk: boolean }): string {
+  if (!c.ownShare) return "disabled";
+  if (!c.rateOk) return "rate_limited";
+  if (c.cmd.cmd !== "volume") {
+    if (!c.active) return "not_found";
+    const needs: Record<string, string[]> = { play: ["play", "toggle"], pause: ["pause", "toggle"], toggle: ["toggle", "play", "pause"], next: ["next"], prev: ["prev"], seek: ["seek"] };
+    if (c.cmd.sid !== c.active.sid || !needs[c.cmd.cmd].some((a) => c.active!.actions.includes(a))) return "stale";
+  }
+  return c.systemOk ? "ok" : "action_failed";
+}
+
 // ---- rate limiters (integers only: millitokens, so there is no rounding to argue about)
 function pcLimiter(events: { t: number; nid: string; content: string }[]) {
   const CAP = 20000, COST = 1000; // 1 token per 1000 ms = 1 millitoken per ms
@@ -975,15 +1326,25 @@ class Receiver {
     const badInts = new Set<string>();
     for (const f of INT_FIELDS) {
       for (const m of text.matchAll(new RegExp(`"${f}"\\s*:\\s*(-?[0-9][0-9.eE+\\-]*)`, "g"))) {
-        if (!/^(0|[1-9][0-9]*)$/.test(m[1])) badInts.add(f);
+        if (!(SIGNED_INT_FIELDS.has(f) ? /^-?(0|[1-9][0-9]*)$/ : /^(0|[1-9][0-9]*)$/).test(m[1])) badInts.add(f);
       }
     }
     // step 6: for hello, protocol is checked before every other field
     if (type === "hello" && !badInts.has("protocol") && typeof o.protocol === "number" && Number.isSafeInteger(o.protocol) && o.protocol >= 0 && o.protocol !== 1)
       return bad(ref, "unsupported_version", 4002);
     const isNotif = type.startsWith("notif.");
+    const isMedia = type.startsWith("media.");
     // step 7
-    if (!isNotif && !validateFields(type, o, badInts)) return bad(ref);
+    if (!isNotif && !isMedia && !validateFields(type, o, badInts)) return bad(ref);
+    // step 6c (changelog 57): a media.* message is dropped silently unless this side's own latest hello and the sender's latest hello list "media"; then the 32 KiB
+    // frame rule (48 KiB for a media.image); then the fields. None is acked, de-duplicated or stored.
+    if (isMedia) {
+      if (!(this.ownCaps.has("media") && this.peerCaps.has("media"))) return { reply: "none", action: "media_dropped", close: null };
+      if (fb.bytes.length > (type === "media.image" ? MAX_MEDIA_IMAGE_FRAME : MAX_MEDIA_FRAME)) return bad(ref, "too_large");
+      const r = mediaOf(type, o, badInts);
+      if (r === "bad") return bad(ref);
+      return r === "drop" ? { reply: "none", action: "media_dropped", close: null } : { reply: "none", action: ACTION[type], close: null, media: r };
+    }
     // a valid offer with more than 800 files is rejected (an error, no ack, nothing remembered)
     if (type === "offer" && o.files.length > MAX_OFFER_FILES) return bad(ref, "too_large");
     // step 6b (changelog 56): a notif.* message is dropped silently unless this side's own latest hello and the sender's latest hello list "notif".
@@ -1067,6 +1428,8 @@ function sameOutcome(actual: Outcome, expect: any): boolean {
   if (actual.action === "deliver_link" && expect.link !== undefined && !eq(actual.link, expect.link)) return false;
   // a notif.* case says what the receiver got after cleaning (expect.notif)
   if (expect.notif !== undefined && !eq(actual.notif, expect.notif)) return false;
+  // a media.* case says what the receiver got after cleaning (expect.media)
+  if (expect.media !== undefined && !eq(actual.media, expect.media)) return false;
   return true;
 }
 
@@ -2195,6 +2558,140 @@ function pickActionsModel(actions: any[], clean: (s: string | null | undefined, 
   const d = load("notif.json");
   for (const k of ["nid", "iconHash", "icon", "clean", "post", "code", "toastIds", "toastArguments", "rate", "coalesce", "sendNotif", "syncDiff", "toastLabel", "otpDetect", "skip", "pickActions"]) check(g, `notif.json ${k}[] exists`, Array.isArray(d[k]) && d[k].length > 0);
   console.log(`milestone 2B.2 scope: ${inScope} notif cases in messages.json, plus notif.json`);
+}
+
+// ---- media.json (changelog 57)
+{
+  const g = "media";
+  const d = load("media.json");
+  for (const k of ["sid", "clean", "image", "position", "sourcePosition", "pick", "clearDebounce", "throttle", "rate", "androidMap", "toAndroid", "windowsMap", "toSmtc", "volumeLevel", "volumeSet", "sendRule", "viewerRule", "cmdResult"]) uniqueNames(g + "." + k, d[k]);
+  check(g, "limits", eq(d.limits, MEDIA_LIMITS), () => j(d.limits));
+  check(g, "limiters", eq(d.limiters, MEDIA_LIMITERS), () => j(d.limiters));
+  for (const c of d.sid) check(g, `sid ${c.name}`, sidOf(c.identity) === c.sid && HEX32.test(c.sid), () => sidOf(c.identity));
+  check(g, "sid has a package name, an exe name, a packaged app and a non-ASCII identity", d.sid.some((c: any) => c.identity.includes(".") && !c.identity.endsWith(".exe")) && d.sid.some((c: any) => c.identity.endsWith(".exe")) && d.sid.some((c: any) => c.identity.includes("!")) && d.sid.some((c: any) => /[^\x00-\x7f]/.test(c.identity)));
+  const parts = (list: (string | [string, number])[]) => list.map((p) => (typeof p === "string" ? p : p[0].repeat(p[1]))).join("");
+  for (const c of d.clean) {
+    const max = (MEDIA_LIMITS as any)[c.field];
+    check(g, `clean ${c.name}: a known field`, ["app", "title", "artist", "album"].includes(c.field) && max !== undefined);
+    const input: string = c.inputParts !== undefined ? parts(c.inputParts) : c.input;
+    const expected: string | null = c.expectedParts !== undefined ? parts(c.expectedParts) : c.expected;
+    const got = cleanLinkText(input, max);
+    check(g, `clean ${c.name}`, got === expected, () => `expected ${j(expected)}, model says ${j(got)}`);
+    if (got !== null) check(g, `clean ${c.name}: stable and within the limit`, cleanLinkText(got, max) === got && cps(got).length <= max);
+  }
+  // image[]: a media.image frame through the receiver
+  for (const c of d.image) {
+    const bytes = new Uint8Array(readFileSync(join(dir, c.dataFile)));
+    const frame: any = { type: "media.image", id: "image-case", hash: c.hash ?? hex(sha256(bytes)).slice(0, 32), kind: c.kind, data: base64url(bytes) };
+    const out = new Receiver("pc", "open", { own: ["media"], peer: ["media"] }).receive("phone", { frame });
+    const got = out.reply === "error" ? (out.code === "bad_request" ? "bad_request" : out.code) : out.action === "media_image" ? "accepted" : out.action === "media_dropped" ? "dropped" : "?";
+    check(g, `image ${c.name}`, got === c.expect && out.reply !== "ack", () => `expected ${c.expect}, model says ${got}`);
+    if (got === "accepted") check(g, `image ${c.name}: the frame is within 48 KiB`, frameBytes({ frame }).bytes.length <= MAX_MEDIA_IMAGE_FRAME);
+  }
+  check(g, "image fixtures: 24,576 and 24,577 bytes", readFileSync(join(dir, "fixtures/media-art-24576.png")).length === 24576 && readFileSync(join(dir, "fixtures/media-art-24577.png")).length === 24577);
+  check(g, "image has accepted, dropped and bad_request cases", ["accepted", "dropped", "bad_request"].every((e) => d.image.some((c: any) => c.expect === e)));
+  for (const c of d.position) {
+    const got = mediaShown(c);
+    check(g, `position ${c.name}`, eq(got, c.expect), () => `model says ${j(got)}`);
+  }
+  for (const c of d.sourcePosition) {
+    const got = mediaSourcePosition(c);
+    check(g, `sourcePosition ${c.name}`, got === c.expect, () => `model says ${j(got)}`);
+    check(g, `sourcePosition ${c.name}: a known platform`, c.platform === "android" || c.platform === "windows");
+  }
+  for (const c of d.pick) {
+    const got = mediaPick(c.sessions, c.current);
+    check(g, `pick ${c.name}`, got === c.expect, () => `model says ${j(got)}`);
+    // a session of Kin's own, one without a title and one that is stopped is never the answer
+    const chosen = c.sessions.find((s: any) => s.sid === got);
+    check(g, `pick ${c.name}: the answer is a candidate`, got === null || (chosen && !chosen.own && chosen.title && chosen.state !== "stopped"));
+  }
+  for (const c of d.clearDebounce) {
+    const got = mediaClearTimes(c.events);
+    check(g, `clearDebounce ${c.name}`, eq(got, c.expect), () => `model says ${j(got)}`);
+    check(g, `clearDebounce ${c.name}: events are in time order`, c.events.every((e: any, k: number) => k === 0 || c.events[k - 1].t <= e.t));
+  }
+  for (const c of d.throttle) {
+    const got = mediaThrottle(c.events);
+    check(g, `throttle ${c.name}`, eq(got, c.expect), () => `model says ${j(got)}`);
+    // never two sends less than 250 ms apart, and never the same value twice in a row
+    check(g, `throttle ${c.name}: at least 250 ms apart and never a repeat`, got.every((x, k) => k === 0 || (x.t - got[k - 1].t >= MEDIA_LIMITS.throttleMs && x.value !== got[k - 1].value)));
+  }
+  // runs of [outcome, count]: adjacent equal outcomes are one run
+  const runs = (outcomes: string[]) => {
+    const out: [string, number][] = [];
+    for (const o of outcomes) {
+      if (out.length > 0 && out[out.length - 1][0] === o) out[out.length - 1][1]++;
+      else out.push([o, 1]);
+    }
+    return out;
+  };
+  for (const c of d.rate) {
+    check(g, `rate ${c.name}: a known limiter`, MEDIA_LIMITERS[c.limiter] !== undefined);
+    const events = c.events.flatMap(([t, n]: [number, number]) => Array.from({ length: n }, () => ({ t })));
+    check(g, `rate ${c.name}: events are in time order`, events.every((e: any, k: number) => k === 0 || events[k - 1].t <= e.t));
+    const r = mediaLimiter(c.limiter, events);
+    check(g, `rate ${c.name}`, eq(runs(r.outcomes), c.expect) && eq(r.errorsAt, c.errorsAt), () => `runs ${j(runs(r.outcomes))}, errors ${j(r.errorsAt)}`);
+    check(g, `rate ${c.name}: the runs are canonical (no empty run, no two equal neighbours)`, c.expect.every(([o, n]: [string, number], k: number) => n > 0 && (k === 0 || c.expect[k - 1][0] !== o)));
+  }
+  for (const c of d.androidMap) {
+    const got = androidToWire(c);
+    check(g, `androidMap ${c.name}`, eq(got, c.expect), () => `model says ${j(got)}`);
+  }
+  for (const c of d.toAndroid) check(g, `toAndroid ${c.name}`, eq(wireToAndroid(c), c.expect), () => j(wireToAndroid(c)));
+  for (const c of d.windowsMap) check(g, `windowsMap ${c.name}`, eq(windowsToWire(c), c.expect), () => j(windowsToWire(c)));
+  for (const c of d.toSmtc) check(g, `toSmtc ${c.name}`, eq(wireToSmtc(c), c.expect), () => j(wireToSmtc(c)));
+  check(g, "toSmtc: no testMode case ever says Playing", d.toSmtc.filter((c: any) => c.testMode).every((c: any) => c.expect.status !== "Playing"));
+  for (const c of d.volumeLevel) check(g, `volumeLevel ${c.name}`, volumeLevelOf(c) === c.level, () => String(volumeLevelOf(c)));
+  for (const c of d.volumeSet) check(g, `volumeSet ${c.name}`, eq(volumeSet(c), c.expect), () => j(volumeSet(c)));
+  // a delta always moves at least one native step in its direction, unless it is already at the end
+  for (const c of d.volumeSet.filter((c: any) => c.op.delta !== undefined && c.platform === "android")) {
+    const idx = volumeSet(c).index as number;
+    const atEnd = (c.op.delta > 0 && c.index === c.max) || (c.op.delta < 0 && c.index === 1);
+    check(g, `volumeSet ${c.name}: moves at least one step`, atEnd ? idx === c.index : Math.sign(idx - c.index) === Math.sign(c.op.delta));
+  }
+  for (const c of d.sendRule) check(g, `sendRule ${c.name}`, (mediaMaySend(c) ? "send" : "nothing") === c.expected);
+  for (const c of d.viewerRule) {
+    const got = ["state", "image", "clear", "volume"].includes(c.kind) && !c.ownShow ? "drop" : "accept";
+    check(g, `viewerRule ${c.name}`, got === c.expected);
+  }
+  for (const c of d.cmdResult) check(g, `cmdResult ${c.name}`, mediaCmdResult(c) === c.expected, () => mediaCmdResult(c));
+}
+
+{
+  const g = "scope-2b.3";
+  const messages = load("messages.json");
+  const matches = (name: string, p: string) => (p.endsWith("*") ? name.startsWith(p.slice(0, -1)) : name === p);
+  const SEQ = ["media-is-not-in-the-dedup-memory", "media-status-change-needs-no-new-hello", "media-capability-changes-with-a-new-hello", "media-cmd-is-not-resent-after-reconnect", "media-image-before-state", "media-invalid-state-keeps-the-connection-open"];
+  const SCOPE: [string, any[], string[], number][] = [
+    ["messages.valid", messages.valid, ["media-*"], 35],
+    ["messages.invalid", messages.invalid, ["media-*"], 50],
+    ["messages.sequences", messages.sequences, SEQ, 6],
+  ];
+  let inScope = 0;
+  for (const [label, cases, patterns, atLeast] of SCOPE) {
+    for (const p of patterns) check(g, `${label}: "${p}" matches a case`, cases.some((c) => matches(c.name, p)));
+    const hits = cases.filter((c) => patterns.some((p) => matches(c.name, p)));
+    inScope += hits.length;
+    check(g, `${label}: at least ${atLeast} cases in scope`, hits.length >= atLeast, () => String(hits.length));
+  }
+  // every media type has a valid example; none is ever acked; a dropped message never has a reply; every case lists the capabilities of both sides
+  for (const t of Object.keys(DIRECTION).filter((t) => t.startsWith("media."))) {
+    const ex = messages.valid.filter((c: any) => c.frame?.type === t && c.expect.action !== "media_dropped");
+    check(g, `${t}: has a valid example`, ex.length > 0);
+    check(g, `${t}: is never acked`, ex.every((c: any) => c.expect.reply === "none"));
+    check(g, `${t}: has a bad_request example`, messages.invalid.some((c: any) => c.name.startsWith("media-") && (c.frame?.type === t || c.raw?.includes(`"${t}"`)) && c.expect.code === "bad_request"));
+  }
+  check(g, "every media dropped case replies with nothing", messages.valid.filter((c: any) => c.expect.action === "media_dropped").every((c: any) => c.expect.reply === "none" && c.expect.close === null));
+  check(g, "every media case lists the capabilities of both sides", [...messages.valid, ...messages.invalid].filter((c: any) => c.name.startsWith("media-")).every((c: any) => Array.isArray(c.own) && Array.isArray(c.peer)));
+  check(g, "too_large cases for state, image and a small type", ["media-state-over-32-KiB-is-too-large", "media-image-over-48-KiB-is-too-large", "media-status-padding-over-32-KiB-is-too-large"].every((n) => messages.invalid.some((c: any) => c.name === n && c.expect.code === "too_large")));
+  // the policy names of design 3.12 are pinned in media.json
+  const d = load("media.json");
+  for (const n of ["media-not-sent-before-peer-status"]) check(g, `sendRule ${n}`, d.sendRule.some((c: any) => c.name === n));
+  check(g, "viewerRule media-dropped-when-viewer-off-is-silent", d.viewerRule.some((c: any) => c.name.startsWith("media-dropped-when-viewer-off-is-silent")));
+  for (const n of ["media-cmd-to-non-sharing-source-is-disabled", "media-cmd-stale-sid-is-stale"]) check(g, `cmdResult ${n}`, d.cmdResult.some((c: any) => c.name === n));
+  for (const k of ["sid", "clean", "image", "position", "sourcePosition", "pick", "clearDebounce", "throttle", "rate", "androidMap", "toAndroid", "windowsMap", "toSmtc", "volumeLevel", "volumeSet", "sendRule", "viewerRule", "cmdResult"]) check(g, `media.json ${k}[] exists`, Array.isArray(d[k]) && d[k].length > 0);
+  console.log(`milestone 2B.3 scope: ${inScope} media cases in messages.json, plus media.json`);
 }
 
 // ---- fixtures/: DER certificates for the negative tls[] cases (made by fixtures/make-fixtures.ts)
