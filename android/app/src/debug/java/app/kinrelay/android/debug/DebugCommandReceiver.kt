@@ -130,6 +130,56 @@ class DebugCommandReceiver : BroadcastReceiver() {
                             graph.log.i("debug", "CMD SEND_LINK result=$result")
                         }
                     }
+                    // 2B.2 notification mirroring. `--es pkg <p>[,<p>] [--ez on false]`: the allow list (also `com.android.shell`, the package of
+                    // `adb shell cmd notification post`).
+                    "MIRROR_ALLOW" -> {
+                        val packages = intent.getStringExtra("pkg")?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() }.orEmpty().toSet()
+                        val current = graph.mirror.store.current().allowed
+                        graph.mirror.store.setAllowed(if (intent.getBooleanExtra("on", true)) current + packages else current - packages)
+                        graph.log.i("debug", "CMD MIRROR_ALLOW allowed=${graph.mirror.store.current().allowed.sorted()}")
+                    }
+                    "MIRROR_HIDDEN" -> {
+                        val packages = intent.getStringExtra("pkg")?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() }.orEmpty().toSet()
+                        val current = graph.mirror.store.current().hiddenAllowed
+                        graph.mirror.store.setHiddenAllowed(if (intent.getBooleanExtra("on", true)) current + packages else current - packages)
+                        graph.log.i("debug", "CMD MIRROR_HIDDEN hiddenAllowed=${graph.mirror.store.current().hiddenAllowed.sorted()}")
+                    }
+                    "MIRROR_ENABLE" -> {
+                        graph.mirror.store.setEnabled(intent.getBooleanExtra("on", true))
+                        graph.log.i("debug", "CMD MIRROR_ENABLE enabled=${graph.mirror.store.current().enabled}")
+                    }
+                    "MIRROR_DISMISS_PREF" -> {
+                        graph.mirror.store.setDismissOnPhone(intent.getBooleanExtra("on", true))
+                        graph.log.i("debug", "CMD MIRROR_DISMISS_PREF dismissOnPhone=${graph.mirror.store.current().dismissOnPhone}")
+                    }
+                    // `--es kind a|b|c|d|e|f|g [--es tag <t>]`: the debug test notifications (design 4.14), posted from Kin on the channel kin_debug_mirror.
+                    "MIRROR_POST" -> {
+                        val kind = intent.getStringExtra("kind")?.firstOrNull() ?: 'a'
+                        graph.log.i("debug", "CMD MIRROR_POST kind=$kind posted=${MirrorTestPoster.post(context, kind, intent.getStringExtra("tag") ?: "t")}")
+                    }
+                    // `--es tag <t> --ei id <n>`: cancel one of Kin's own test notifications, as an app removing its notification would.
+                    "MIRROR_CANCEL" -> {
+                        context.getSystemService(android.app.NotificationManager::class.java).cancel(intent.getStringExtra("tag") ?: "t", intent.getIntExtra("id", 1))
+                        graph.log.i("debug", "CMD MIRROR_CANCEL done")
+                    }
+                    // Clears the shade (the listener's `cancelAllNotifications`): `adb shell cmd notification post` is limited to 50 notifications per package.
+                    "MIRROR_CLEAR_ALL" -> {
+                        app.kinrelay.android.notifmirror.MirrorListenerService.cancelAll()
+                        graph.log.i("debug", "CMD MIRROR_CLEAR_ALL done")
+                    }
+                    // Counts and settings, never content.
+                    "MIRROR_STATE" -> {
+                        val policy = graph.mirror.store.current()
+                        val stats = graph.mirror.sender.stats
+                        graph.log.i(
+                            "debug",
+                            "CMD MIRROR_STATE enabled=${policy.enabled} apps=${policy.allowed.size} hiddenAllowed=${policy.hiddenAllowed.size} dismissOnPhone=${policy.dismissOnPhone} " +
+                                "access=${graph.mirror.accessGranted()} listener=${graph.mirror.listenerConnected} pcAcceptsNotif=${graph.mirror.pcAcceptsNotif.value} " +
+                                "online=${graph.mirror.sender.isOnline()} sent=${stats.sent.get()} removed=${stats.removed.get()} identical=${stats.identical.get()} " +
+                                "actions=${stats.actions.get()} dismissed=${stats.dismissed.get()} dropped={${listOf("not_allowed", "own", "other_profile", "ongoing", "summary", "local_only", "media", "category", "importance", "secret", "empty", "offline", "rate").joinToString(",") { "$it:${stats.dropped(it)}" }}} " +
+                                "announced=${graph.mirror.sender.announcedCount()} lastAction=${graph.mirror.lastActionResult} replies=${MirrorTestLog.replies} lastReplySha=${MirrorTestLog.lastReplySha} marksRead=${MirrorTestLog.marksRead} sdk=${android.os.Build.VERSION.SDK_INT}",
+                        )
+                    }
                     "SET_CLIPBOARD" -> {
                         val text = intent.getStringExtra("textfile")?.let { java.io.File(DebugFiles.dir(context), DebugFiles.fileName(it)).readText() } ?: intent.getStringExtra("text")
                         if (text == null) {

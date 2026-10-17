@@ -50,6 +50,8 @@ fun HomeScreen(
     onOpenItem: (app.kinrelay.android.history.HistoryItem) -> Unit = {},
     onRetryItem: (app.kinrelay.android.history.HistoryItem) -> Unit = {},
     onCancelItem: (app.kinrelay.android.history.HistoryItem) -> Unit = {},
+    /** The "Mirroring notifications" row (2B.2): empty while mirroring is off. */
+    mirrorCard: @Composable () -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
     var pinging by remember { mutableStateOf(false) }
@@ -80,6 +82,7 @@ fun HomeScreen(
                 Text("This phone: ${phoneShortId?.let(DeviceIds::display) ?: "…"}", style = MaterialTheme.typography.bodySmall)
             }
         }
+        mirrorCard()
         if (identityProblem != null) IdentityProblemCard(identityProblem)
         if (!localNetworkAllowed) LocalNetworkCard(onAllowLocalNetwork)
         Button(

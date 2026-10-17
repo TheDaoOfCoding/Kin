@@ -28,6 +28,10 @@ object DebugHooks {
      */
     fun refuseNewNames(context: android.content.Context): Boolean = java.io.File(context.filesDir, "debug-refuse-names").exists()
 
+    /** The debug-only "Mirror test" section of the Debug screen (design 4.14): buttons that post test notifications from Kin itself. */
+    @androidx.compose.runtime.Composable
+    fun MirrorTest(graph: AppGraph, context: android.content.Context) = app.kinrelay.android.debug.MirrorTestSection(graph, context)
+
     /**
      * The phone maker the setup screen picks its guide for. With the file `files/debug-oem` present, its first line is used instead of
      * `Build.MANUFACTURER`, so the emulator can show the Xiaomi, Samsung ... steps

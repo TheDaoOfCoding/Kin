@@ -24,6 +24,16 @@ object LinkRules {
     /** The URL if [raw] is one `http` or `https` URL that passes the wire rule **exactly as it is** (no trimming), else null. Everything else is rejected. */
     fun acceptUrl(raw: String): String? = raw.takeIf(LinkWire::isLinkUrl)
 
+    /**
+     * The URL as an `Intent` should carry it: the scheme in lower case. Android matches an intent filter's scheme **case-sensitively**, so
+     * `HTTPS://example.com` (valid for the protocol: the scheme may be in any case) finds no app and no browser. Only the scheme changes
+     * (everything before the first `://`); the rest of the URL is exactly as it came, and what is shown, copied and checked is never this form.
+     */
+    fun intentUrl(url: String): String {
+        val end = url.indexOf("://")
+        return if (end <= 0) url else url.substring(0, end).lowercase(java.util.Locale.ROOT) + url.substring(end)
+    }
+
     /** Builds a [ReceivedLink], or null if the URL is rejected. A title and a source app that are already clean stay as they are. */
     fun accept(rawUrl: String, rawTitle: String?, rawSourceApp: String? = null): ReceivedLink? {
         val url = acceptUrl(rawUrl) ?: return null

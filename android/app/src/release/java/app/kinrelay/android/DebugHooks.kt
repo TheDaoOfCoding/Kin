@@ -15,6 +15,11 @@ object DebugHooks {
     @Suppress("UNUSED_PARAMETER")
     fun refuseNewNames(context: android.content.Context): Boolean = false
 
+    /** The debug-only "Mirror test" section: nothing in a release build. */
+    @androidx.compose.runtime.Composable
+    @Suppress("UNUSED_PARAMETER")
+    fun MirrorTest(graph: AppGraph, context: android.content.Context) = Unit
+
     /** Always the phone's real maker. */
     @Suppress("UNUSED_PARAMETER")
     fun manufacturer(context: android.content.Context): String = android.os.Build.MANUFACTURER

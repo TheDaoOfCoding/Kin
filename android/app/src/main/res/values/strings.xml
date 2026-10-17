@@ -2,4 +2,5 @@
     <string name="app_name">Kin</string>
     <string name="send_to_pc">Send to PC</string>
     <string name="send_clipboard">Send clipboard</string>
+    <string name="mirror_service_label">Kin (phone notifications on your PC)</string>
 </resources>

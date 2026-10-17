@@ -34,6 +34,7 @@ import app.kinrelay.android.link.TextFileSender
 import app.kinrelay.android.log.FileLog
 import app.kinrelay.android.log.LogFingerprint
 import app.kinrelay.android.log.LogKeyStore
+import app.kinrelay.android.notifmirror.MirrorController
 import app.kinrelay.android.pairing.DeviceInfo
 import app.kinrelay.android.pairing.PairingController
 import app.kinrelay.android.protocol.DedupMemory
@@ -88,6 +89,9 @@ class AppGraph(private val context: Context) {
 
     /** Notifications and toasts; also the [app.kinrelay.android.link.Alerts] the sender and the receiver use. */
     val notifications: Notifications by lazy { Notifications(appContext) }
+
+    /** Notification mirroring, phone to PC (2B.2): the user's choices, the sender and the listener's engine. Reacts only; starts nothing by itself. */
+    val mirror: MirrorController by lazy { MirrorController(this) }
 
     /** Remembers what the PC just put on the clipboard, so "send clipboard" doesn't send it back. */
     val clipboardGuard = ClipboardGuard(System::currentTimeMillis)
@@ -221,6 +225,8 @@ class AppGraph(private val context: Context) {
         // What a crash left behind and no transfer owns (pending gallery entries, and cached copies of transfers that are not live: a queued,
         // active or failed upload keeps its copies, whatever their age) goes now, before downloads resume.
         scope.launch(Dispatchers.IO) { runCatching { transfers.sweepOrphans() } }
+        // Follows the user's notification-mirroring choices (turning it off or an app off takes its toasts down on the PC).
+        mirror.start()
         // The paired PC shows up in the share sheet's top row (the direct-share shortcut) and goes away when it is unpaired.
         scope.launch {
             database.devices().observeAll().collect { ShareShortcuts.sync(appContext, it.firstOrNull(), log) }

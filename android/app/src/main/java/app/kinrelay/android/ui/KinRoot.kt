@@ -24,6 +24,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import android.os.Build
 import androidx.core.net.toUri
 import app.kinrelay.android.DebugHooks
@@ -41,12 +42,15 @@ import app.kinrelay.android.pairing.PairingConfirmation
 import app.kinrelay.android.pairing.PairingUiState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private const val MAIN = 0
 private const val SETUP = 1
 private const val DEBUG = 2
+private const val MIRROR_SETUP = 3
+private const val MIRROR_APPS = 4
 
 /**
  * The screens in one. When a link is waiting: Confirm pairing. With no PC paired: pairing (and Debug). With a PC: Home, History and Settings
@@ -121,11 +125,23 @@ fun KinRoot(
                     guide = OemTable.select(DebugHooks.manufacturer(context), Build.BRAND),
                     onAskPermissions = onAskPermissions, onOpenAppSettings = onAllowLocalNetwork,
                     onDone = {
-                        scope.launch { graph.settings.setSetupDone(true) }
+                        scope.launch {
+                            graph.settings.setSetupDone(true)
+                            // Notification mirroring is offered once, right after the reliability setup (2B.2); it stays in Settings after that.
+                            if (!graph.mirror.store.setupShown.first()) screen = MIRROR_SETUP
+                        }
                         screen = MAIN
                         graph.link.userAction()
                     },
                 )
+                return@Column
+            }
+            if (screen == MIRROR_SETUP && pc != null) {
+                MirrorSetupScreen(graph, context, permissions, onDone = { screen = MAIN })
+                return@Column
+            }
+            if (screen == MIRROR_APPS && pc != null) {
+                MirrorAppsScreen(graph, context, onBack = { screen = MAIN })
                 return@Column
             }
             val success by produceState(SuccessRate.Result(0, 0), history) { value = graph.successRate() }
@@ -135,6 +151,13 @@ fun KinRoot(
                     stats, logLines, success,
                     errors = history.filter { it.status == HistoryStatus.FAILED || it.status == HistoryStatus.EXPIRED },
                     events = events,
+                    mirror = {
+                        androidx.compose.foundation.layout.Column(verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(6.dp)) {
+                            Text("Notification mirroring", style = androidx.compose.material3.MaterialTheme.typography.titleMedium)
+                            Text(graph.mirror.sender.stats.line() + " · announced ${graph.mirror.sender.announcedCount()} · last action ${graph.mirror.lastActionResult}", style = androidx.compose.material3.MaterialTheme.typography.bodySmall)
+                            DebugHooks.MirrorTest(graph, context)
+                        }
+                    },
                     onPingInterval = { scope.launch { graph.settings.setPingIntervalSeconds(it) } },
                     onExport = {
                         scope.launch {
@@ -192,6 +215,7 @@ fun KinRoot(
                     onSaveName = { graph.settings.setDeviceName(it) },
                     onOpenSetup = { screen = SETUP }, onOpenDebug = { screen = DEBUG },
                     onUnpair = { graph.link.unpair(context) },
+                    mirrorCard = { MirrorSettingsCard(graph, context, permissions, onOpenSetup = { screen = MIRROR_SETUP }, onOpenApps = { screen = MIRROR_APPS }) },
                 )
                 else -> HomeScreen(
                     pc = pc,
@@ -208,6 +232,7 @@ fun KinRoot(
                     onUnpair = { graph.link.unpair(context) },
                     recent = history, nowMillis = now, onSeeHistory = { tab = 1 },
                     onOpenItem = ::open, onRetryItem = { graph.retryItem(it) }, onCancelItem = { graph.cancelItem(it) },
+                    mirrorCard = { MirrorHomeCard(graph, permissions, onOpenSetup = { screen = MIRROR_SETUP }) },
                 )
             }
         }

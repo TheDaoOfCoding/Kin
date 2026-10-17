@@ -67,6 +67,8 @@ fun SettingsScreen(
     onOpenDebug: () -> Unit,
     onUnpair: suspend () -> Unit,
     modifier: Modifier = Modifier,
+    /** "Show notifications on your PC" (2B.2). */
+    mirrorCard: @Composable () -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
     var name by rememberSaveable(deviceName) { mutableStateOf(deviceName) }
@@ -108,6 +110,8 @@ fun SettingsScreen(
                 OutlinedButton(onClick = { SetupActions.openChannelSettings(context, NotificationChannels.TRANSFERS) }, modifier = Modifier.fillMaxWidth()) { Text("File transfers: progress and results") }
             }
         }
+
+        mirrorCard()
 
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {

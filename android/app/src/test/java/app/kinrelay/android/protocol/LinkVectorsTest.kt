@@ -127,9 +127,9 @@ class LinkVectorsTest {
     }
 
     @Test
-    fun theHelloTheAppSendsListsTheLinkCapability() {
+    fun theHelloTheAppSendsListsTheLinkAndNotifCapabilities() {
         val hello = kotlinx.serialization.json.Json.parseToJsonElement(Frames.hello("id-1", "Pixel", "android", "0.1.1")).jsonObject
-        assertEquals(listOf("link"), hello.getValue("capabilities").jsonArray.map { it.jsonPrimitive.content })
+        assertEquals(listOf("link", "notif"), hello.getValue("capabilities").jsonArray.map { it.jsonPrimitive.content })
         assertFalse(hello["capabilities"] is JsonNull)
     }
 

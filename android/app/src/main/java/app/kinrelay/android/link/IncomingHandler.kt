@@ -44,7 +44,10 @@ class IncomingHandler(
             log.i("link", "sensitive text from '$fromName' written=$written automatic=$automatic (its content is not logged)")
         } else {
             val openUrl = if (isUrl) UrlRules.httpUrl(text) else null
-            alerts.textFrom(fromName, id, text, openUrl, copyText = text, sensitive = false, copiedAlready = written)
+            // A text that is a web address is shown like a link (2B.1 review): the real address first, with the warning mark when it is tricky, then
+            // the URL; never the raw text alone. The phone checks the rule again and never trusts `isUrl`. Copy still copies the text as it came.
+            val shown = openUrl?.let(::shownLikeALink) ?: text
+            alerts.textFrom(fromName, id, shown, openUrl, copyText = text, sensitive = false, copiedAlready = written)
             log.i("link", "text from '$fromName' ${ClipboardGuard.fingerprint(text)} isUrl=$isUrl openable=${openUrl != null} written=$written automatic=$automatic")
         }
         if (automatic && !written) tellNotCopied()
@@ -61,6 +64,13 @@ class IncomingHandler(
         // protocol.md: no URL in a log (a URL can carry a token), the length and the scheme at most.
         log.i("link", "link from '$fromName' scheme=${link.url.substringBefore(':').lowercase()} urlChars=${link.url.length} titleChars=${link.title?.length ?: 0} warn=${link.warn}")
         return link
+    }
+
+    /** "[⚠ ]address" on the first line and the URL (shortened, invisible characters made visible) on the next, as the link notification shows them. */
+    private fun shownLikeALink(url: String): String {
+        val link = LinkRules.accept(url, null) ?: return url
+        val address = if (link.warn) "${app.kinrelay.android.links.LinkNotificationContent.WARNING_MARK} ${link.domain}" else link.domain
+        return address + "\n" + LinkRules.displayUrl(link.url, app.kinrelay.android.links.LinkNotificationContent.URL_SHOWN_CHARACTERS)
     }
 
     /** The ack has gone out already, so without this the PC would say "sent" and Paste on the phone would give the old text. */

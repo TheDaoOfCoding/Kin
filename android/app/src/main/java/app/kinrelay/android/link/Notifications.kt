@@ -20,6 +20,7 @@ import app.kinrelay.android.R
 import app.kinrelay.android.clipboard.ClipboardSendActivity
 import app.kinrelay.android.links.AndroidLinks
 import app.kinrelay.android.links.LinkNotifications
+import app.kinrelay.android.links.LinkRules
 import app.kinrelay.android.links.ReceivedLink
 import app.kinrelay.android.notify.NotificationChannels
 import app.kinrelay.android.notify.NotificationLedger
@@ -141,7 +142,7 @@ class Notifications(context: Context) : Alerts {
             builder.addAction(R.drawable.ic_stat_kin, if (state.count > 1) "Copy latest" else "Copy", copyText(latest.id))
         }
         state.openUrl?.let { url ->
-            val view = Intent(Intent.ACTION_VIEW, url.toUri()).addCategory(Intent.CATEGORY_BROWSABLE).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            val view = Intent(Intent.ACTION_VIEW, LinkRules.intentUrl(url).toUri()).addCategory(Intent.CATEGORY_BROWSABLE).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             val pending = PendingIntent.getActivity(
                 context, url.hashCode(), view, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )

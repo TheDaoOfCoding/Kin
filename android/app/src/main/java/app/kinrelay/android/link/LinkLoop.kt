@@ -1,9 +1,11 @@
 package app.kinrelay.android.link
 
 import app.kinrelay.android.log.KinLog
+import app.kinrelay.android.notifmirror.NotifWire
 import app.kinrelay.android.pairing.PairingAddress
 import app.kinrelay.android.protocol.CloseAction
 import app.kinrelay.android.protocol.CloseRules
+import app.kinrelay.android.protocol.Frames
 import app.kinrelay.android.protocol.Hello
 import app.kinrelay.android.protocol.LinkMessage
 import app.kinrelay.android.protocol.Offer
@@ -59,6 +61,16 @@ interface LinkHost {
 
     /** A `cancel` (acked already). Called one at a time, in arrival order. */
     suspend fun onCancelReceived(transferId: String, reason: String) = Unit
+
+    /** The accepted `hello` of this connection (the first, or a later one that may change the PC's capabilities): 2B.2 sends its status and sync. */
+    fun onHelloAccepted(connection: LinkConnection) = Unit
+
+    /** A `notif.dismiss` from the PC (ephemeral: no ack). Don't block. */
+    fun onNotifDismiss(nid: String) = Unit
+
+    /** A `notif.action` from the PC: fire it, and return the frame to answer with. */
+    suspend fun onNotifAction(request: NotifWire.ActionRequest): String =
+        Frames.error("disabled", "Notification mirroring isn't available.", request.id)
 }
 
 /**
@@ -152,10 +164,22 @@ class LinkLoop(
                 continue
             }
             val listener = object : SessionListener {
+                private var announced = false
+
                 override fun onHelloAccepted(peer: Hello) {
                     mutableState.value = LinkState.Connected(peer.name, address)
-                    scope.launch { host.onConnected(address, peer) }
+                    // "Connected" (counters, the queue, the transfers, housekeeping) is for the first accepted hello of a connection. A later hello (the PC turned
+                    // "Show phone notifications" on or off: protocol.md "Capability") only changes what the peer understands: the mirror hears it, nothing else.
+                    if (!announced) {
+                        announced = true
+                        scope.launch { host.onConnected(address, peer) }
+                    }
+                    session?.let { host.onHelloAccepted(it) }
                 }
+
+                override fun onNotifDismiss(nid: String) = host.onNotifDismiss(nid)
+
+                override suspend fun onNotifAction(request: NotifWire.ActionRequest): String = host.onNotifAction(request)
 
                 override fun onPingReceived(fromName: String) = host.onPingReceived(fromName)
 

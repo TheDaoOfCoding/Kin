@@ -31,7 +31,16 @@ object Permissions {
         localNetwork = localNetworkGranted(context),
         localNetworkExists = Build.VERSION.SDK_INT >= ANDROID_17,
         batteryUnrestricted = app.kinrelay.android.setup.SetupActions.batteryOptimisationIgnored(context),
+        notificationAccess = notificationAccessGranted(context),
     )
+
+    /** "Notification access" (2B.2): a special access the user gives in the system settings, not a runtime permission. Read again each time the app comes back. */
+    fun notificationAccessGranted(context: Context): Boolean = try {
+        context.getSystemService(android.app.NotificationManager::class.java)
+            .isNotificationListenerAccessGranted(android.content.ComponentName(context, app.kinrelay.android.notifmirror.MirrorListenerService::class.java))
+    } catch (_: Exception) {
+        false
+    }
 
     private fun granted(context: Context, permission: String) =
         ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
@@ -44,4 +53,6 @@ data class PermissionSnapshot(
     val localNetwork: Boolean = true,
     val localNetworkExists: Boolean = false,
     val batteryUnrestricted: Boolean = false,
+    /** The user gave Kin notification access (2B.2 mirroring). */
+    val notificationAccess: Boolean = false,
 )

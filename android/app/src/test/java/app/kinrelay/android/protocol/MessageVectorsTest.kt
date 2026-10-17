@@ -8,6 +8,9 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.put
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -31,6 +34,8 @@ class MessageVectorsTest {
         "offer-*", "complete-*", "cancel-*",
         // 2B.1
         "link-*",
+        // 2B.2 (the PC's side of the phone's `notif.*` is `NotifInbound`, which stands for the PC here; the real one is the desktop's)
+        "notif-*",
     )
     private val invalidScope = listOf(
         "first-message-*", "hello-*", "ack-*", "error-*", "unpair-missing-id", "ping-*", "type-*",
@@ -43,6 +48,8 @@ class MessageVectorsTest {
         "offer-*", "complete-*", "cancel-*",
         // 2B.1
         "link-*",
+        // 2B.2
+        "notif-*",
     )
     private val sequenceScope = listOf(
         "second-hello-after-handshake-is-a-normal-message", "invalid-hello-does-not-count-as-accepted",
@@ -63,6 +70,11 @@ class MessageVectorsTest {
         // 2B.1
         "link-duplicate-is-acked-not-redelivered", "link-rejected-id-is-not-remembered", "link-after-reconnect-is-idempotent",
         "link-sent-as-text-to-an-old-peer-is-a-text",
+        // 2B.2
+        "notif-dropped-when-feature-off-is-silent", "notif-capability-changes-with-a-new-hello", "notif-not-sent-without-capability-receiver-side",
+        "notif-is-not-in-the-dedup-memory", "notif-action-is-acked-and-a-repeat-is-not-run-twice", "notif-action-is-not-resent-after-reconnect",
+        "notif-post-after-reconnect-needs-the-hellos-again", "notif-sync-removes-the-rest", "notif-invalid-post-keeps-the-connection-open",
+        "notif-status-then-icon-then-post",
     )
 
     /** The invalid-UTF-8 case can only be checked on the PC side: OkHttp never shows the bad bytes. */
@@ -71,8 +83,10 @@ class MessageVectorsTest {
     /** The phone is the receiver for `to: phone`; for `to: pc` the receiver stands for the PC, which refuses `clipboard`. */
     private fun newReceiver(role: String = "phone") = MessageReceiver(DedupMemory({ 0L }), if (role == "phone") ReceiverRole.PHONE else ReceiverRole.PC)
 
-    private fun open(receiver: MessageReceiver) {
-        val hello = receiver.onText("""{"type":"hello","id":"prime","protocol":1,"name":"Peer","platform":"windows","appVersion":"0.1.0"}""")
+    /** [peerCapabilities]: what the sender's `hello` lists (`peer` of a 2B.2 case); null sends a `hello` with no `capabilities`, as a 0.1.0 peer does. */
+    private fun open(receiver: MessageReceiver, peerCapabilities: List<String>? = null) {
+        val caps = peerCapabilities?.joinToString(",", prefix = ",\"capabilities\":[", postfix = "]") { "\"$it\"" }.orEmpty()
+        val hello = receiver.onText("""{"type":"hello","id":"prime","protocol":1,"name":"Peer","platform":"windows","appVersion":"0.1.0"$caps}""")
         assertTrue(hello.action is Action.HandshakeOk)
     }
 
@@ -128,6 +142,19 @@ class MessageVectorsTest {
             assertEquals("$name: link title", link.string("title"), it.link.title)
             assertEquals("$name: link sourceApp", link.string("sourceApp"), it.link.sourceApp)
         }
+        // `expect.notif` (2B.2) is what the receiver ends up with for a valid `notif.*`.
+        expect["notif"]?.let { notif ->
+            val got: JsonObject = when (val action = outcome.action) {
+                is Action.NotifReceived -> action.notif
+                is Action.NotifDismiss -> buildJsonObject { put("nid", action.nid) }
+                is Action.NotifAction -> buildJsonObject {
+                    put("nid", action.request.nid); put("i", action.request.index); put("label", action.request.label)
+                    action.request.text?.let { put("text", it) }
+                }
+                else -> error("$name: expected a notif action, got ${outcome.action}")
+            }
+            assertEquals("$name: notif", notif.jsonObject, got)
+        }
         // `expect.sensitive` says how the receiver treats a delivered text (absent means false).
         (outcome.action as? Action.DeliverText)?.let {
             assertEquals("$name: sensitive", expect["sensitive"]?.jsonPrimitive?.boolean ?: false, it.sensitive)
@@ -140,7 +167,9 @@ class MessageVectorsTest {
             val name = case.getValue("name").str()
             if (!Vectors.inScope(name, scope) || name in skipped) continue
             val receiver = newReceiver(case.getValue("to").str())
-            if (case.getValue("state").str() == "open") open(receiver)
+            // 2B.2 cases say what the receiver's own `hello` and the sender's list (`own`, `peer`).
+            case["own"]?.let { own -> receiver.ownCapabilities = own.jsonArray.map { it.str() }.toSet() }
+            if (case.getValue("state").str() == "open") open(receiver, case["peer"]?.jsonArray?.map { it.str() })
             check("$section/$name", case, feed(receiver, case))
             run++
         }
@@ -185,7 +214,13 @@ class MessageVectorsTest {
                     null -> Unit
                     else -> error("unknown step event in $name#$i")
                 }
-                val receiver = receivers.getValue(if (case.getValue("from").str() == "phone") "pc" else "phone")
+                val fromRole = case.getValue("from").str()
+                val receiver = receivers.getValue(if (fromRole == "phone") "pc" else "phone")
+                // A `hello` sets the sender's own capabilities (the other side keeps them as its view of the sender, through its own receiver).
+                case["frame"]?.jsonObject?.takeIf { it["type"]?.str() == "hello" }?.let { hello ->
+                    receivers.getValue(fromRole).ownCapabilities =
+                        (hello["capabilities"] as? kotlinx.serialization.json.JsonArray)?.mapNotNull { it.jsonPrimitive.contentOrNull }?.toSet().orEmpty()
+                }
                 val outcome = feed(receiver, case)
                 check("sequence/$name#$i", case, outcome)
                 (outcome.action as? Action.StartDownload)?.let { known[it.offer.id] = Known(device, it.offer.files.associate { f -> f.fileId to f.size }) }
@@ -290,7 +325,7 @@ class MessageVectorsTest {
     @Test
     fun sentFramesAreCompactAndStrictlyValid() {
         val hello = Frames.hello("0193a5c2-7b1e-7c3a-9d4f-5e6a7b8c9d32", "Pixel 8", "android", "0.1.0")
-        assertEquals("""{"type":"hello","id":"0193a5c2-7b1e-7c3a-9d4f-5e6a7b8c9d32","protocol":1,"name":"Pixel 8","platform":"android","appVersion":"0.1.0","capabilities":["link"]}""", hello)
+        assertEquals("""{"type":"hello","id":"0193a5c2-7b1e-7c3a-9d4f-5e6a7b8c9d32","protocol":1,"name":"Pixel 8","platform":"android","appVersion":"0.1.0","capabilities":["link","notif"]}""", hello)
         // An app with no extra features sends no `capabilities` at all (a 0.1.0 hello).
         assertEquals("""{"type":"hello","id":"h","protocol":1,"name":"Pixel 8","platform":"android","appVersion":"0.1.0"}""", Frames.hello("h", "Pixel 8", "android", "0.1.0", capabilities = emptyList()))
         assertEquals("""{"type":"ping","id":"a","sentAt":1760443200000}""", Frames.ping("a", 1760443200000))

@@ -12,6 +12,7 @@ import app.kinrelay.android.Permissions
 import app.kinrelay.android.clipboard.AndroidClipboard
 import app.kinrelay.android.data.DeviceEntity
 import app.kinrelay.android.identity.DeviceIds
+import app.kinrelay.android.notifmirror.NotifWire
 import app.kinrelay.android.pairing.PairingAddress
 import app.kinrelay.android.protocol.CloseAction
 import app.kinrelay.android.protocol.LinkMessage
@@ -243,6 +244,13 @@ class LinkRuntime(
             // A link from the PC is history (the address and the cleaned title); it is never put on the clipboard and nothing is opened by itself.
             runCatching { graph.textOutbox.recordIncomingLink(device.deviceId, fromName, id, shown.url, shown.title) }
         }
+
+        // 2B.2: notification mirroring. The PC's `hello` was accepted (the first, or a later one that changed its capabilities): the status and the sync go out.
+        override fun onHelloAccepted(connection: LinkConnection) = graph.mirror.onLinkReady(connection)
+
+        override fun onNotifDismiss(nid: String) = graph.mirror.onDismiss(nid)
+
+        override suspend fun onNotifAction(request: NotifWire.ActionRequest): String = graph.mirror.onAction(request)
 
         override fun acceptOffer(offer: Offer): String? = graph.transfers.acceptOffer(offer, device.deviceId)
 

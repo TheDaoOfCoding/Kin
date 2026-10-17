@@ -39,6 +39,8 @@ fun DebugScreen(
     onPingInterval: (Int) -> Unit,
     onExport: () -> Unit,
     modifier: Modifier = Modifier,
+    /** The notification-mirroring counters and, in a debug build, the "Mirror test" section (2B.2). */
+    mirror: @Composable () -> Unit = {},
 ) {
     val rtt = LatencySummary.of(stats.recentRtts)
     val arrival = LatencySummary.of(stats.recentArrivals.map { it.toDouble() })
@@ -58,6 +60,7 @@ fun DebugScreen(
             }
         }
         item { Button(onClick = onExport, modifier = Modifier.fillMaxWidth()) { Text("Export logs") } }
+        item { mirror() }
 
         item { Text("Recent errors", style = MaterialTheme.typography.titleMedium) }
         if (errors.isEmpty()) item { Text("None.", style = MaterialTheme.typography.bodySmall) }

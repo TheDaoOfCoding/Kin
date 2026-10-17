@@ -29,6 +29,14 @@
           opens in its app on a tap (the system picks it); only the label is then the neutral "Open link" instead of "Open in <App>".
     -->
     <queries>
+        <!--
+            2B.2: the apps with a launcher icon, for the notification picker ("which apps may show notifications on your PC"). This is the usual way to
+            list the apps a user knows, and it is not QUERY_ALL_PACKAGES. A Play review may ask why (risk R27).
+        -->
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
         <intent>
             <action android:name="android.intent.action.VIEW" />
             <category android:name="android.intent.category.BROWSABLE" />
@@ -238,6 +246,20 @@
             android:name=".link.LinkService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <!--
+            Notification mirroring (2B.2), opt-in: the user gives Kin "Notification access" in the system settings (a special access: there is no
+            permission to ask for), and ticks the apps whose notifications may appear on the PC. The label is what the user sees in that list.
+        -->
+        <service
+            android:name=".notifmirror.MirrorListenerService"
+            android:exported="true"
+            android:label="@string/mirror_service_label"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
 
         <!-- The Cancel and Retry buttons of the transfer notifications. Only our own PendingIntents reach it. -->
         <receiver

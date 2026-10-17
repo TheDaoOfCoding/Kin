@@ -1,5 +1,6 @@
 package app.kinrelay.android.protocol
 
+import app.kinrelay.android.notifmirror.NotifWire
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -29,6 +30,29 @@ sealed class Action(val category: String) {
 
     /** A valid `link` (2B.1), acked: show it and let the user open it. The URL is exactly as sent; the title and source app are cleaned. */
     class DeliverLink(val id: String, val link: LinkMessage) : Action("deliver_link")
+
+    /**
+     * A valid `notif.dismiss` (2B.2): cancel that notification if the setting allows. **Ephemeral**: no ack, not in the de-duplication memory, no reply
+     * either way. [nid] is the 32-hex identity of a notification this phone announced.
+     */
+    class NotifDismiss(val nid: String) : Action("notif_dismiss")
+
+    /**
+     * A valid, new `notif.action` (2B.2): fire the action (or the reply with `text`), then answer with an `ack` or an `error`. Nothing has been sent
+     * yet: the caller answers after it fired and records the answer with [MessageReceiver.recordResponse], so a repeated ID gets the same answer and
+     * the action is never fired twice.
+     */
+    class NotifAction(val request: NotifWire.ActionRequest) : Action("notif_action")
+
+    /** A `notif.*` message the receiver understands but does not act on (the peer's `hello` doesn't list `notif`): dropped silently, no `error`. */
+    data object NotifIgnored : Action("notif_dropped")
+
+    /**
+     * A valid `notif.*` message that **the PC** receives from the phone (`ReceiverRole.PC` only: the real receiver is the desktop's; this stands for it in
+     * the shared vectors). [notif] is what the receiver ends up with (`expect.notif`): the normalized post, the status, the icon's hash and size, a `nid`
+     * or the list of `nid`s. [category] is `notif_status`, `notif_icon`, `notif_post`, `notif_remove` or `notif_sync`.
+     */
+    class NotifReceived(category: String, val notif: JsonObject) : Action(category)
 
     /** A valid `offer`, acked: download the files. */
     class StartDownload(val offer: Offer) : Action("start_download")
@@ -87,15 +111,24 @@ class MessageReceiver(
     private val role: ReceiverRole = ReceiverRole.PHONE,
     private val offerGate: (Offer) -> String? = { null },
     private val offerHistory: (Offer) -> OfferHistory = { OfferHistory.NEW },
+    /**
+     * What a valid, new `notif.action` is answered with **now**: the frame (an `ack` by default, what the shared vectors expect), or null for "the answer
+     * comes later" (the app fires the action first and answers after it: [Action.NotifAction]). Either way the answer is the ID's one response.
+     */
+    private val notifAction: (NotifWire.ActionRequest) -> String? = { Frames.ack(it.id) },
 ) {
     var peer: Hello? = null
         private set
+
+    /** The capabilities of this side's own latest `hello` (protocol.md, validation step 6b): the phone always lists `notif`. The tests set it for the vectors. */
+    var ownCapabilities: Set<String> = setOf(LinkWire.CAPABILITY_LINK, NotifWire.CAPABILITY)
 
     val helloAccepted: Boolean get() = peer != null
 
     private val handled: Set<String> = buildSet {
         addAll(listOf("hello", "ack", "error", "ping", "unpair", "text", "link", "cancel"))
-        if (role == ReceiverRole.PHONE) addAll(listOf("clipboard", "offer")) else add("complete")
+        if (role == ReceiverRole.PHONE) addAll(listOf("clipboard", "offer", NotifWire.DISMISS, NotifWire.ACTION))
+        else addAll(listOf("complete", NotifWire.STATUS, NotifWire.ICON, NotifWire.POST, NotifWire.REMOVE, NotifWire.SYNC))
     }
 
     fun onBinary(): Outcome = Outcome(emptyList(), 1003, Action.CloseOnly)
@@ -125,6 +158,13 @@ class MessageReceiver(
         // 5. Unknown or wrong-direction type.
         if (type !in handled) return rejected(ErrorCodes.UNSUPPORTED_TYPE, "Unsupported message type.", ref)
 
+        // 6b. A `notif.*` message is dropped silently when either side's latest `hello` doesn't list `notif`; then the size limit of 32 KiB (48 KiB for an icon).
+        if (type.startsWith("notif.")) {
+            if (NotifWire.CAPABILITY !in ownCapabilities || peer?.understandsNotif != true) return Outcome(emptyList(), null, Action.NotifIgnored)
+            val limit = if (type == NotifWire.ICON) NOTIF_ICON_FRAME_BYTES else NOTIF_FRAME_BYTES
+            if (Utf8.size(text) > limit) return rejected(ErrorCodes.TOO_LARGE, "A notification message is at most ${limit / 1024} KiB.", ref)
+        }
+
         return when (type) {
             "hello" -> onHello(frame, ref)
             "ack" -> onAck(frame)
@@ -136,6 +176,9 @@ class MessageReceiver(
             "offer" -> onOffer(frame, ref)
             "complete" -> onComplete(frame, ref)
             "cancel" -> onCancel(frame, ref)
+            NotifWire.DISMISS -> onNotifDismiss(frame, ref)
+            NotifWire.ACTION -> onNotifAction(frame, ref)
+            NotifWire.STATUS, NotifWire.ICON, NotifWire.POST, NotifWire.REMOVE, NotifWire.SYNC -> onNotifForThePc(type, frame, ref)
             else -> onUnpair(frame, ref)
         }
     }
@@ -215,6 +258,58 @@ class MessageReceiver(
         val link = LinkMessage(url, LinkWire.cleanTitle(title), LinkWire.cleanSourceApp(sourceApp))
         return processOnce(ref, Action.DeliverLink(ref, link))
     }
+
+    /**
+     * `notif.dismiss`: ephemeral, so no ack and no de-duplication (a repeated `id` is processed again). A peer whose `hello` doesn't list `notif` has
+     * no business sending it: dropped silently, like any `notif.*` a receiver has switched off (protocol 3.1).
+     */
+    private fun onNotifDismiss(frame: JsonObject, ref: String?): Outcome {
+        val nid = NotifWire.parseDismiss(frame)
+        if (ref == null || nid == null) {
+            return rejected(ErrorCodes.BAD_REQUEST, "The notif.dismiss message needs an id and a nid of 32 lowercase hex characters.", ref)
+        }
+        return Outcome(emptyList(), null, Action.NotifDismiss(nid))
+    }
+
+    /** The PC's side of the phone's `notif.*` (the shared vectors only; see [NotifInbound]). Ephemeral: no ack, no de-duplication. */
+    private fun onNotifForThePc(type: String, frame: JsonObject, ref: String?): Outcome {
+        if (ref == null) return rejected(ErrorCodes.BAD_REQUEST, "A notification message needs an id.", ref)
+        val result = when (type) {
+            NotifWire.STATUS -> NotifInbound.status(frame)
+            NotifWire.ICON -> NotifInbound.icon(frame)
+            NotifWire.POST -> NotifInbound.post(frame)
+            NotifWire.REMOVE -> NotifInbound.remove(frame)
+            else -> NotifInbound.sync(frame)
+        }
+        return when (result) {
+            is NotifInbound.Result.Bad -> rejected(ErrorCodes.BAD_REQUEST, result.message, ref)
+            NotifInbound.Result.Dropped -> Outcome(emptyList(), null, Action.NotifIgnored)
+            is NotifInbound.Result.Ok -> Outcome(emptyList(), null, Action.NotifReceived(type.replace('.', '_'), result.data))
+        }
+    }
+
+    /**
+     * `notif.action`: the one `notif.*` message that is acked, so a repeated `id` is answered with the stored response and never fires again. The ack
+     * (or the `error`) is sent by the caller **after** the action was fired (see [Action.NotifAction]).
+     */
+    private fun onNotifAction(frame: JsonObject, ref: String?): Outcome {
+        val request = ref?.let { NotifWire.parseAction(it, frame) }
+        if (ref == null || request == null) {
+            return rejected(ErrorCodes.BAD_REQUEST, "The notif.action message needs an id, a nid, an action index i (0 to 31), a label and, for a reply, a non-empty text.", ref)
+        }
+        dedup.lookup(ref)?.let { return Outcome(listOf(it), null, Action.IgnoreDuplicate) }
+        val answer = notifAction(request) ?: return Outcome(emptyList(), null, Action.NotifAction(request))
+        dedup.record(ref, answer)
+        return Outcome(listOf(answer), null, Action.NotifAction(request))
+    }
+
+    private companion object {
+        const val NOTIF_FRAME_BYTES = 32 * 1024
+        const val NOTIF_ICON_FRAME_BYTES = 48 * 1024
+    }
+
+    /** Remembers the answer that was sent for [id] (the `notif.action` answer comes after the action fired, so it is recorded here, not by the receiver itself). */
+    fun recordResponse(id: String, response: String) = dedup.record(id, response)
 
     private fun onClipboard(frame: JsonObject, ref: String?): Outcome {
         val text = Fields.nonEmptyString(frame["text"])

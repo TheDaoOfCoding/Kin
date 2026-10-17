@@ -2,6 +2,7 @@ package app.kinrelay.android.testing
 
 import java.io.File
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 
@@ -23,6 +24,10 @@ import org.junit.Test
  *                 `stale <offset>` (the next repeated POST reports that offset), `ackmsg` / `noackmsg` (ack or ignore the phone's `complete` and `cancel`).
  *                 The events file also gets what the PC stored: `stored <transfer> <file> name='..' size=N complete=<bool> sha=<hex>`, the phone's
  *                 `complete` / `cancel` messages and DELETEs.
+ *                 Milestone 2B.2 (notifications): this PC lists the `notif` capability from the start (a 0.2.0 PC with "Show phone notifications" on); every
+ *                 frame from the phone, `notif.*` and the `ack` or `error` of a `notif.action`, is in the events file as `frame from phone: ...` (a test
+ *                 stub: it keeps the test strings the scripts post, so never point it at real notifications). `notifoff` / `notifon` send a new `hello`
+ *                 without or with `notif`; `dismiss <nid>` sends `notif.dismiss`; `action <nid> <i> <label>` a button press; `reply <nid> <i> <label>|<text>` a reply.
  *
  *   KIN_FAKE_PC=1 gradlew.bat testDebugUnitTest --tests "*FakePcSession*" --rerun
  */
@@ -36,7 +41,7 @@ class FakePcSession {
         val command = File(dir, "command.txt").also { it.writeText("") }
         fun event(text: String) = events.appendText("${System.currentTimeMillis()} $text\n")
 
-        FakePc(name = "Fake PC", fixedPort = 47831).apply { autoPair = true }.start().use { pc ->
+        FakePc(name = "Fake PC", fixedPort = 47831).apply { autoPair = true; helloCapabilities = listOf("link", "notif") }.start().use { pc ->
             val token = "AAECAwQFBgcICQoLDA0ODw"
             File(dir, "pair-url.txt").writeText(
                 "kinrelay://pair?v=1&a=10.0.2.2:${pc.port}&id=${pc.identity.deviceId}&tk=$token&n=Fake%20PC"
@@ -88,6 +93,20 @@ class FakePcSession {
                             "url" -> pc.sendText("fake-pc-text-${System.nanoTime()}", argument, isUrl = true)
                             "holdtext" -> held += argument
                             "used" -> pc.files.usedIds += argument.trim() // the PC has used this transfer ID up (canceled, failed or forgotten): POST, PUT and DELETE with it are 404
+                            "notifon" -> { pc.helloCapabilities = listOf("link", "notif"); pc.send(pc.helloFrame()) }
+                            "notifoff" -> { pc.helloCapabilities = listOf("link"); pc.send(pc.helloFrame()) }
+                            "dismiss" -> pc.send(kotlinx.serialization.json.buildJsonObject {
+                                put("type", "notif.dismiss"); put("id", "fake-pc-dismiss-${System.nanoTime()}"); put("nid", argument.trim())
+                            }.toString())
+                            "action", "reply" -> {
+                                val parts = argument.split(' ', limit = 3)
+                                val rest = parts.getOrElse(2) { "" }
+                                val label = if (text == "reply") rest.substringBefore('|') else rest
+                                pc.send(kotlinx.serialization.json.buildJsonObject {
+                                    put("type", "notif.action"); put("id", "fake-pc-action-${System.nanoTime()}"); put("nid", parts[0]); put("i", parts[1].toInt()); put("label", label)
+                                    if (text == "reply") put("text", rest.substringAfter('|'))
+                                }.toString())
+                            }
                             "noack" -> pc.ackTexts = false
                             "ack" -> { pc.ackTexts = true; pc.errorForText = null }
                             "errtext" -> pc.errorForText = "internal"

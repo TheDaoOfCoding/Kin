@@ -79,6 +79,8 @@ class LinkLoopTest {
             delivered += "text:$text"
         }
         override suspend fun onClipboardReceived(id: String, text: String) { delivered += "clipboard:$text" }
+        val helloSeen = mutableListOf<LinkConnection>()
+        override fun onHelloAccepted(connection: LinkConnection) { helloSeen += connection }
         override suspend fun onConnected(address: PairingAddress, peer: Hello) { connected += address }
         override suspend fun onDisconnected(end: SessionEnd, action: CloseAction) { disconnected += end to action }
         override fun onPingReceived(fromName: String) = Unit
@@ -96,6 +98,23 @@ class LinkLoopTest {
     private fun TestScope.advance(millis: Long) {
         advanceTimeBy(millis)
         runCurrent()
+    }
+
+    @Test
+    fun aLaterHelloOfTheSameConnectionTellsTheMirrorButIsNotAnotherConnect() = runTest {
+        // The PC turns "Show phone notifications" on or off: it sends a new hello on the open connection (protocol.md, Capability).
+        val env = Env(this).apply { winners = setOf(known) }
+        val host = Host(listOf(known))
+        val loop = loop(env, host)
+        loop.start()
+        advance(10)
+        val session = env.sessions.single()
+        session.listener.onHelloAccepted(peer)
+        session.listener.onHelloAccepted(peer.copy(capabilities = setOf("link", "notif")))
+        advance(10)
+        assertEquals("connected once", listOf(known), host.connected)
+        assertEquals("the mirror hears every hello", 2, host.helloSeen.size)
+        loop.stop("test")
     }
 
     @Test

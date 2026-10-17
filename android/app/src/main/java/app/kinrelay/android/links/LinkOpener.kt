@@ -106,7 +106,7 @@ class AndroidLinks(context: Context) : LinkHandlers, LinkLauncher {
         }
     }
 
-    private fun view(url: String) = Intent(Intent.ACTION_VIEW, url.toUri()).addCategory(Intent.CATEGORY_BROWSABLE)
+    private fun view(url: String) = Intent(Intent.ACTION_VIEW, LinkRules.intentUrl(url).toUri()).addCategory(Intent.CATEGORY_BROWSABLE)
 
     @Suppress("DEPRECATION")
     private fun resolve(intent: Intent): List<ResolveInfo> = runCatching {

@@ -49,8 +49,21 @@
                 <action android:name="app.kinrelay.android.debug.TEXT_FROM_PC" />
                 <action android:name="app.kinrelay.android.debug.SEND_LINK" />
                 <action android:name="app.kinrelay.android.debug.SET_LINK_PREFS" />
+                <action android:name="app.kinrelay.android.debug.MIRROR_ALLOW" />
+                <action android:name="app.kinrelay.android.debug.MIRROR_HIDDEN" />
+                <action android:name="app.kinrelay.android.debug.MIRROR_ENABLE" />
+                <action android:name="app.kinrelay.android.debug.MIRROR_DISMISS_PREF" />
+                <action android:name="app.kinrelay.android.debug.MIRROR_POST" />
+                <action android:name="app.kinrelay.android.debug.MIRROR_STATE" />
+                <action android:name="app.kinrelay.android.debug.MIRROR_CANCEL" />
+                <action android:name="app.kinrelay.android.debug.MIRROR_CLEAR_ALL" />
             </intent-filter>
         </receiver>
+
+        <!-- The Reply and Mark as read buttons of the debug "Mirror test" notifications (2B.2). Not exported: only Kin's own PendingIntents reach it. -->
+        <receiver
+            android:name=".debug.DebugMirrorReceiver"
+            android:exported="false" />
 
         <!--
             Lets the adb shell start the (not exported) clipboard send activity, the same one the tile and the

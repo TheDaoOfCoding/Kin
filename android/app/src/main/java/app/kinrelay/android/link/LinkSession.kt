@@ -1,6 +1,8 @@
 package app.kinrelay.android.link
 
 import app.kinrelay.android.log.KinLog
+import app.kinrelay.android.notifmirror.MirrorLink
+import app.kinrelay.android.notifmirror.NotifWire
 import app.kinrelay.android.pairing.PairingAddress
 import app.kinrelay.android.protocol.Action
 import app.kinrelay.android.protocol.CloseRules
@@ -58,8 +60,17 @@ sealed interface AckResult {
 class HttpEndpoint(val client: OkHttpClient, val address: PairingAddress)
 
 /** One connection to the PC, as the reconnect loop and the UI see it. */
-interface LinkConnection {
-    val isReady: Boolean
+interface LinkConnection : MirrorLink {
+    override val isReady: Boolean
+
+    /**
+     * The PC's latest accepted `hello` on this connection lists the `notif` capability (2B.2): it will show `notif.post`, and `notif.*` messages may
+     * go to it. Checked when each message goes on the wire ([MirrorSender] is the only sender); with no `notif` nothing is sent.
+     */
+    override val peerUnderstandsNotif: Boolean get() = false
+
+    /** Puts a `notif.*` frame on the socket with no ack, no queue and no re-send (ephemeral messages). False when the connection can't take it. */
+    override fun sendEphemeral(frame: String): Boolean = false
 
     /**
      * The PC's latest accepted `hello` on this connection lists the `link` capability (protocol.md, "Versioning"): a `link` may go to it as a
@@ -112,6 +123,15 @@ interface SessionListener {
     /** A valid `link` from the PC, already acked (the title and source app are cleaned). Called in arrival order from the socket's thread: don't block. */
     fun onLinkReceived(fromName: String, id: String, link: LinkMessage) = Unit
 
+    /** A valid `notif.dismiss` (2B.2). Ephemeral: no ack. Don't block. */
+    fun onNotifDismiss(nid: String) = Unit
+
+    /**
+     * A valid, new `notif.action` (2B.2): fire it and return the frame to answer with, an `ack` or an `error` for `request.id`. The caller sends the
+     * answer and remembers it for the de-duplication. Runs on a coroutine of the session's scope.
+     */
+    suspend fun onNotifAction(request: NotifWire.ActionRequest): String = Frames.error("disabled", "Notification mirroring isn't available.", request.id)
+
     /**
      * A valid, new `offer`, before it is acked: null accepts it, an error code (`disk_full`) answers with an `error` instead of the
      * ack. Runs on the socket's thread: keep it cheap.
@@ -156,9 +176,11 @@ class LinkSession(
     /** Opens (and closes) a new connection to the PC at the address within the time: the probe of [checkAlive]. */
     private val reachable: suspend (PairingAddress, Long) -> Boolean = { _, _ -> true },
 ) : LinkConnection {
-    private val receiver = MessageReceiver(dedup, ReceiverRole.PHONE, listener::acceptOffer, listener::offerHistory)
+    // A `notif.action` is answered after the action fired, not by the receiver (`notifAction` returns null: "later", see the NotifAction branch of [handle]).
+    private val receiver = MessageReceiver(dedup, ReceiverRole.PHONE, listener::acceptOffer, listener::offerHistory, notifAction = { null })
     private val ended = CompletableDeferred<SessionEnd>()
     private val pending = ConcurrentHashMap<String, CompletableDeferred<Action>>()
+    private val actionsInProgress: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private var socket: WebSocket? = null
     private var openedAt = 0L
     @Volatile private var helloAcceptedAt: Long? = null
@@ -172,6 +194,10 @@ class LinkSession(
     override val isReady: Boolean get() = helloAcceptedAt != null && !ended.isCompleted
 
     override val peerUnderstandsLink: Boolean get() = receiver.peer?.understandsLink == true
+
+    override val peerUnderstandsNotif: Boolean get() = receiver.peer?.understandsNotif == true
+
+    override fun sendEphemeral(frame: String): Boolean = isReady && send(frame)
 
     /** File requests wait longer than the connection's own defaults: a response may follow a long upload, and a busy PC may be slow to write. */
     override val httpEndpoint: HttpEndpoint = HttpEndpoint(
@@ -301,6 +327,23 @@ class LinkSession(
             is Action.DeliverText -> listener.onTextReceived(receiver.peer?.name ?: "PC", action.id, action.text, action.isUrl, action.sensitive)
             is Action.SetClipboard -> listener.onClipboardReceived(action.id, action.text)
             is Action.DeliverLink -> listener.onLinkReceived(receiver.peer?.name ?: "PC", action.id, action.link)
+            is Action.NotifDismiss -> listener.onNotifDismiss(action.nid)
+            is Action.NotifAction -> {
+                // A repeat of an ID whose action is still firing has no recorded answer yet: it is ignored here, so the action never fires twice.
+                if (actionsInProgress.add(action.request.id)) {
+                    scope.launch {
+                        try {
+                            val answer = listener.onNotifAction(action.request)
+                            // The answer is the one response of this ID: a repeat gets it again and the action never fires twice.
+                            receiver.recordResponse(action.request.id, answer)
+                            send(answer)
+                        } finally {
+                            actionsInProgress.remove(action.request.id)
+                        }
+                    }
+                }
+            }
+            Action.NotifIgnored, is Action.NotifReceived -> Unit
             is Action.StartDownload -> listener.onOfferReceived(receiver.peer?.name ?: "PC", action.offer)
             is Action.RepeatOffer -> listener.onOfferRepeated(receiver.peer?.name ?: "PC", action.offer)
             is Action.CancelTransfer -> listener.onCancelReceived(action.transferId, action.reason)

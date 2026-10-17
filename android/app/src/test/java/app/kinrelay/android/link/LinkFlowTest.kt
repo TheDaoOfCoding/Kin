@@ -281,7 +281,7 @@ class LinkFlowTest {
 
     @Test
     fun theAppSaysItUnderstandsLinksInItsHello() {
-        assertTrue(app.kinrelay.android.protocol.Frames.hello("h", "Pixel", "android", "0.1.1").contains("\"capabilities\":[\"link\"]"))
+        assertTrue(app.kinrelay.android.protocol.Frames.hello("h", "Pixel", "android", "0.1.1").contains("\"capabilities\":[\"link\",\"notif\"]"))
         assertEquals(1, PROTOCOL_VERSION)
     }
 }
