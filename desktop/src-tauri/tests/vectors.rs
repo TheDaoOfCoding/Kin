@@ -223,12 +223,28 @@ fn input_of(case: &Value) -> (Input, Option<String>) {
 }
 
 fn open_receiver(role: Role, dedup: &mut MemoryDedup) -> Receiver {
+    open_receiver_with(role, dedup, None, None)
+}
+
+/// A receiver after the peer's `hello`. `own` is what this side's own `hello` lists, `peer` what the peer's lists (changelog 56; a case or sequence of
+/// `messages.json` that has `own` and `peer` keys).
+fn open_receiver_with(role: Role, dedup: &mut MemoryDedup, own: Option<&Value>, peer: Option<&Value>) -> Receiver {
     let mut rx = Receiver::new(role);
-    let hello =
+    let mut hello =
         json!({ "type": "hello", "id": "setup-hello", "protocol": 1, "name": "Peer", "platform": "android", "appVersion": "0.1.0" });
+    if let Some(peer) = peer {
+        hello["capabilities"] = peer.clone();
+    }
     rx.handle_frame(Frame::Text(hello.to_string().as_bytes()), dedup);
     assert!(rx.is_open());
+    set_own(&mut rx, own);
     rx
+}
+
+fn set_own(rx: &mut Receiver, own: Option<&Value>) {
+    let own: Vec<String> =
+        own.and_then(Value::as_array).map(|a| a.iter().filter_map(|c| c.as_str().map(str::to_string)).collect()).unwrap_or_default();
+    rx.set_own_capabilities(&own.iter().map(String::as_str).collect::<Vec<_>>());
 }
 
 fn role_of(v: &Value) -> Role {
@@ -271,6 +287,13 @@ fn check_outcome(name: &str, out: &messages::Outcome, expect: &Value, frame_id: 
         }
         assert_eq!(&got, &expect["link"], "{name}: the link");
     }
+    // A `notif.*` message says what the receiver ended up with (changelog 56): `expect.notif`, the cleaned and cut fields.
+    if let Some(want) = expect.get("notif") {
+        match &out.action {
+            messages::Action::Notif(m) => assert_eq!(&m.to_json(), want, "{name}: what the receiver ends up with"),
+            other => panic!("{name}: expected a notification, got {other:?}"),
+        }
+    }
     // A text that is delivered says whether it is sensitive: `expect.sensitive`, false when the case doesn't say.
     if let messages::Action::DeliverText { sensitive, .. } = &out.action {
         assert_eq!(*sensitive, expect["sensitive"].as_bool().unwrap_or(false), "{name}: sensitive");
@@ -281,7 +304,14 @@ fn run_message_case(case: &Value) {
     let name = case["name"].as_str().unwrap();
     let role = role_of(&case["to"]);
     let mut dedup = MemoryDedup::default();
-    let mut rx = if case["state"] == "open" { open_receiver(role, &mut dedup) } else { Receiver::new(role) };
+    let (own, peer) = (case.get("own"), case.get("peer"));
+    let mut rx = if case["state"] == "open" {
+        open_receiver_with(role, &mut dedup, own, peer)
+    } else {
+        let mut rx = Receiver::new(role);
+        set_own(&mut rx, own);
+        rx
+    };
     let (input, id) = input_of(case);
     let out = match &input {
         Input::Text(bytes) => rx.handle_frame(Frame::Text(bytes), &mut dedup),
@@ -354,6 +384,21 @@ const MESSAGES_INVALID_SCOPE_1_2: &[&str] = &["text-*", "clipboard-*"];
 const MESSAGES_VALID_SCOPE_2B1: &[&str] = &["link-*"];
 const MESSAGES_INVALID_SCOPE_2B1: &[&str] = &["link-*"];
 const MESSAGES_SEQUENCE_SCOPE_2B1: &[&str] = &["link-*"];
+/// 2B.2 (notifications, changelog 56): the `notif-*` cases.
+const MESSAGES_VALID_SCOPE_2B2: &[&str] = &["notif-*"];
+const MESSAGES_INVALID_SCOPE_2B2: &[&str] = &["notif-*"];
+const MESSAGES_SEQUENCE_SCOPE_2B2: &[&str] = &[
+    "notif-dropped-when-feature-off-is-silent",
+    "notif-capability-changes-with-a-new-hello",
+    "notif-not-sent-without-capability-receiver-side",
+    "notif-is-not-in-the-dedup-memory",
+    "notif-action-is-acked-and-a-repeat-is-not-run-twice",
+    "notif-action-is-not-resent-after-reconnect",
+    "notif-post-after-reconnect-needs-the-hellos-again",
+    "notif-sync-removes-the-rest",
+    "notif-invalid-post-keeps-the-connection-open",
+    "notif-status-then-icon-then-post",
+];
 const MESSAGES_SEQUENCE_SCOPE_1_2: &[&str] =
     &["handshake-then-text-then-duplicate", "invalid-message-keeps-connection-open", "rejected-message-id-is-not-remembered"];
 
@@ -388,9 +433,14 @@ fn names(cases: &Value) -> Vec<&str> {
 #[test]
 fn messages_valid_and_invalid() {
     let root = load("messages.json");
-    let valid = with(&with(&with(MESSAGES_VALID_SCOPE, MESSAGES_VALID_SCOPE_1_2), MESSAGES_VALID_SCOPE_1_3), MESSAGES_VALID_SCOPE_2B1);
-    let invalid =
-        with(&with(&with(MESSAGES_INVALID_SCOPE, MESSAGES_INVALID_SCOPE_1_2), MESSAGES_INVALID_SCOPE_1_3), MESSAGES_INVALID_SCOPE_2B1);
+    let valid = with(
+        &with(&with(&with(MESSAGES_VALID_SCOPE, MESSAGES_VALID_SCOPE_1_2), MESSAGES_VALID_SCOPE_1_3), MESSAGES_VALID_SCOPE_2B1),
+        MESSAGES_VALID_SCOPE_2B2,
+    );
+    let invalid = with(
+        &with(&with(&with(MESSAGES_INVALID_SCOPE, MESSAGES_INVALID_SCOPE_1_2), MESSAGES_INVALID_SCOPE_1_3), MESSAGES_INVALID_SCOPE_2B1),
+        MESSAGES_INVALID_SCOPE_2B2,
+    );
     for (key, scope) in [("valid", valid.as_slice()), ("invalid", invalid.as_slice())] {
         assert_patterns_match(key, scope, &names(&root[key]));
         let mut run = 0;
@@ -434,8 +484,14 @@ fn messages_1_2_scope_is_what_the_readme_says() {
 fn messages_sequences() {
     let root = load("messages.json");
     let scope = with(
-        &with(&with(&with(MESSAGES_SEQUENCE_SCOPE, MESSAGES_SEQUENCE_SCOPE_1_2), MESSAGES_SEQUENCE_SCOPE_1_3), MESSAGES_SEQUENCE_SCOPE_1_4),
-        MESSAGES_SEQUENCE_SCOPE_2B1,
+        &with(
+            &with(
+                &with(&with(MESSAGES_SEQUENCE_SCOPE, MESSAGES_SEQUENCE_SCOPE_1_2), MESSAGES_SEQUENCE_SCOPE_1_3),
+                MESSAGES_SEQUENCE_SCOPE_1_4,
+            ),
+            MESSAGES_SEQUENCE_SCOPE_2B1,
+        ),
+        MESSAGES_SEQUENCE_SCOPE_2B2,
     );
     assert_patterns_match("sequences", &scope, &names(&root["sequences"]));
     let mut with_events = 0;
@@ -483,6 +539,13 @@ fn messages_sequences() {
                 Input::Text(bytes) => rx.handle_frame(Frame::Text(bytes), dedup),
                 Input::Binary => rx.handle_frame(Frame::Binary, dedup),
             };
+            // A `hello` that was accepted also tells what its sender lists when that side is the receiver (changelog 56): the other receiver's own list.
+            if step["frame"]["type"] == "hello" && matches!(out.action, messages::Action::HandshakeOk) {
+                let sender_role = if step["from"] == "phone" { "phone" } else { "pc" };
+                let (sender_rx, _) =
+                    receivers.entry(sender_role).or_insert_with(|| (Receiver::new(role_of(&json!(sender_role))), MemoryDedup::default()));
+                set_own(sender_rx, step["frame"].get("capabilities"));
+            }
             check_outcome(&format!("{seq_name} step {}", i + 1), &out, &step["expect"], id.as_deref());
         }
     }
@@ -794,4 +857,282 @@ async fn pair_oversize_body_wins_over_content_type() {
     let request = json!({ "method": "POST", "path": "/v1/pair", "headers": { "Content-Type": "text/plain" }, "bodyBytes": 1_048_576 });
     let (status, _, body) = send_in_process(&env, &client_id, &request).await;
     assert_eq!((status, body["error"].as_str()), (400, Some("bad_request")));
+}
+
+// ----- notif.json and the notif-* cases (2B.2, changelog 56) ------------------------------------------------------------------
+
+use kin_lib::mirror::{args as toast_args, limits as mirror_limits, wire};
+
+/// The `notif-*` cases are in the runs above. This pins how many there are, so a dropped vector is noticed here.
+#[test]
+fn notif_scope_is_what_the_readme_says() {
+    let root = load("messages.json");
+    for (key, scope, at_least) in [
+        ("valid", MESSAGES_VALID_SCOPE_2B2, 30),
+        ("invalid", MESSAGES_INVALID_SCOPE_2B2, 55),
+        ("sequences", MESSAGES_SEQUENCE_SCOPE_2B2, 10),
+    ] {
+        assert_patterns_match(key, scope, &names(&root[key]));
+        let n = root[key].as_array().unwrap().iter().filter(|c| matches(c["name"].as_str().unwrap(), scope)).count();
+        assert!(n >= at_least, "messages.json {key}[]: {n} notif cases, expected at least {at_least}");
+    }
+    // Only notif.action is acked; the other six are ephemeral and never get a reply.
+    for c in root["valid"].as_array().unwrap().iter().filter(|c| c["name"].as_str().unwrap().starts_with("notif-")) {
+        let ty = c["frame"]["type"].as_str().unwrap();
+        let acked = c["expect"]["action"] != "notif_dropped" && ty == "notif.action";
+        assert_eq!(c["expect"]["reply"], if acked { "ack" } else { "none" }, "{}", c["name"]);
+    }
+    let notif = load("notif.json");
+    for key in [
+        "nid",
+        "iconHash",
+        "icon",
+        "clean",
+        "post",
+        "code",
+        "toastIds",
+        "toastArguments",
+        "rate",
+        "coalesce",
+        "sendNotif",
+        "syncDiff",
+        "toastLabel",
+    ] {
+        assert!(!notif[key].as_array().unwrap().is_empty(), "notif.json {key}[]");
+    }
+}
+
+fn limits_match(notif: &Value) {
+    let l = &notif["limits"];
+    let pairs: [(&str, usize); 17] = [
+        ("app", wire::MAX_APP),
+        ("title", wire::MAX_TITLE),
+        ("text", wire::MAX_TEXT),
+        ("bigText", wire::MAX_BIG_TEXT),
+        ("subText", wire::MAX_SUB_TEXT),
+        ("conversation", wire::MAX_CONVERSATION),
+        ("messageSender", wire::MAX_MESSAGE_SENDER),
+        ("messageText", wire::MAX_MESSAGE_TEXT),
+        ("line", wire::MAX_LINE),
+        ("hint", wire::MAX_HINT),
+        ("label", wire::MAX_LABEL),
+        ("messages", wire::MAX_MESSAGES),
+        ("lines", wire::MAX_LINES),
+        ("actions", wire::MAX_ACTIONS),
+        ("nids", wire::MAX_SYNC_NIDS),
+        ("actionText", wire::MAX_ACTION_TEXT),
+        ("iconBytes", wire::MAX_ICON_BYTES),
+    ];
+    for (key, value) in pairs {
+        assert_eq!(l[key], value, "limits.{key}");
+    }
+    assert_eq!(l["frameBytes"], wire::MAX_FRAME_BYTES);
+    assert_eq!(l["iconFrameBytes"], wire::MAX_ICON_FRAME_BYTES);
+    assert_eq!((l["iconMin"].as_u64(), l["iconMax"].as_u64()), (Some(24), Some(128)));
+}
+
+fn base64_url_decode(text: &str) -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(text).expect("valid base64url")
+}
+
+#[test]
+fn notif_json_nid_icons_codes_and_cleaning() {
+    let notif = load("notif.json");
+    limits_match(&notif);
+    for c in notif["nid"].as_array().unwrap() {
+        let name = c["name"].as_str().unwrap();
+        assert_eq!(wire::nid_of_key(c["key"].as_str().unwrap()), c["nid"].as_str().unwrap(), "nid {name}");
+    }
+    for c in notif["iconHash"].as_array().unwrap() {
+        let name = c["name"].as_str().unwrap();
+        let bytes = base64_url_decode(c["png"].as_str().unwrap());
+        assert_eq!(bytes.len() as u64, c["bytes"].as_u64().unwrap(), "iconHash {name}");
+        assert_eq!(wire::hex32(&sha256(&bytes)), c["hash"].as_str().unwrap(), "iconHash {name}");
+        assert_eq!(base64url(&bytes), c["png"].as_str().unwrap(), "iconHash {name}: written without padding");
+    }
+    for c in notif["code"].as_array().unwrap() {
+        assert_eq!(wire::valid_code(c["input"].as_str().unwrap()), c["valid"].as_bool().unwrap(), "code {}", c["name"]);
+    }
+    let max_of = |field: &str| match field {
+        "app" => wire::MAX_APP,
+        "title" => wire::MAX_TITLE,
+        "text" => wire::MAX_TEXT,
+        "bigText" => wire::MAX_BIG_TEXT,
+        "subText" => wire::MAX_SUB_TEXT,
+        "conversation" => wire::MAX_CONVERSATION,
+        "messageSender" => wire::MAX_MESSAGE_SENDER,
+        "messageText" => wire::MAX_MESSAGE_TEXT,
+        "line" => wire::MAX_LINE,
+        "hint" => wire::MAX_HINT,
+        "label" => wire::MAX_LABEL,
+        other => panic!("unknown field {other}"),
+    };
+    for c in notif["clean"].as_array().unwrap() {
+        let name = c["name"].as_str().unwrap();
+        let got = links::clean_link_text(c["input"].as_str().unwrap(), max_of(c["field"].as_str().unwrap()));
+        assert_eq!(got.as_deref(), c["expected"].as_str(), "clean {name}");
+    }
+}
+
+/// `icon[]`: a `notif.icon` frame through the real receiver.
+#[test]
+fn notif_json_icons_through_the_receiver() {
+    let notif = load("notif.json");
+    for c in notif["icon"].as_array().unwrap() {
+        let name = c["name"].as_str().unwrap();
+        let mut frame = json!({ "type": "notif.icon", "id": "icon-case" });
+        if let Some(h) = c.get("hash") {
+            frame["hash"] = h.clone();
+        }
+        if let Some(file) = c.get("pngFile").and_then(Value::as_str) {
+            frame["png"] = json!(base64url(&std::fs::read(protocol_dir().join(file)).unwrap()));
+        } else if let Some(p) = c.get("png") {
+            frame["png"] = p.clone();
+        }
+        let mut dedup = MemoryDedup::default();
+        let mut rx = open_receiver_with(Role::Pc, &mut dedup, Some(&json!(["notif"])), Some(&json!(["notif"])));
+        let out = rx.handle_frame(Frame::Text(frame.to_string().as_bytes()), &mut dedup);
+        let got = match (&out.action, out.reply.as_ref().and_then(|r| r["code"].as_str())) {
+            (messages::Action::Notif(wire::NotifMsg::Icon { .. }), None) => "accepted",
+            (messages::Action::NotifDropped(messages::NotifDrop::BadIcon), None) => "dropped",
+            (_, Some("bad_request")) => "bad_request",
+            (other, code) => panic!("{name}: {other:?} {code:?}"),
+        };
+        assert_eq!(got, c["expect"].as_str().unwrap(), "icon {name}");
+        assert!(out.reply.is_none() || got == "bad_request", "{name}: an icon is never acked");
+    }
+}
+
+/// `post[]`: cases in the format of `messages.json`, run as the others are.
+#[test]
+fn notif_json_posts_through_the_receiver() {
+    let notif = load("notif.json");
+    let cases = notif["post"].as_array().unwrap();
+    assert!(cases.len() >= 70, "{} post cases", cases.len());
+    for case in cases {
+        run_message_case(case);
+    }
+}
+
+#[test]
+fn notif_json_toast_names_and_arguments() {
+    use toast_args::{ToastAction, ToastArgs};
+    let notif = load("notif.json");
+    for c in notif["toastIds"].as_array().unwrap() {
+        let name = c["name"].as_str().unwrap();
+        let (short, nid) = (c["shortId"].as_str().unwrap(), c["nid"].as_str().unwrap());
+        assert_eq!(toast_args::tag_of(nid), c["tag"].as_str().unwrap(), "{name}");
+        assert_eq!(toast_args::group_of(short), c["group"].as_str().unwrap(), "{name}");
+        assert_eq!(ToastArgs::new(short, nid, ToastAction::Tap, None).to_arguments(), c["launch"].as_str().unwrap(), "{name}");
+        assert_eq!(ToastArgs::new(short, nid, ToastAction::Copy, None).to_arguments(), c["copy"].as_str().unwrap(), "{name}");
+        let reply_i = c["reply"]["i"].as_u64().unwrap() as u8;
+        assert_eq!(
+            ToastArgs::new(short, nid, ToastAction::Reply, Some(reply_i)).to_arguments(),
+            c["reply"]["arguments"].as_str().unwrap(),
+            "{name}"
+        );
+        let button_i = c["button"]["i"].as_u64().unwrap() as u8;
+        assert_eq!(
+            ToastArgs::new(short, nid, ToastAction::Button, Some(button_i)).to_arguments(),
+            c["button"]["arguments"].as_str().unwrap(),
+            "{name}"
+        );
+    }
+    for c in notif["toastArguments"].as_array().unwrap() {
+        let name = c["name"].as_str().unwrap();
+        let got = toast_args::parse(c["input"].as_str().unwrap());
+        match c["valid"].as_bool().unwrap() {
+            false => assert_eq!(got, None, "toastArguments {name}"),
+            true => {
+                let got = got.unwrap_or_else(|| panic!("toastArguments {name}: refused"));
+                let want = &c["parsed"];
+                assert_eq!(got.device, want["d"].as_str().unwrap(), "{name}");
+                assert_eq!(got.nid, want["n"].as_str().unwrap(), "{name}");
+                assert_eq!(got.index.map(u64::from), want["i"].as_u64(), "{name}");
+                let word = match got.action {
+                    ToastAction::Tap => "tap",
+                    ToastAction::Reply => "reply",
+                    ToastAction::Copy => "copy",
+                    ToastAction::Button => "btn",
+                };
+                assert_eq!(word, want["a"].as_str().unwrap(), "{name}");
+            }
+        }
+    }
+}
+
+/// `rate[]` for the PC's limiter (the phone's budget is the phone's own).
+#[test]
+fn notif_json_the_pcs_rate_limits() {
+    let notif = load("notif.json");
+    let mut ran = 0;
+    for c in notif["rate"].as_array().unwrap() {
+        if c["limiter"] != "pc" {
+            continue;
+        }
+        let name = c["name"].as_str().unwrap();
+        let mut limiter = mirror_limits::PostLimiter::default();
+        let (mut got, mut errors) = (Vec::new(), Vec::new());
+        for e in c["events"].as_array().unwrap() {
+            let t = e["t"].as_u64().unwrap();
+            // A stand-in for the payload: any stable hash of the case's content word.
+            let content =
+                e["content"].as_str().unwrap().bytes().fold(14695981039346656037u64, |h, b| (h ^ u64::from(b)).wrapping_mul(1099511628211));
+            got.push(match limiter.post(t, e["nid"].as_str().unwrap(), content) {
+                mirror_limits::Verdict::Accepted => "accepted",
+                mirror_limits::Verdict::IgnoredDuplicate => "ignored_duplicate",
+                mirror_limits::Verdict::DroppedRate { send_error } => {
+                    if send_error {
+                        errors.push(t);
+                    }
+                    "dropped_rate"
+                }
+            });
+        }
+        let want: Vec<&str> = c["expect"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(got, want, "rate {name}");
+        let want_errors: Vec<u64> = c["errorsAt"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+        assert_eq!(errors, want_errors, "rate {name}: when the rate_limited errors go");
+        ran += 1;
+    }
+    assert!(ran >= 6, "{ran} PC rate cases");
+}
+
+/// `sendNotif[]` and `syncDiff[]`.
+#[test]
+fn notif_json_when_to_send_and_what_a_sync_removes() {
+    let notif = load("notif.json");
+    for c in notif["sendNotif"].as_array().unwrap() {
+        let name = c["name"].as_str().unwrap();
+        let mut dedup = MemoryDedup::default();
+        let mut rx = Receiver::new(Role::Phone);
+        for h in c["hellos"].as_array().unwrap() {
+            let mut hello = json!({ "type": "hello", "id": "h", "protocol": 1, "name": "X", "platform": "windows", "appVersion": "0.2.0" });
+            for (k, v) in h.as_object().unwrap() {
+                hello[k] = v.clone();
+            }
+            let out = rx.handle_frame(Frame::Text(hello.to_string().as_bytes()), &mut dedup);
+            assert!(matches!(out.action, messages::Action::HandshakeOk), "{name}");
+        }
+        let may = rx.peer().is_some_and(|p| p.has(wire::CAPABILITY));
+        assert_eq!(if may { "send" } else { "nothing" }, c["expected"].as_str().unwrap(), "{name}");
+    }
+    for c in notif["syncDiff"].as_array().unwrap() {
+        let strings = |k: &str| c[k].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(kin_lib::mirror::sync_remove(&strings("shown"), &strings("nids")), strings("remove"), "syncDiff {}", c["name"]);
+    }
+}
+
+/// `toastLabel[]`: a hint or a button label as it is on the toast and in `notif.action.label`.
+#[test]
+fn notif_json_a_label_in_the_form_of_the_toast() {
+    let notif = load("notif.json");
+    let cases = notif["toastLabel"].as_array().unwrap();
+    assert!(cases.len() >= 10);
+    for c in cases {
+        let got = kin_lib::mirror::toast_xml::toast_label(c["input"].as_str().unwrap());
+        assert_eq!(got, c["expected"].as_str().unwrap(), "toastLabel {}", c["name"]);
+        assert_eq!(kin_lib::mirror::toast_xml::toast_label(&got), got, "idempotent: {}", c["name"]);
+    }
 }

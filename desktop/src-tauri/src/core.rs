@@ -205,6 +205,8 @@ pub struct Core {
     pub hooks: Hooks,
     /// The queue of 1.4 (queue.rs).
     pub(crate) queue: crate::queue::QueueState,
+    /// Phone notifications on the PC (2B.2, mirror/). In memory only, and nothing of a notification is ever stored.
+    pub(crate) mirror: crate::mirror::Mirror,
     pub(crate) next_toast_id: AtomicU32,
     pub(crate) clipboard: Arc<dyn Clipboard>,
     pub(crate) opener: Arc<dyn UrlOpener>,
@@ -280,6 +282,7 @@ impl Core {
             transfers: Transfers::default(),
             hooks: hooks_of(&config_for_hooks),
             queue: crate::queue::QueueState::default(),
+            mirror: crate::mirror::Mirror::new(&config_for_hooks.data_dir),
             next_toast_id: AtomicU32::new(0),
             clipboard: services.clipboard,
             opener: services.opener,
@@ -392,6 +395,7 @@ impl Core {
             "lastReceived": sync["lastReceived"],
             "clipboardSync": sync["clipboardSync"],
             "transfers": self.transfers_status(),
+            "mirror": { "view": self.mirror_view(), "counts": self.mirror.counters_json() },
             "updatedAtMs": unix_ms(),
         })
     }
@@ -634,6 +638,7 @@ impl Core {
     pub fn remove_device(&self, device_id: &str) -> Result<bool> {
         let removed = self.db.remove_device(device_id)?;
         let _ = self.db.delete_pending_cancels_of(device_id);
+        self.mirror_forget_device(device_id);
         log::info!("device {} removed: {removed}", short(device_id));
         self.connections.revoke(device_id);
         self.emit(Event::PairingChanged);

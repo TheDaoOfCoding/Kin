@@ -56,6 +56,8 @@ opt-level = "s"
 strip = true
 
 [target."cfg(windows)".dependencies]
+# The `implement` macro (the toast activator class) expands to paths in `windows_core`, so it is a direct dependency, pinned to the same version.
+windows-core = "=0.62.2"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
@@ -81,4 +83,9 @@ windows = { version = "0.62.2", features = [
     "Win32_System_IO",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_UI_Notifications",
+    "UI_Notifications",
+    "Data_Xml_Dom",
+    "Foundation",
+    "Foundation_Collections",
 ] }

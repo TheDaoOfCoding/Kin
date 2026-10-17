@@ -325,6 +325,16 @@ pub trait Clipboard: Send + Sync {
     fn clear_if_text(&self, _expected: &str) -> Result<bool> {
         Err("this clipboard can't be cleared".into())
     }
+    /// The clipboard's own change counter (`GetClipboardSequenceNumber`), which goes up with every change by anyone. `None` for a clipboard that
+    /// has none. The one-time code's 60-second clear (`mirror/otp_clip.rs`) uses it to be sure nothing was copied since.
+    fn sequence_number(&self) -> Option<u32> {
+        None
+    }
+    /// Like [`Clipboard::clear_if_text`], and also only if the change counter is still `sequence` (when it is given): the check of both and the
+    /// clearing are one step. `true` if it was emptied.
+    fn clear_if_text_unchanged(&self, expected: &str, _sequence: Option<u32>) -> Result<bool> {
+        self.clear_if_text(expected)
+    }
     /// Puts the image in this file on the clipboard (see `images.rs`). The default is for clipboards that can't.
     fn write_image_file(&self, _path: &std::path::Path) -> Result<ImageOutcome> {
         Ok(ImageOutcome::Skipped("this clipboard can't hold images".to_string()))
@@ -351,6 +361,8 @@ pub struct MemoryClipboard {
     writes: Mutex<Vec<String>>,
     sensitive_writes: Mutex<Vec<String>>,
     images: Mutex<Vec<std::path::PathBuf>>,
+    /// Goes up with every change, like the real clipboard's counter.
+    sequence: std::sync::atomic::AtomicU32,
 }
 
 impl MemoryClipboard {
@@ -362,6 +374,7 @@ impl MemoryClipboard {
     }
 
     fn notify(&self) {
+        self.sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         for tx in self.listeners.lock().unwrap_or_else(|p| p.into_inner()).iter() {
             let _ = tx.send(());
         }
@@ -423,9 +436,19 @@ impl Clipboard for MemoryClipboard {
     }
 
     fn clear_if_text(&self, expected: &str) -> Result<bool> {
+        self.clear_if_text_unchanged(expected, None)
+    }
+
+    fn sequence_number(&self) -> Option<u32> {
+        Some(self.sequence.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn clear_if_text_unchanged(&self, expected: &str, sequence: Option<u32>) -> Result<bool> {
         {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            if state.text.as_deref() != Some(expected) {
+            if state.text.as_deref() != Some(expected)
+                || sequence.is_some_and(|s| s != self.sequence.load(std::sync::atomic::Ordering::SeqCst))
+            {
                 return Ok(false);
             }
             *state = ClipSnapshot::default();
@@ -454,7 +477,8 @@ mod win {
     use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::DataExchange::{
         AddClipboardFormatListener, CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardFormatNameW,
-        IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, RemoveClipboardFormatListener, SetClipboardData,
+        GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, RemoveClipboardFormatListener,
+        SetClipboardData,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock};
@@ -744,9 +768,22 @@ mod win {
             self.write_text_marked(text, &[(super::EXCLUDE_FROM_MONITOR, 1), (CAN_INCLUDE_IN_HISTORY, 0), (CAN_UPLOAD_TO_CLOUD, 0)])
         }
 
+        fn sequence_number(&self) -> Option<u32> {
+            // SAFETY: a plain call with no arguments.
+            Some(unsafe { GetClipboardSequenceNumber() })
+        }
+
         fn clear_if_text(&self, expected: &str) -> Result<bool> {
+            self.clear_if_text_unchanged(expected, None)
+        }
+
+        fn clear_if_text_unchanged(&self, expected: &str, sequence: Option<u32>) -> Result<bool> {
             // One open of the clipboard for the look and the clearing, so a copy by the user can't land in between.
             let _open = Open::new(self.hwnd())?;
+            // SAFETY: a plain call with no arguments.
+            if sequence.is_some_and(|s| s != unsafe { GetClipboardSequenceNumber() }) {
+                return Ok(false);
+            }
             // SAFETY: the clipboard is open for the rest of this function.
             let has_text = unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) }.is_ok();
             let text = if has_text { global_bytes(CF_UNICODETEXT, MAX_READ_BYTES).map(|b| text_of(&b)) } else { None };

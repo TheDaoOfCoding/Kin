@@ -38,7 +38,14 @@ pub enum ConnCommand {
         frame: serde_json::Value,
         reply: oneshot::Sender<SendOutcome>,
     },
-    /// Send a new `hello` (the name of this PC changed).
+    /// Send a `notif.*` message (changelog 56): only to a peer whose latest `hello` lists `notif` (else it is dropped, and `reply` hears `NotConnected`).
+    /// With no `reply` it is ephemeral (`notif.dismiss`: never acked, never re-sent). With a `reply` it is a `notif.action`: the `ack` or `error` is
+    /// reported, no `ack` in 5 seconds is `NoReply` **without** closing the connection, and it is never sent again.
+    Notif {
+        frame: serde_json::Value,
+        reply: Option<oneshot::Sender<SendOutcome>>,
+    },
+    /// Send a new `hello` (the name of this PC changed, or the setting "Show phone notifications" did).
     Hello,
     /// Tell the phone it was removed: an `unpair` message, then close after the `ack` (or 5 seconds).
     Unpair,
@@ -49,6 +56,8 @@ struct Entry {
     tx: UnboundedSender<ConnCommand>,
     /// When the phone's `hello` was accepted. A connection counts as connected only from then on.
     open_since: Option<Instant>,
+    /// The `capabilities` of the phone's latest accepted `hello` of this connection.
+    capabilities: Vec<String>,
 }
 
 #[derive(Default)]
@@ -66,7 +75,7 @@ impl Connections {
     pub fn register(&self, device_id: &str) -> (u64, UnboundedReceiver<ConnCommand>) {
         let conn_id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = unbounded_channel();
-        let old = self.map().insert(device_id.to_string(), Entry { conn_id, tx, open_since: None });
+        let old = self.map().insert(device_id.to_string(), Entry { conn_id, tx, open_since: None, capabilities: Vec::new() });
         if let Some(old) = old {
             let _ = old.tx.send(ConnCommand::Close { code: CLOSE_REPLACED, reason: "replaced by a new connection" });
         }
@@ -77,6 +86,18 @@ impl Connections {
         if let Some(e) = self.map().get_mut(device_id).filter(|e| e.conn_id == conn_id) {
             e.open_since.get_or_insert_with(Instant::now);
         }
+    }
+
+    /// Remembers what the phone's latest accepted `hello` listed (every accepted `hello` replaces it).
+    pub fn set_capabilities(&self, device_id: &str, conn_id: u64, capabilities: &[String]) {
+        if let Some(e) = self.map().get_mut(device_id).filter(|e| e.conn_id == conn_id) {
+            e.capabilities = capabilities.to_vec();
+        }
+    }
+
+    /// Whether this device is connected (its `hello` was accepted) and its latest `hello` lists the capability.
+    pub fn has_capability(&self, device_id: &str, capability: &str) -> bool {
+        self.map().get(device_id).is_some_and(|e| e.open_since.is_some() && e.capabilities.iter().any(|c| c == capability))
     }
 
     /// Forgets a connection that ended. `false` if a newer one has taken its place already.
@@ -127,6 +148,14 @@ impl Connections {
     /// Every open connection gets a new `hello` (the PC's name changed).
     pub fn send_hello_to_all(&self) {
         for e in self.map().values().filter(|e| e.open_since.is_some()) {
+            let _ = e.tx.send(ConnCommand::Hello);
+        }
+    }
+
+    /// Every open connection whose peer's latest `hello` lists `capability` gets a new `hello` (the PC's own list of capabilities changed: a peer that
+    /// doesn't list it has nothing to learn from it).
+    pub fn send_hello_to_capable(&self, capability: &str) {
+        for e in self.map().values().filter(|e| e.open_since.is_some() && e.capabilities.iter().any(|c| c == capability)) {
             let _ = e.tx.send(ConnCommand::Hello);
         }
     }

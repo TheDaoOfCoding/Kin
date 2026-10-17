@@ -101,6 +101,8 @@ pub fn run(parsed: Parsed) {
             ui::set_auto_clipboard_sync,
             ui::set_images_to_clipboard,
             ui::set_open_links_automatically,
+            ui::set_mirror_notifications,
+            ui::set_mirror_option,
             ui::choose_received_folder,
             ui::reset_received_folder,
             ui::set_hotkey,
@@ -127,6 +129,10 @@ pub fn run(parsed: Parsed) {
         RunEvent::ExitRequested { api, code, .. } if code.is_none() => api.prevent_exit(),
         RunEvent::Exit => {
             if let Some(state) = app.try_state::<AppState>() {
+                // A one-time code that is still on the clipboard goes now if nothing else was copied (design 5.7). A copy beside the installed Kin takes
+                // every registry key it made with it; the installed Kin keeps its own (they are how a click on a toast finds Kin again).
+                state.core.mirror_clear_code_now();
+                state.core.mirror_stop(state.core.config.instance_key().is_some());
                 write_status(&state.core, true);
             }
             log::info!("Kin stopped");
@@ -232,6 +238,9 @@ fn setup(app: &mut tauri::App, parsed: Parsed, aumid: std::result::Result<(), St
     });
     integrate_with_windows(&core, for_integration, loaded.created);
     register_native_host(&core);
+    // Phone notifications (2B.2): the toast layer, the registry keys and the COM class, only while the switch is on.
+    core.mirror.set_runtime(tauri::async_runtime::block_on(async { tokio::runtime::Handle::current() }));
+    core.mirror_start();
 
     let handle = app.handle().clone();
     tauri::async_runtime::spawn(event_loop(handle.clone(), core.clone(), events_rx));
@@ -251,6 +260,8 @@ fn setup(app: &mut tauri::App, parsed: Parsed, aumid: std::result::Result<(), St
                 core.expire_queue(crate::encoding::unix_ms() as i64).await;
                 // The send log and the old text bodies are trimmed every hour, not only at start (an app that runs for weeks grows otherwise).
                 core.prune_storage(crate::encoding::unix_ms() as i64);
+                // The icon cache of the phone notifications keeps at most 200 files or 8 MiB.
+                core.mirror.icons().prune();
             }
         });
     }
@@ -714,6 +725,10 @@ pub fn handle_commands(app: &AppHandle, commands: &[Command]) {
             Command::CancelTransfers => {
                 tauri::async_runtime::spawn(async move { core.cancel_all_transfers().await });
             }
+            Command::DevToast { action, nid, arg } => {
+                let (action, nid, arg) = (action.clone(), nid.clone(), arg.clone());
+                tauri::async_runtime::spawn(async move { core.mirror_dev_toast(&action, &nid, arg).await });
+            }
             Command::DevSetClipboard { text, mark } => {
                 let (text, mark) = (text.clone(), *mark);
                 tauri::async_runtime::spawn(async move { core.dev_set_clipboard(text, mark).await });
@@ -878,6 +893,27 @@ fn dev_set(app: &AppHandle, core: &Arc<Core>, key: &str, value: &str) {
         }
         "openLinksAutomatically" => {
             core.set_open_links_automatically(on);
+            write(true, on.to_string());
+        }
+        // Phone notifications (2B.2): the switch starts the toast layer and registers the instance's own keys (registered under a name of its own, removed at exit).
+        "mirrorNotifications" => {
+            core.set_mirror_notifications(on);
+            write(true, on.to_string());
+        }
+        "mirrorSound" => {
+            core.set_mirror_sound(on);
+            write(true, on.to_string());
+        }
+        "mirrorHideContent" => {
+            core.set_mirror_hide_content(on);
+            write(true, on.to_string());
+        }
+        "mirrorDismissToPhone" => {
+            core.set_mirror_dismiss_to_phone(on);
+            write(true, on.to_string());
+        }
+        "mirrorTextOnly" => {
+            core.set_mirror_text_only(on);
             write(true, on.to_string());
         }
         "receivedFolder" => match core.set_received_folder(Some(value)) {

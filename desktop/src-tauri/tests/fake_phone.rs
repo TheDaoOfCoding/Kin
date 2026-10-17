@@ -844,9 +844,21 @@ fn text_toasts(events: &[Event]) -> Vec<(String, String, bool)> {
         .iter()
         .filter_map(|e| match e {
             Event::TextToast { from, preview, has_link, .. } => Some((from.clone(), preview.clone(), *has_link)),
+            // A text that is a web address is shown like a link from the phone (2B.1 review, carry-over b): the real address first, Open and Copy.
+            Event::LinkToast { title, body, .. } => {
+                Some((title.strip_prefix("Link from ").unwrap_or(title).to_string(), body.clone(), true))
+            }
             _ => None,
         })
         .collect()
+}
+
+/// The id of the toast of a text that is a web address.
+fn link_toast_id(events: &[Event]) -> Option<u32> {
+    events.iter().find_map(|e| match e {
+        Event::LinkToast { id, .. } => Some(*id),
+        _ => None,
+    })
 }
 
 #[tokio::test]
@@ -948,13 +960,11 @@ async fn a_link_toast_opens_the_link_when_clicked_and_only_for_http_and_https() 
     let core = w.env.core.clone();
     wait_until("the toast", || core.status_json()["lastReceived"]["text"]["id"] == "l1").await;
     let events = drain(&mut w.env.events);
-    let id = events
-        .iter()
-        .find_map(|e| match e {
-            Event::TextToast { id, has_link: true, .. } => Some(*id),
-            _ => None,
-        })
-        .expect("a toast with a link");
+    let id = link_toast_id(&events).expect("a toast with a link");
+    assert!(
+        matches!(events.iter().find(|e| matches!(e, Event::LinkToast { .. })), Some(Event::LinkToast { title, body, opened: false, .. }) if title == "Link from Test Phone" && body == "example.com"),
+        "shown like a link: the real address, Open and Copy"
+    );
     assert!(w.opener_opened().is_empty(), "nothing opens before the click");
     assert!(w.core().toast_clicked(id));
     assert_eq!(w.opener_opened(), ["https://example.com/a?b=c#d"]);
@@ -1244,13 +1254,7 @@ async fn the_text_of_the_clipboard_never_reaches_the_log_or_status_json() {
     next_json(&mut ws).await;
     let core = w.env.core.clone();
     wait_until("the link toast", || core.status_json()["lastReceived"]["text"]["id"] == "s2").await;
-    let id = drain(&mut w.env.events)
-        .iter()
-        .find_map(|e| match e {
-            Event::TextToast { id, has_link: true, .. } => Some(*id),
-            _ => None,
-        })
-        .expect("a link toast");
+    let id = link_toast_id(&drain(&mut w.env.events)).expect("a link toast");
     assert!(w.core().toast_clicked(id));
 
     w.env.clipboard.user_copy(flagged, vec![ClipFormat::named(EXCLUDE_FROM_MONITOR)]);
@@ -1517,4 +1521,39 @@ async fn the_developer_clipboard_hooks_are_refused_unless_the_app_was_started_wi
     assert_eq!(dev.clipboard.text().as_deref(), Some("changed by a hook"));
     dev.core.dev_get_clipboard().await;
     assert_eq!(std::fs::read_to_string(dev.dir.path().join("dev-clipboard.txt")).unwrap(), "changed by a hook");
+}
+
+/// 2B.1 review, carry-over (b): a text that is a web address is shown like a link from the phone, with the real address first and a warning sign when it
+/// has one; a click on the body of a warned one does not open it, the Open button does; nothing is ever opened by itself.
+#[tokio::test]
+async fn a_text_that_is_a_link_with_a_warning_shows_its_address_and_a_click_does_not_open_it() {
+    let mut w = World::new().await;
+    let mut ws = w.connected().await;
+    drain(&mut w.env.events);
+    // A look-alike (Cyrillic) host: the toast says what a browser would open, marked.
+    send_json(&mut ws, &text_message("w1", "https://\u{430}\u{440}\u{440}\u{4cf}\u{435}.com/login", true)).await;
+    next_json(&mut ws).await;
+    let core = w.env.core.clone();
+    wait_until("the toast", || core.status_json()["lastReceived"]["text"]["id"] == "w1").await;
+    let events = drain(&mut w.env.events);
+    let (id, body) = events
+        .iter()
+        .find_map(|e| match e {
+            Event::LinkToast { id, body, opened: false, .. } => Some((*id, body.clone())),
+            _ => None,
+        })
+        .expect("a link toast");
+    assert_eq!(body, "\u{26a0} xn--80ak6aa92e.com");
+    assert!(w.opener_opened().is_empty(), "nothing opens by itself");
+    assert!(!w.core().toast_action(id, "tap"), "a click on the body of a warned link opens nothing");
+    assert!(w.opener_opened().is_empty());
+    assert!(w.core().toast_action(id, "open"), "the Open button is the user choosing it");
+    assert_eq!(w.opener_opened(), ["https://\u{430}\u{440}\u{440}\u{4cf}\u{435}.com/login"]);
+    // A plain address: a click opens it, as before.
+    send_json(&mut ws, &text_message("w2", "https://example.com/a", true)).await;
+    next_json(&mut ws).await;
+    let core = w.env.core.clone();
+    wait_until("the toast", || core.status_json()["lastReceived"]["text"]["id"] == "w2").await;
+    let id = link_toast_id(&drain(&mut w.env.events)).expect("a link toast");
+    assert!(w.core().toast_action(id, "tap"));
 }

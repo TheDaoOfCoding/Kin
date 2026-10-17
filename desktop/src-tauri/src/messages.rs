@@ -93,6 +93,19 @@ pub enum Action {
         progress: Progress,
     },
     CloseOnly,
+    /// A `notif.*` message (changelog 56) that passed validation. Only `notif.action` was acked (and remembered); the other six are ephemeral.
+    Notif(crate::mirror::wire::NotifMsg),
+    /// A `notif.*` message dropped silently (no reply, no error): the receiver's own `hello` or the sender's didn't list `notif`, or it was an icon that
+    /// failed its checks. Counted.
+    NotifDropped(NotifDrop),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotifDrop {
+    /// Step 6b: one of the two sides didn't list `notif`.
+    Capability,
+    /// A `notif.icon` whose hash, size or picture was wrong.
+    BadIcon,
 }
 
 impl Action {
@@ -114,6 +127,8 @@ impl Action {
             Action::RemovePeerAndClose => "remove_peer_and_close",
             Action::IgnoreDuplicate | Action::RepeatedOffer { .. } => "ignore_duplicate",
             Action::CloseOnly => "close_only",
+            Action::Notif(m) => crate::mirror::wire::vector_name(m),
+            Action::NotifDropped(_) => "notif_dropped",
         })
     }
 }
@@ -234,11 +249,17 @@ pub struct Receiver {
     role: Role,
     state: State,
     peer: Option<Peer>,
+    /// The capabilities of this side's own latest `hello` (what it said it can do), for step 6b of the validation order.
+    own_capabilities: Vec<String>,
 }
 
 /// Message types and which role may receive them. `complete` only goes phone -> PC, `clipboard` and `offer` only
 /// PC -> phone.
 fn receivable(role: Role, ty: &str) -> bool {
+    // A `notif.*` message is received by the side it goes to: the phone sends five of them to the PC, the PC two to the phone.
+    if let Some((phone_sends, _)) = crate::mirror::wire::kind(ty) {
+        return phone_sends == (role == Role::Pc);
+    }
     match ty {
         "hello" | "ack" | "error" | "text" | "link" | "cancel" | "unpair" | "ping" => true,
         "complete" => role == Role::Pc,
@@ -249,7 +270,13 @@ fn receivable(role: Role, ty: &str) -> bool {
 
 impl Receiver {
     pub fn new(role: Role) -> Self {
-        Receiver { role, state: State::BeforeHello, peer: None }
+        Receiver { role, state: State::BeforeHello, peer: None, own_capabilities: Vec::new() }
+    }
+
+    /// What this side lists in its own `hello` (changelog 56: a `notif.*` message is dropped unless both sides list `notif`). The PC sets it from the
+    /// setting every time it sends a `hello`.
+    pub fn set_own_capabilities(&mut self, capabilities: &[&str]) {
+        self.own_capabilities = capabilities.iter().map(|c| c.to_string()).collect();
     }
 
     pub fn is_open(&self) -> bool {
@@ -303,6 +330,9 @@ impl Receiver {
                 Some(CLOSE_UNSUPPORTED_VERSION),
             );
         }
+        if crate::mirror::wire::kind(ty).is_some() {
+            return self.notif(ty, &obj, text.len(), reference, dedup);
+        }
         match ty {
             "hello" => self.hello(&obj, reference),
             "ack" => ack(&obj),
@@ -310,6 +340,37 @@ impl Receiver {
             "ping" | "unpair" | "text" | "link" | "clipboard" | "offer" | "complete" | "cancel" => self.acked(ty, &obj, reference, dedup),
             _ => unreachable!("receivable() only lets known types through"),
         }
+    }
+
+    /// A `notif.*` message: step 6b (dropped silently unless both sides list `notif`), the 32 KiB rule, then the fields (`mirror::wire`). The six ephemeral
+    /// types skip the duplicate check; `notif.action` is acked and remembered like any other acked message.
+    fn notif(&mut self, ty: &str, obj: &Map<String, Value>, frame_bytes: usize, reference: Option<&str>, dedup: &mut dyn Dedup) -> Outcome {
+        use crate::mirror::wire;
+        let capable =
+            self.own_capabilities.iter().any(|c| c == wire::CAPABILITY) && self.peer.as_ref().is_some_and(|p| p.has(wire::CAPABILITY));
+        if !capable {
+            return Outcome { reply: None, action: Action::NotifDropped(NotifDrop::Capability), close: None };
+        }
+        if frame_bytes > wire::frame_limit(ty) {
+            let message = format!("A {ty} message can be at most {} KiB.", wire::frame_limit(ty) / 1024);
+            return Outcome::error("too_large", &message, reference, None);
+        }
+        let msg = match wire::parse(ty, obj) {
+            wire::Parsed::Bad => return bad_fields(reference),
+            wire::Parsed::Drop => return Outcome { reply: None, action: Action::NotifDropped(NotifDrop::BadIcon), close: None },
+            wire::Parsed::Ok(msg) => msg,
+        };
+        let acked = wire::kind(ty).is_some_and(|(_, acked)| acked);
+        let Some(id) = reference.filter(|_| acked) else {
+            return Outcome { reply: None, action: Action::Notif(msg), close: None };
+        };
+        if let Some(first) = dedup.lookup(id) {
+            let reply = serde_json::from_str(&first).unwrap_or_else(|_| ack_message(id));
+            return Outcome { reply: Some(reply), action: Action::IgnoreDuplicate, close: None };
+        }
+        let reply = ack_message(id);
+        dedup.remember(id, &reply.to_string());
+        Outcome { reply: Some(reply), action: Action::Notif(msg), close: None }
     }
 
     fn hello(&mut self, obj: &Map<String, Value>, reference: Option<&str>) -> Outcome {

@@ -367,6 +367,30 @@ pub fn set_open_links_automatically(window: WebviewWindow, state: State<'_, AppS
     Ok(())
 }
 
+/// "Show phone notifications" (2B.2): off by default. Turning it on registers Kin's phone notifications with Windows and starts the toast layer; off removes
+/// the toasts and the registration. The phone is told by a new `hello` either way.
+#[tauri::command]
+pub async fn set_mirror_notifications(window: WebviewWindow, state: State<'_, AppState>, on: bool) -> Result<(), String> {
+    only(&window, &[SETTINGS_WINDOW], "set_mirror_notifications")?;
+    let core = state.core.clone();
+    // Registering with Windows touches the registry and starts threads: not on the thread that runs the window.
+    tauri::async_runtime::spawn_blocking(move || core.set_mirror_notifications(on)).await.map_err(|e| e.to_string())
+}
+
+/// The other switches of "Phone notifications": `sound`, `hideContent`, `dismissToPhone` and `textOnly`.
+#[tauri::command]
+pub fn set_mirror_option(window: WebviewWindow, state: State<'_, AppState>, name: String, on: bool) -> Result<(), String> {
+    only(&window, &[SETTINGS_WINDOW], "set_mirror_option")?;
+    match name.as_str() {
+        "sound" => state.core.set_mirror_sound(on),
+        "hideContent" => state.core.set_mirror_hide_content(on),
+        "dismissToPhone" => state.core.set_mirror_dismiss_to_phone(on),
+        "textOnly" => state.core.set_mirror_text_only(on),
+        other => return Err(format!("no such option: {other}")),
+    }
+    Ok(())
+}
+
 /// "Choose folder…": the Windows folder picker, then the folder is checked and kept. `None` if the user closed the dialog.
 #[tauri::command]
 pub async fn choose_received_folder(window: WebviewWindow, app: AppHandle, state: State<'_, AppState>) -> Result<Option<String>, String> {

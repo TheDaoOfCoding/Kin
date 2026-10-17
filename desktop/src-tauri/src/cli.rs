@@ -24,6 +24,9 @@ pub struct Config {
     /// Developer setting (2B.1): nothing is ever opened (no browser, no Explorer): the app only logs that it would have, with the length of a link and
     /// never the link. For a test run that receives links from the phone and must not open a window.
     pub dev_no_open: bool,
+    /// Developer setting (2B.2): every phone notification goes to the Action Center without a popup and without a sound, so a test never puts a popup on the
+    /// screen of the person at the keyboard.
+    pub dev_toast_quiet: bool,
     /// Developer setting: received files go here instead of `Downloads\Kin` (and instead of `receivedFolder` of settings.json), so
     /// a test never writes to the real Downloads folder.
     pub dev_received_dir: Option<PathBuf>,
@@ -52,6 +55,7 @@ impl Config {
             dev_no_windows: false,
             dev_no_toasts: false,
             dev_no_open: false,
+            dev_toast_quiet: false,
             dev_received_dir: None,
             dev_free_bytes: None,
             dev_clock_offset_secs: None,
@@ -78,6 +82,7 @@ impl Config {
             || self.dev_no_windows
             || self.dev_no_toasts
             || self.dev_no_open
+            || self.dev_toast_quiet
             || self.dev_received_dir.is_some()
             || self.dev_free_bytes.is_some()
             || self.dev_clock_offset_secs.is_some()
@@ -167,6 +172,9 @@ pub enum Command {
     /// Developer hook (1.4): the "Export logs" button without a dialog: write the zip to this path. Refused unless the app was started with a
     /// developer setting.
     DevExportLogs(PathBuf),
+    /// Developer hook (2B.2): what a click, a reply or the X does to a phone notification that is on screen, without Windows: `reply <nid> <text>`, `copy <nid>`,
+    /// `button <nid> <index>`, `dismiss <nid>`. Refused unless the app was started with a developer setting.
+    DevToast { action: String, nid: String, arg: Option<String> },
     /// Quit.
     Quit,
 }
@@ -191,6 +199,7 @@ impl Command {
             Command::DevExportLogs(_) => "dev export logs",
             Command::DevSet { .. } => "dev set",
             Command::DevHistory { .. } => "dev history",
+            Command::DevToast { .. } => "dev toast",
             Command::Quit => "quit",
         }
     }
@@ -233,6 +242,7 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
     let mut no_windows = truthy(env("KIN_DEV_NO_WINDOWS"));
     let mut no_toasts = truthy(env("KIN_DEV_NO_TOASTS"));
     let mut no_open = truthy(env("KIN_DEV_NO_OPEN"));
+    let mut toast_quiet = truthy(env("KIN_DEV_TOAST_QUIET"));
     let mut received_dir = env("KIN_DEV_RECEIVED_DIR").map(PathBuf::from);
     let mut free_bytes = env("KIN_DEV_FREE_BYTES");
     let mut clock_offset = env("KIN_DEV_CLOCK_OFFSET");
@@ -257,6 +267,16 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
             "--dev-no-windows" => no_windows = true,
             "--dev-no-toasts" => no_toasts = true,
             "--dev-no-open" => no_open = true,
+            "--dev-toast-quiet" => toast_quiet = true,
+            // What COM adds to the command line when a click on a toast starts Kin (`mirror/registration.rs`): Kin starts as usual and the click reaches the
+            // class it registers.
+            "--toast-activated" | "-Embedding" => {}
+            "--dev-toast" => {
+                let action = value(name)?;
+                let nid = it.next().cloned().ok_or_else(|| "--dev-toast needs an action and a nid".to_string())?;
+                let arg = it.next_if(|a| !a.starts_with("--")).cloned();
+                commands.push(Command::DevToast { action, nid, arg });
+            }
             "--dev-received-dir" => received_dir = Some(PathBuf::from(value(name)?)),
             "--dev-free-bytes" => free_bytes = Some(value(name)?),
             "--dev-clock-offset" => clock_offset = Some(value(name)?),
@@ -349,6 +369,7 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
     config.dev_no_windows = no_windows;
     config.dev_no_toasts = no_toasts;
     config.dev_no_open = no_open;
+    config.dev_toast_quiet = toast_quiet;
     config.dev_received_dir = received_dir;
     if let Some(v) = free_bytes {
         config.dev_free_bytes = Some(v.parse().map_err(|_| format!("--dev-free-bytes: {v:?} is not a number of bytes"))?);

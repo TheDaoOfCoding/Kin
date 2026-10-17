@@ -15,6 +15,13 @@
 //! * (2B.1) The phone says `"capabilities": ["link"]` in its `hello` (`--old-phone` leaves it out, like a 0.1.x phone). `--send-link <url>` (repeat it;
 //!   `--send-link-title <title>` gives each a title) sends a `link` message the way `--send-text` sends a text. A `link` from the PC is acked and printed as
 //!   `received link id=<id> url=<url> title=<title> sourceApp=<app>`.
+//! * (2B.2) **Phone notifications.** `--notif` adds `notif` to the phone's `capabilities`. The phone then sends, one per second like texts, in the order
+//!   given: `--notif-status` (a `notif.status`: mirroring, access granted, 3 apps), `--notif-icon` (a generated 48 x 48 PNG as `notif.icon`; a post that has
+//!   `"iconHash":"@icon"` gets its hash), `--notif-post '<json>'` (the fields of a `notif.post` other than `type` and `id`, for example
+//!   `'{"nid":"54892d1f759b11f6762ff1bd98cda7df","app":"Chat","title":"Alice","text":"hi","reply":{"i":1,"hint":"Reply"}}'`), `--notif-remove <nid>` and
+//!   `--notif-sync <nid,nid,...>` (empty: nothing is on the phone). It prints what the PC sends back: `received notif.dismiss nid=<nid>`,
+//!   `received notif.action id=<id> nid=<nid> i=<i> label=<label> text=<text>` (acked; `--notif-action-error <code>` answers with that `error` instead) and
+//!   an `error` of the PC (`rate_limited`). (A developer tool: it prints the reply text. Kin itself never logs it.)
 //! * `--no-ack` doesn't ack `text` and `clipboard` from the PC (to see the PC's 5 s ack timeout and its notice).
 //! * What it receives is printed on one line each, for scripts to look for: `received clipboard id=<id> text=<text>` and
 //!   `received text id=<id> isUrl=<bool> text=<text>`. (This is a developer tool: it prints the text. Kin itself never logs it.)
@@ -108,13 +115,40 @@ impl ServerCertVerifier for Pinned {
     }
 }
 
-/// The phone's `hello`. A 2B.1 phone lists the `link` capability; `--old-phone` is a 0.1.x phone, which doesn't.
-fn hello_of(name: &str, id: &str, old_phone: bool) -> Value {
+/// The phone's `hello`. A 2B.1 phone lists the `link` capability; `--old-phone` is a 0.1.x phone, which doesn't; `--notif` (2B.2) adds `notif`.
+fn hello_of(name: &str, id: &str, old_phone: bool, notif: bool) -> Value {
     let mut hello = json!({ "type": "hello", "id": id, "protocol": 1, "name": name, "platform": "android", "appVersion": "0.0.0" });
     if !old_phone {
-        hello["capabilities"] = json!(["link"]);
+        hello["capabilities"] = if notif { json!(["link", "notif"]) } else { json!(["link"]) };
     }
     hello
+}
+
+/// The 48 x 48 icon that `--notif-icon` sends (a real phone sends a compressed PNG of up to 32 KiB; this generated one is stored uncompressed, so it is
+/// kept small), and its hash (the first 32 hex characters of its SHA-256).
+fn generated_icon() -> (String, Vec<u8>) {
+    let png = kin_lib::mirror::icons::test_png(48, 48, [32, 140, 220, 255]);
+    (kin_lib::mirror::wire::hex32(&kin_lib::encoding::sha256(&png)), png)
+}
+
+/// The frame of one of the `--notif-*` things the phone sends on its own.
+fn notif_frame(kind: &str, value: &str, id: &str) -> Value {
+    let (icon_hash, icon_png) = generated_icon();
+    match kind {
+        "notif.status" => json!({ "type": kind, "id": id, "enabled": true, "access": "granted", "apps": 3 }),
+        "notif.icon" => json!({ "type": kind, "id": id, "hash": icon_hash, "png": kin_lib::encoding::base64url(&icon_png) }),
+        "notif.remove" => json!({ "type": kind, "id": id, "nid": value }),
+        "notif.sync" => json!({ "type": kind, "id": id, "nids": value.split(',').filter(|n| !n.is_empty()).collect::<Vec<_>>() }),
+        _ => {
+            let mut frame: Value = serde_json::from_str(value).expect("--notif-post takes a JSON object");
+            frame["type"] = json!(kind);
+            frame["id"] = json!(id);
+            if frame["iconHash"] == "@icon" {
+                frame["iconHash"] = json!(icon_hash);
+            }
+            frame
+        }
+    }
 }
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -470,12 +504,27 @@ async fn main() {
     let ping_every: Option<u64> = arg(&args, "--ping-every").map(|s| s.parse().unwrap());
     let old_phone = args.iter().any(|a| a == "--old-phone");
     let link_title = arg(&args, "--send-link-title");
-    // What the phone sends on its own: texts and links, one a second.
-    let texts: Vec<(&'static str, String)> = all_args(&args, "--send-text")
+    let notif = args.iter().any(|a| a == "--notif");
+    let notif_action_error = arg(&args, "--notif-action-error");
+    // What the phone sends on its own: texts, links and (2B.2) notification messages, one a second. The notification ones keep the order of the command line.
+    let mut texts: Vec<(&'static str, String)> = all_args(&args, "--send-text")
         .into_iter()
         .map(|t| ("text", t))
         .chain(all_args(&args, "--send-link").into_iter().map(|u| ("link", u)))
         .collect();
+    let mut i = 0;
+    while i < args.len() {
+        let next = || args.get(i + 1).cloned().unwrap_or_default();
+        match args[i].as_str() {
+            "--notif-status" => texts.push(("notif.status", String::new())),
+            "--notif-icon" => texts.push(("notif.icon", String::new())),
+            "--notif-post" => texts.push(("notif.post", next())),
+            "--notif-remove" => texts.push(("notif.remove", next())),
+            "--notif-sync" => texts.push(("notif.sync", next())),
+            _ => {}
+        }
+        i += 1;
+    }
     let send_text_after: u64 = arg(&args, "--send-text-after").map_or(2, |s| s.parse().unwrap());
     let no_ack = args.iter().any(|a| a == "--no-ack");
     let mut uploads: Vec<Upload> = all_args(&args, "--upload")
@@ -557,7 +606,7 @@ async fn main() {
     // WebSocket.
     let (mut ws, _) =
         tokio_tungstenite::client_async(format!("ws://{host}:{port}/v1/ws"), net.connect().await).await.expect("WebSocket upgrade");
-    let hello = hello_of(&name, "fake-hello", old_phone);
+    let hello = hello_of(&name, "fake-hello", old_phone, notif);
     ws.send(Message::Text(hello.to_string().into())).await.unwrap();
     say("connected, hello sent");
     let mut hello_sent_at = Instant::now();
@@ -598,7 +647,7 @@ async fn main() {
                     let (new_ws, _) = tokio_tungstenite::client_async(format!("ws://{host}:{port}/v1/ws"), net.connect().await).await.expect("WebSocket upgrade after the reconnect");
                     ws = new_ws;
                     hellos += 1;
-                    let hello = hello_of(&name, &format!("fake-hello-{hellos}"), old_phone);
+                    let hello = hello_of(&name, &format!("fake-hello-{hellos}"), old_phone, notif);
                     ws.send(Message::Text(hello.to_string().into())).await.unwrap();
                     hello_sent_at = Instant::now();
                     say(&format!("reconnected at={} (hello sent)", unix_ms()));
@@ -612,7 +661,9 @@ async fn main() {
                 }
                 if let Some((i, (kind, text))) = pending_text.take().filter(|_| Instant::now() >= next_text) {
                     let id = format!("fake-{kind}-{}", i + 1);
-                    let frame = if kind == "link" {
+                    let frame = if kind.starts_with("notif.") {
+                        notif_frame(kind, &text, &id)
+                    } else if kind == "link" {
                         let mut f = json!({ "type": "link", "id": id, "url": text, "sourceApp": "Fake Phone" });
                         if let Some(t) = &link_title {
                             f["title"] = json!(t);
@@ -707,6 +758,23 @@ async fn main() {
                             say(&format!("the PC canceled transfer {} ({})", v["transferId"], v["reason"]));
                             ws.send(Message::Text(json!({ "type": "ack", "ref": v["id"] }).to_string().into())).await.unwrap();
                         }
+                        Some("notif.dismiss") => say(&format!("received notif.dismiss nid={}", v["nid"].as_str().unwrap_or(""))),
+                        Some("notif.action") => {
+                            say(&format!(
+                                "received notif.action id={} nid={} i={} label={} text={}",
+                                v["id"],
+                                v["nid"].as_str().unwrap_or(""),
+                                v["i"],
+                                v["label"].as_str().unwrap_or(""),
+                                v["text"].as_str().unwrap_or("")
+                            ));
+                            let answer = match &notif_action_error {
+                                Some(code) => json!({ "type": "error", "ref": v["id"], "code": code, "message": "refused by the fake phone" }),
+                                None => json!({ "type": "ack", "ref": v["id"] }),
+                            };
+                            ws.send(Message::Text(answer.to_string().into())).await.unwrap();
+                        }
+                        Some("error") => say(&format!("received error code={} ref={}", v["code"].as_str().unwrap_or(""), v["ref"])),
                         Some("unpair") => {
                             say("the PC unpaired this phone");
                             ws.send(Message::Text(json!({ "type": "ack", "ref": v["id"] }).to_string().into())).await.unwrap();

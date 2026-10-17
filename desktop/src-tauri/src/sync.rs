@@ -640,17 +640,23 @@ impl Core {
         });
 
         let toast_id = self.next_toast_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let has_link = link.is_some();
-        if let Some(url) = link {
-            self.register_toast_target(toast_id, ToastTarget::Link(url));
-        }
         if clipboard_set {
-            self.emit(Event::TextToast {
-                id: toast_id,
-                from: from.to_string(),
-                preview: if sensitive { String::new() } else { clipboard::preview(&text, PREVIEW_CHARS) },
-                has_link,
-            });
+            match link {
+                // A text that is a web address is shown like a link from the 2B.1 `link` message (a review finding): **the real address first**, with the
+                // warning sign when it has one, and Open and Copy buttons. The text itself stays on the clipboard as before. It is never opened by
+                // itself, and a click on the body of a warned one doesn't open it either (`toast_action`): only the Open button does.
+                Some(url) => {
+                    let body = crate::phonelinks::toast_body(None, &url);
+                    self.register_toast_target(toast_id, ToastTarget::LinkOffer(url));
+                    self.emit(Event::LinkToast { id: toast_id, title: format!("Link from {from}"), body, opened: false });
+                }
+                None => self.emit(Event::TextToast {
+                    id: toast_id,
+                    from: from.to_string(),
+                    preview: if sensitive { String::new() } else { clipboard::preview(&text, PREVIEW_CHARS) },
+                    has_link: false,
+                }),
+            }
         }
         self.emit(Event::StateChanged);
     }
@@ -714,6 +720,12 @@ impl Core {
     /// A button of a toast was pressed: `show` shows the file in its folder (or opens the folder of several), anything else is the same
     /// as a click on the toast. Returns whether something was opened.
     pub fn toast_action(&self, toast_id: u32, action: &str) -> bool {
+        // A click on the body of a toast whose address has a warning (a look-alike or international host, an IP address) never opens it: the Open button
+        // does, because pressing it is the user choosing it.
+        if action == "tap" && self.toast_link_has_warning(toast_id) {
+            log::info!("toast {toast_id}: a click on a link with a warning does not open it (use the Open button)");
+            return false;
+        }
         if action != "show" {
             return self.toast_clicked(toast_id);
         }
@@ -736,6 +748,13 @@ impl Core {
                 false
             }
         }
+    }
+
+    /// Whether the link behind this toast has a warning (`links::link_address`).
+    fn toast_link_has_warning(&self, toast_id: u32) -> bool {
+        lock(&self.toast_targets).iter().any(|(i, t)| {
+            *i == toast_id && matches!(t, ToastTarget::Link(u) | ToastTarget::LinkOffer(u) if crate::links::link_address(u).warn)
+        })
     }
 
     /// The "Copy" button of the toast of a link from the phone: the URL goes to the clipboard (the loop guard is told, so the automatic sync

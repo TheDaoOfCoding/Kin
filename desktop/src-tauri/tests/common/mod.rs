@@ -117,6 +117,23 @@ pub fn test_core_in(dir: tempfile::TempDir, identity: Identity, pc_name: &str, d
     TestEnv { core, events, dir, clipboard, opener }
 }
 
+/// [`test_core`] with a clock that only moves when the test says so.
+pub fn test_core_clock(identity: Identity, pc_name: &str, clock: Arc<kin_lib::clipboard::ManualClock>) -> TestEnv {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::new(dir.path().to_path_buf());
+    config.dev_bind = Some("127.0.0.1".parse().unwrap());
+    config.dev_qr_address = Some("10.0.2.2".parse().unwrap());
+    config.dev_port = Some(0);
+    config.dev_print_pair_url = true;
+    config.dev_received_dir = Some(dir.path().join("received"));
+    let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+    let clipboard = Arc::new(MemoryClipboard::default());
+    let opener = Arc::new(RecordingOpener::default());
+    let services = Services { clipboard: clipboard.clone(), opener: opener.clone(), clock };
+    let core = Arc::new(Core::new(config, identity, Db::open_in_memory().unwrap(), pc_name.to_string(), tx, services));
+    TestEnv { core, events, dir, clipboard, opener }
+}
+
 pub async fn start(core: &Arc<Core>) -> ServerHandle {
     server::start(core.clone()).await.unwrap()
 }
@@ -417,6 +434,27 @@ impl World {
             short_id: phone_identity.short_id,
         };
         let env = test_core(pc_identity, "Desk PC");
+        let server = start(&env.core).await;
+        World { env, server, pc, phone }
+    }
+
+    /// Like [`World::new`], with a clock the test moves (the rate limits and the 60-second clear of a one-time code follow it).
+    pub async fn new_with_clock(clock: Arc<kin_lib::clipboard::ManualClock>) -> World {
+        let pc_identity = Identity::generate().unwrap();
+        let pc = TestKey {
+            pkcs8: pc_identity.key_der.clone(),
+            cert: pc_identity.cert_der.clone(),
+            device_id: pc_identity.device_id.clone(),
+            short_id: pc_identity.short_id.clone(),
+        };
+        let phone_identity = Identity::generate().unwrap();
+        let phone = TestKey {
+            pkcs8: phone_identity.key_der,
+            cert: phone_identity.cert_der,
+            device_id: phone_identity.device_id,
+            short_id: phone_identity.short_id,
+        };
+        let env = test_core_clock(pc_identity, "Desk PC", clock);
         let server = start(&env.core).await;
         World { env, server, pc, phone }
     }

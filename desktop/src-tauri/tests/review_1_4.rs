@@ -564,7 +564,7 @@ fn every_command_checks_the_label_of_the_window_that_called_it() {
         assert!(body.contains("only(&window"), "{name} checks the label of the window first");
         commands += 1;
     }
-    assert_eq!(commands, 26, "the 26 commands of the app");
+    assert_eq!(commands, 28, "the 28 commands of the app");
 }
 
 #[test]

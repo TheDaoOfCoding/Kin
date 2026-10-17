@@ -6,6 +6,20 @@ import { listen } from "@tauri-apps/api/event";
 import { button, el, flash } from "./dom";
 
 type Device = { deviceId: string; name: string; platform: string; connected: boolean };
+type Mirror = {
+  enabled: boolean;
+  sound: boolean;
+  hideContent: boolean;
+  dismissToPhone: boolean;
+  textOnly: boolean;
+  /** The toast layer is running (the switch is on and Windows accepted it). */
+  running: boolean;
+  /** The COM class that answers clicks is registered: the reply box and the buttons work. */
+  activator: boolean;
+  /** Why phone notifications can't run in this copy of Kin, if they can't. */
+  unavailable: string | null;
+  phones: { name: string; status: string }[];
+};
 type View = {
   deviceName: string;
   customDeviceName: string | null;
@@ -13,6 +27,7 @@ type View = {
   autoClipboardSync: boolean;
   imagesToClipboard: boolean;
   openLinksAutomatically: boolean;
+  mirror: Mirror;
   receivedFolder: string;
   receivedFolderIsDefault: boolean;
   hotkey: { accelerator: string; registered: boolean; error: string | null };
@@ -69,6 +84,24 @@ export function startSettingsWindow(root: HTMLElement): void {
     const box = el("input", { type: "checkbox", checked: value });
     box.addEventListener("change", () => onChange(box.checked));
     return el("label", { className: "toggle" }, box, el("span", {}, el("strong", {}, label), el("small", {}, hint)));
+  };
+
+  const mirrorOption = (name: string) => (on: boolean) => void call("set_mirror_option", { name, on }).then(() => refresh());
+
+  /** What belongs under the switch: the status of the phones, why it can't run, and the four options. */
+  const mirrorDetails = (m: Mirror): HTMLElement[] => {
+    const out: HTMLElement[] = [];
+    if (m.unavailable) out.push(el("p", { className: "hint bad" }, `Not available in this copy of Kin: ${m.unavailable}.`));
+    for (const p of m.phones) out.push(el("p", { className: "hint" }, `${p.name}: ${p.status}`));
+    if (m.enabled && m.running && !m.activator && !m.textOnly) out.push(el("p", { className: "hint bad" }, "Replying and buttons need a part of Windows that did not start here, so notifications show text only."));
+    if (!m.enabled) return out;
+    out.push(
+      toggle("Closing a phone notification here also dismisses it on the phone", "Only pressing the X of a notification does this, never a notification that timed out or was replaced.", m.dismissToPhone, mirrorOption("dismissToPhone")),
+      toggle("Hide notification content", "Every phone notification says \"Private notification\". Notifications of banking, authenticator and password apps always do.", m.hideContent, mirrorOption("hideContent")),
+      toggle("Play a sound for phone notifications", "Off: they appear quietly, because your phone has made its own sound.", m.sound, mirrorOption("sound")),
+      toggle("Text only (no reply box, no buttons)", "For a Windows where the reply box and the buttons do not work.", m.textOnly, mirrorOption("textOnly")),
+    );
+    return out;
   };
 
   const draw = (v: View) => {
@@ -139,6 +172,11 @@ export function startSettingsWindow(root: HTMLElement): void {
       section(
         "Links",
         toggle("Open links from the phone automatically", "A web page you share from the phone opens in your default browser. Off: a notice with Open and Copy buttons. In a fullscreen game or a presentation a link is never opened by itself.", v.openLinksAutomatically, (on) => void call("set_open_links_automatically", { on })),
+      ),
+      section(
+        "Phone notifications",
+        toggle("Show phone notifications on this PC", "Notifications of the apps you chose in Kin on your phone appear here as Windows notifications, with the reply box and buttons the app offers. The text stays in Windows' Action Center until it expires or you clear it. Needs Kin 0.2.0 on your phone.", v.mirror.enabled, (on) => void invoke("set_mirror_notifications", { on }).then(() => refresh(), (e) => flash(note, String(e), true))),
+        ...mirrorDetails(v.mirror),
       ),
       section(
         "Received files",

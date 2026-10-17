@@ -693,7 +693,7 @@ async fn a_link_from_the_phone_opens_in_the_browser_and_the_toast_has_copy() {
     assert_eq!(reply, json!({ "type": "ack", "ref": "L1" }), "acked as soon as it is valid, not when it is opened");
     let (id, title, body, opened) = next_link_toast(&mut w).await;
     assert_eq!(w.env.opener.opened(), [YOUTUBE], "opened exactly as sent");
-    assert_eq!((title.as_str(), body.as_str(), opened), ("Opened link from phone", "A video\nwww.youtube.com", true));
+    assert_eq!((title.as_str(), body.as_str(), opened), ("Opened link from phone", "www.youtube.com\nA video", true));
     // Never on the clipboard by itself.
     assert!(w.env.clipboard.app_writes().is_empty());
     // A click on that toast opens nothing more (it was opened already); Copy puts the URL on the clipboard.
@@ -757,8 +757,10 @@ async fn a_link_with_a_warning_is_offered_never_opened_by_itself() {
         drain(&mut w.env.events);
         phone_sends_link(&mut ws, &format!("W{n}"), url, Some("paypal.com")).await;
         let (target, title, body, opened) = next_link_toast(&mut w).await;
-        assert_eq!((title.as_str(), body.as_str(), opened), ("Link from phone", format!("paypal.com\n{shown}").as_str(), false), "{url}");
+        assert_eq!((title.as_str(), body.as_str(), opened), ("Link from phone", format!("{shown}\npaypal.com").as_str(), false), "{url}");
         assert!(w.env.opener.opened().is_empty(), "{url}: not opened by itself");
+        assert!(!w.core().toast_action(target, "tap"), "{url}: a click on the body of a warned link opens nothing");
+        assert!(w.env.opener.opened().is_empty(), "{url}: still not opened");
         assert!(w.core().toast_clicked(target), "{url}: Open works on purpose");
         assert_eq!(w.env.opener.opened(), [url]);
         w.env.opener.opened.lock().unwrap().clear();
@@ -783,7 +785,7 @@ async fn a_toast_that_offers_the_link_says_link_from_phone() {
     })
     .await;
     let (_, title, body, opened) = toasts[0].clone();
-    assert_eq!((title.as_str(), body.as_str(), opened), ("Link from phone", "Title\nexample.com", false));
+    assert_eq!((title.as_str(), body.as_str(), opened), ("Link from phone", "example.com\nTitle", false));
 }
 
 #[tokio::test]
@@ -871,7 +873,7 @@ async fn the_link_never_reaches_the_log_and_the_toast_never_shows_the_title_alon
         !toasts.is_empty()
     })
     .await;
-    assert!(toasts[0].2.ends_with("\nphone-secret-host.example"), "the real host is under the title: {}", toasts[0].2);
+    assert!(toasts[0].2.starts_with("phone-secret-host.example\n"), "the real host is the first line, above the title: {}", toasts[0].2);
     let log = captured_lines().join("\n");
     for secret in ["PHONESECRET", "PHONETITLE", "phone-secret-host"] {
         assert!(!log.contains(secret), "{secret} reached the log:\n{log}");

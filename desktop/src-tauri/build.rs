@@ -21,6 +21,8 @@ const COMMANDS: &[&str] = &[
     "set_auto_clipboard_sync",
     "set_images_to_clipboard",
     "set_open_links_automatically",
+    "set_mirror_notifications",
+    "set_mirror_option",
     "choose_received_folder",
     "reset_received_folder",
     "set_hotkey",

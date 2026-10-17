@@ -46,10 +46,12 @@ desktop/
       export.rs            1.4: "Export logs": a stored-method zip written by hand, and the redaction of paths (long and 8.3 short profile path, any C:\Users\<name>, the received folder wherever it is), IPv4 and IPv6 addresses, names (any letter case) and Wi-Fi network names
       netprofile.rs        1.4: the network profile (Private / Public) from the Network List Manager (COM)
       localtime.rs         1.4: local time for "last seen" (Windows converts, the wording is plain code)
+      mirror/              2B.2: phone notifications on the PC (windows.md "Phone notifications"): `wire.rs` the `notif.*` frames, `limits.rs`, `args.rs` (what a toast carries for a click), `toast_xml.rs`, `surface.rs` (the WinRT toast layer and a fake), `activator.rs` (the COM class), `registration.rs` (the HKCU keys), `icons.rs` (the icon cache), `otp_clip.rs` (Copy and the 60 s clear), `mod.rs` (the ledger and what the core does)
       app.rs, tray.rs, ui.rs   the Tauri side: start-up, single instance, tray (the menu of windows.md), global hotkey (changed from the settings window), toasts and clicks on them, windows, UI commands
     windows/hooks.nsh      1.5: the installer hooks (the firewall rules, the uninstall steps): `bundle.windows.nsis.installerHooks` in tauri.conf.json
     tests/                 vectors.rs, transfer_vectors.rs, tls_vectors.rs, fake_phone.rs, transfers_e2e.rs, offers_e2e.rs, review_1_3.rs, server_limits.rs, queue_1_4.rs, review_1_4.rs, parallel_files.rs (v0.1.1: 4 files of one transfer at once, both directions) (+ common/)
     examples/fake_phone.rs a fake phone for manual checks and for the scripts
+    examples/toast_probe.rs, link_address.rs   2B.2: what Windows holds for a toast identity and a click done through COM; what the PC's toast shows for a URL (for the scripts)
   clipboard-backup.ps1     save and restore every format of the real clipboard (used by the check and e2e scripts). v0.1.1: `Save-Clipboard` keeps an earlier backup that a crashed run left behind instead of overwriting it
   run-real-clipboard-test.ps1  v0.1.1: runs the one unit test that uses the real clipboard (`clear_if_text`) between Save-Clipboard and Restore-Clipboard
   check-1-3.ps1            the 1.3 checks against the real Kin.exe
@@ -61,6 +63,7 @@ desktop/
   check-1-4.ps1            the 1.4 checks against the real Kin.exe: the queue (arrival after the phone's hello, order, a restart, cancel, expiry), the tray's "last seen", the settings (a hotkey conflict, the stand-in for start with Windows), the debug numbers, Export logs
   capture-windows.ps1      screenshots of the history, settings, debug, drop and pairing windows from the real Kin.exe (and the memory before and after they were opened and closed)
   measure-idle.ps1         idle memory of the tray-only app; `-OpenWindows` opens and closes every window first
+  ../tools/check-2b2-desktop.ps1   2B.2: the phone notifications against real Windows with a dev Kin, the fake phone and toast_probe (registry keys, the toasts in Windows' history, a click through COM, the clipboard), and the clean-up
 ```
 
 ## Build, test, run
@@ -131,6 +134,18 @@ Everything here is also available in a release build, so the integration agent c
 - **A launch with no data directory hands nothing to a running Kin that is another program file.** `Kin.exe --quit` from `target\release` with the installed Kin running would otherwise quit the user's Kin. The program that owns the single-instance window is found the way the second launch finds it (`instance::running_program`) and compared with the launching file: the "Send to" shortcut and the Start Menu shortcut run the same file as the running one, so they are never refused.
 
 To start one by hand: `Kin.exe --data-dir "%LOCALAPPDATA%\Temp\kin-mine" --dev-bind 127.0.0.1 --dev-port 49333 --dev-received-dir "%LOCALAPPDATA%\Temp\kin-mine\received" --dev-print-pair-url --dev-no-windows`, and give every later command the same `--data-dir`: `Kin.exe --data-dir "%LOCALAPPDATA%\Temp\kin-mine" --send a.jpg`, `... --quit`.
+
+### Phone notifications (2B.2)
+
+Off by default (`mirrorNotifications` in `settings.json`, or `--dev-set mirrorNotifications true`). A test Kin (own `--data-dir`) registers **its own** identity, `app.kinrelay.desktop.dev-<key>.phone` and a CLSID made from the key, under `HKCU`, and **removes every key at exit** (also the two that Windows makes for an AUMID that showed a toast); the installed Kin's names are written only by a normal release run. `docs/windows.md` ("Phone notifications") has the design.
+
+| What | How |
+|---|---|
+| No popup, no sound, ever | `--dev-toast-quiet`: every phone toast goes to the Action Center only. Use it for every run on a PC that someone is sitting at |
+| A click, a reply, the X, without Windows | `Kin.exe --data-dir <dir> --dev-toast reply <nid> "text"`, `copy <nid>`, `button <nid> <index>`, `dismiss <nid>`: the same functions the COM class and the toast events call |
+| A click the way the shell does it, no input injection | `cargo run --example toast_probe -- activate <clsid> <aumid> "kin=1&d=<short>&n=<nid>&a=reply&i=1" reply=hello` does `CoCreateInstance` of the registered class and `Activate`. `toast_probe history <aumid>` lists what Windows holds (tag, group, whether there is an input box and how many buttons, never the text), `clear <aumid>` removes it, `registry <aumid> <clsid>` says which keys exist. It refuses the installed Kin's identities |
+| The whole check against the real Windows | `tools\check-2b2-desktop.ps1` (a debug build and the examples; about 4 minutes, saves and restores the clipboard, refuses to run while a game is running) |
+| `status.json` | `mirror.view` (the settings, whether the toast layer and the activator run, each phone's line) and `mirror.counts` (shown, replaced, removed, swept, dropped by reason, icons, actions, refusals, codes copied): numbers only |
 
 ### Settings (first launch)
 
@@ -303,6 +318,7 @@ Get-Content $data\logs\kin.log -Tail 20
 | `--identity-file <path>`, `--skip-pairing` | **1.4.** The phone's key is kept in that file, so a later run is the same phone; `--skip-pairing` connects without pairing (it is paired already). Together they test a restart of the PC |
 | `--save-dir <folder>`, `--download-cut <bytes>`, `--no-download`, `--refuse-offer <code>` | For an `offer` from the PC: where to save (default `fake-phone-downloads` in the temp folder), drop the first download after that many bytes and resume with `Range`, ack but don't download, or answer with an `error` of that code (such as `disk_full`) instead of an ack. Prints `downloaded <name> bytes=<n> sha256=<hex> ...` and sends `complete` |
 | `--send-link <url>` (repeat), `--send-link-title <title>`, `--old-phone` | **2B.1.** Sends a `link` message (like `--send-text`, one a second; ids `fake-link-1`, `fake-link-2`, ...). The hello lists `"capabilities": ["link"]` unless `--old-phone` (a 0.1.x phone: the PC then sends it a link as a text). A `link` from the PC is acked and printed as `received link id=.. url=.. title=.. sourceApp=..` |
+| `--notif`, `--notif-status`, `--notif-icon`, `--notif-post '<json>'` (repeat), `--notif-remove <nid>`, `--notif-sync <nid,nid>`, `--notif-action-error <code>` | **2B.2.** `--notif` lists `notif` in the phone's `hello`. The phone then sends, one a second and in the order given, a `notif.status`, a generated 48 x 48 `notif.icon` (a post with `"iconHash":"@icon"` gets its hash), `notif.post`s (the JSON is the post's fields without `type` and `id`), a `notif.remove` and a `notif.sync`. It prints what the PC sends back: `received notif.dismiss nid=..`, `received notif.action id=.. nid=.. i=.. label=.. text=..` (acked, or answered with `--notif-action-error`) and an `error` of the PC (`rate_limited`) |
 
 ## How it behaves
 

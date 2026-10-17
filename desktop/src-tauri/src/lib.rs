@@ -27,6 +27,7 @@ pub mod localtime;
 pub mod mdns;
 pub mod messages;
 pub mod metrics;
+pub mod mirror;
 pub mod motw;
 pub mod nativehost;
 pub mod netaddr;

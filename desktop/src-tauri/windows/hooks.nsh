@@ -83,6 +83,16 @@
     SetShellVarContext current
     RmDir /r "$APPDATA\Kin\native-messaging"
     SetShellVarContext all
+
+    ; The phone notifications' registration (milestone 2B.2, desktop/src-tauri/src/mirror/registration.rs): the COM class of the toast activator and the
+    ; app identity "Kin: phone notifications". The app writes them itself at every start while "Show phone notifications" is on, as the signed-in user, so
+    ; they are removed here in BOTH contexts too. **Exactly these two keys of the installed Kin's own names** (a copy of Kin that runs beside it has names
+    ; of its own and removes its own). The two keys that Windows makes by itself for the identity (Notifications\Settings and PushNotifications\Backup)
+    ; belong to the OS and hold the user's own choices; they are left alone.
+    DetailPrint "Removing the phone notifications' registration"
+    DeleteRegKey HKCU "Software\Classes\CLSID\{6B0A1D3E-2F54-4E8A-9C71-3D5B8E2A4F90}"
+    DeleteRegKey HKCU "Software\Classes\AppUserModelId\app.kinrelay.desktop.phone"
+    nsis_tauri_utils::RunAsUser "cmd.exe" '/d /c "reg delete HKCU\Software\Classes\CLSID\{6B0A1D3E-2F54-4E8A-9C71-3D5B8E2A4F90} /f & reg delete HKCU\Software\Classes\AppUserModelId\app.kinrelay.desktop.phone /f"'
   ${EndIf}
 !macroend
 

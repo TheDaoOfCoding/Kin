@@ -15,7 +15,7 @@ use tokio::time::Instant;
 use crate::connections::{ConnCommand, SendOutcome};
 use crate::core::{APP_VERSION, Core, Event, short};
 use crate::encoding::{unix_ms, uuid_v7};
-use crate::messages::{self, Action, Dedup, Frame, Outcome, Receiver, Role};
+use crate::messages::{self, Action, Dedup, Frame, NotifDrop, Outcome, Receiver, Role};
 
 /// The PC marks a phone offline after this much silence. The phone's WebSocket ping every 4 minutes keeps it alive.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -33,7 +33,7 @@ fn hello_frame(core: &Core) -> serde_json::Value {
         "name": core.pc_name(),
         "platform": "windows",
         "appVersion": APP_VERSION,
-        "capabilities": messages::CAPABILITIES,
+        "capabilities": core.capabilities(),
     })
 }
 
@@ -73,6 +73,10 @@ struct Pending {
     reply: oneshot::Sender<SendOutcome>,
 }
 
+/// How long a `notif.action` waits for its `ack`. Unlike any other message, no answer does **not** close the connection: the press is reported as
+/// "no answer" and never sent again (protocol.md, changelog 56).
+const ACTION_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How a connection ended, for the log and for what to send.
 enum End {
     /// We close with this code.
@@ -83,6 +87,8 @@ enum End {
     /// The phone closed (or the socket ended). The close handshake is left to the library.
     PeerClosed(String),
     Error(String),
+    /// Nothing ends: the timer was only a late `notif.action`.
+    Continue,
 }
 
 struct Conn {
@@ -95,6 +101,8 @@ struct Conn {
     opened: Instant,
     last_rx: Instant,
     pending: HashMap<String, Pending>,
+    /// The `notif.action` messages that are waiting for their `ack`.
+    actions: HashMap<String, Pending>,
     /// The `id` of an `unpair` we sent and when we stop waiting for its `ack`.
     unpair: Option<(String, Instant)>,
     hello_accepted: bool,
@@ -106,6 +114,7 @@ enum Timer {
     Hello,
     Idle,
     Ack,
+    ActionAck,
     Unpair,
 }
 
@@ -115,16 +124,19 @@ pub async fn run(core: Arc<Core>, socket: WebSocket, device_id: String, remote: 
     let (conn_id, mut commands) = core.connections.register(&device_id);
     log::info!("websocket opened: device {} from {remote}", short(&device_id));
     let now = Instant::now();
+    let mut receiver = Receiver::new(Role::Pc);
+    receiver.set_own_capabilities(&core.capabilities());
     let mut conn = Conn {
         core,
         device_id,
         remote,
         conn_id,
         socket,
-        receiver: Receiver::new(Role::Pc),
+        receiver,
         opened: now,
         last_rx: now,
         pending: HashMap::new(),
+        actions: HashMap::new(),
         unpair: None,
         hello_accepted: false,
         unpaired: false,
@@ -152,8 +164,9 @@ impl Conn {
                 },
                 () = tokio::time::sleep_until(deadline) => Some(self.on_timer(timer)),
             };
-            if let Some(end) = end {
-                return end;
+            match end {
+                Some(End::Continue) | None => {}
+                Some(end) => return end,
             }
         }
     }
@@ -171,6 +184,9 @@ impl Conn {
         }
         if let Some(at) = self.pending.values().map(|p| p.sent + ACK_TIMEOUT).min() {
             consider(at, Timer::Ack);
+        }
+        if let Some(at) = self.actions.values().map(|p| p.sent + ACTION_ACK_TIMEOUT).min() {
+            consider(at, Timer::ActionAck);
         }
         if let Some((_, at)) = &self.unpair {
             consider(*at, Timer::Unpair);
@@ -197,6 +213,18 @@ impl Conn {
                     }
                 }
                 End::Close { code: messages::CLOSE_NORMAL, reason: "no ack within 5 s".into() }
+            }
+            Timer::ActionAck => {
+                // The press gets "no answer" and the connection goes on.
+                let now = Instant::now();
+                let late: Vec<String> =
+                    self.actions.iter().filter(|(_, p)| now >= p.sent + ACTION_ACK_TIMEOUT).map(|(id, _)| id.clone()).collect();
+                for id in late {
+                    if let Some(p) = self.actions.remove(&id) {
+                        let _ = p.reply.send(SendOutcome::NoReply);
+                    }
+                }
+                End::Continue
             }
             Timer::Unpair => End::Close { code: messages::CLOSE_NORMAL, reason: "unpaired".into() },
         }
@@ -229,7 +257,7 @@ impl Conn {
         match outcome.action {
             Action::HandshakeOk => self.on_hello(),
             Action::MarkDelivered { reference } => {
-                if let Some(p) = self.pending.remove(&reference) {
+                if let Some(p) = self.pending.remove(&reference).or_else(|| self.actions.remove(&reference)) {
                     let _ = p.reply.send(SendOutcome::Ack(p.sent.elapsed()));
                 } else if self.unpair.as_ref().is_some_and(|(id, _)| *id == reference) {
                     return Some(End::Close { code: messages::CLOSE_NORMAL, reason: "unpaired".into() });
@@ -237,7 +265,7 @@ impl Conn {
             }
             Action::MarkFailed { reference, code } => {
                 log::warn!("phone answered with an error ({code})");
-                if let Some(p) = self.pending.remove(&reference) {
+                if let Some(p) = self.pending.remove(&reference).or_else(|| self.actions.remove(&reference)) {
                     let _ = p.reply.send(SendOutcome::Failed(code));
                 }
             }
@@ -270,12 +298,24 @@ impl Conn {
             Action::RemovePeerAndClose => {
                 self.unpaired = true;
                 let _ = self.core.db.delete_pending_cancels_of(&self.device_id);
+                self.core.mirror_forget_device(&self.device_id);
                 match self.core.db.remove_device(&self.device_id) {
                     Ok(_) => log::info!("device {} unpaired itself", short(&self.device_id)),
                     Err(e) => log::error!("removing the unpaired device failed: {e}"),
                 }
                 self.core.emit(Event::PairingChanged);
             }
+            // A phone notification (changelog 56): shown, replaced, removed or synced by the mirror. The only thing that can come back is a `rate_limited`
+            // error (no `ref`), at most one per 10 seconds.
+            Action::Notif(msg) => {
+                if let Some(frame) = self.core.mirror_message(&self.device_id, msg).await
+                    && let Err(e) = self.send(&frame).await
+                {
+                    return Some(End::Error(e));
+                }
+            }
+            Action::NotifDropped(NotifDrop::Capability) => self.core.mirror_dropped_by_receiver(),
+            Action::NotifDropped(NotifDrop::BadIcon) => self.core.mirror_icon_dropped(),
             // `clipboard` and `offer` only go PC to phone: the receiver answers `unsupported_type` before it gets here.
             Action::None
             | Action::ShowErrorOnly
@@ -296,6 +336,8 @@ impl Conn {
         if let Err(e) = self.core.db.update_name(&self.device_id, &peer.name) {
             log::error!("saving the phone's name failed: {e}");
         }
+        // The latest accepted `hello` decides what may be sent to the phone (and the PC's own list is what it said last).
+        self.core.connections.set_capabilities(&self.device_id, self.conn_id, &peer.capabilities);
         if self.hello_accepted {
             return;
         }
@@ -337,10 +379,15 @@ impl Conn {
             }
             // The device name was changed in the settings: the phone learns it from a later `hello` (protocol.md, "Opening handshake":
             // a `hello` after the first one is handled the same way and is not acked).
-            ConnCommand::Hello => match self.send(&hello_frame(&self.core)).await {
-                Ok(()) => None,
-                Err(e) => Some(End::Error(e)),
-            },
+            ConnCommand::Hello => {
+                // What the PC lists may have changed ("Show phone notifications"): the receiver's own list and the `hello` come from the same place.
+                self.receiver.set_own_capabilities(&self.core.capabilities());
+                match self.send(&hello_frame(&self.core)).await {
+                    Ok(()) => None,
+                    Err(e) => Some(End::Error(e)),
+                }
+            }
+            ConnCommand::Notif { frame, reply } => self.send_notif(frame, reply).await,
             ConnCommand::Unpair => {
                 let id = uuid_v7(unix_ms());
                 match self.send(&json!({ "type": "unpair", "id": id })).await {
@@ -353,6 +400,31 @@ impl Conn {
                 }
             }
         }
+    }
+
+    /// A `notif.*` message to the phone. Sent only if the phone's latest `hello` lists `notif` (else dropped). A `notif.action` (it has a `reply`) waits for its
+    /// `ack` for 5 seconds and is never sent again.
+    async fn send_notif(&mut self, frame: serde_json::Value, reply: Option<oneshot::Sender<SendOutcome>>) -> Option<End> {
+        let listed = self.receiver.is_open() && self.receiver.peer().is_some_and(|p| p.has(crate::mirror::wire::CAPABILITY));
+        if !listed {
+            if let Some(reply) = reply {
+                let _ = reply.send(SendOutcome::NotConnected);
+            }
+            return None;
+        }
+        let sent = Instant::now();
+        if let Err(e) = self.send(&frame).await {
+            if let Some(reply) = reply {
+                let _ = reply.send(SendOutcome::NotConnected);
+            }
+            return Some(End::Error(e));
+        }
+        // The type only: nothing of the notification is logged.
+        log::info!("{} sent to device {}", frame["type"].as_str().unwrap_or("message"), short(&self.device_id));
+        if let (Some(reply), Some(id)) = (reply, frame.get("id").and_then(|v| v.as_str())) {
+            self.actions.insert(id.to_string(), Pending { sent, reply });
+        }
+        None
     }
 
     /// Sends a message that needs an `ack` and waits for it: `Timer::Ack` ends the connection after 5 s, and `on_message`
@@ -392,8 +464,9 @@ impl Conn {
                 (text, None)
             }
             End::Error(text) => (text, None),
+            End::Continue => ("the connection went on".to_string(), None),
         };
-        for (_, p) in self.pending.drain() {
+        for (_, p) in self.pending.drain().chain(self.actions.drain()) {
             let _ = p.reply.send(SendOutcome::Lost);
         }
         let current = self.core.connections.remove(&self.device_id, self.conn_id);

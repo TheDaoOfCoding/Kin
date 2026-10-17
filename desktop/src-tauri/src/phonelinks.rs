@@ -41,12 +41,34 @@ pub fn decide(open_automatically: bool, state: UserState, warn: bool) -> LinkDec
     }
 }
 
-/// What a toast for a link says: the title (if any) and the real address under it, the way a browser reads it, with a warning sign in front when
-/// there is a warning (the title is not to be trusted, the address is what the user needs to see).
+/// The longest title a toast shows, in characters. A title is a web page's text: a long one must not push the address out of the toast, and the
+/// address is on the first line anyway.
+pub const MAX_TOAST_TITLE_CHARS: usize = 100;
+
+/// A page's title as a toast shows it: every kind of line break (including U+2028, U+2029 and U+0085, which Windows draws as one) becomes a space,
+/// spaces collapse, and it is cut with an ellipsis.
+pub fn display_title(title: &str) -> String {
+    let flat: String = title
+        .chars()
+        .map(|c| if matches!(c, '\u{2028}' | '\u{2029}' | '\u{85}' | '\n' | '\r' | '\u{b}' | '\u{c}') { ' ' } else { c })
+        .collect();
+    let words: Vec<&str> = flat.split(' ').filter(|w| !w.is_empty()).collect();
+    let flat = words.join(" ");
+    if flat.chars().count() <= MAX_TOAST_TITLE_CHARS {
+        return flat;
+    }
+    let mut cut: String = flat.chars().take(MAX_TOAST_TITLE_CHARS - 1).collect();
+    cut.push('\u{2026}');
+    cut
+}
+
+/// What a toast for a link says: **the real address first**, the way a browser reads it, with a warning sign in front when there is a warning, then the
+/// title (if any). The title is not to be trusted and is long enough to fill a toast, the address is what the user needs to see, so it comes first and
+/// the title can't push it out.
 pub fn toast_body(title: Option<&str>, url: &str) -> String {
     let host = link_address(url).shown();
-    match title {
-        Some(t) => format!("{t}\n{host}"),
+    match title.map(display_title).filter(|t| !t.is_empty()) {
+        Some(t) => format!("{host}\n{t}"),
         None => host,
     }
 }
@@ -149,12 +171,28 @@ mod tests {
     }
 
     #[test]
-    fn the_toast_shows_the_real_host_not_the_title_alone() {
-        assert_eq!(toast_body(Some("A video"), "https://youtu.be/abc"), "A video\nyoutu.be");
+    fn the_toast_shows_the_real_host_first_and_the_title_under_it() {
+        assert_eq!(toast_body(Some("A video"), "https://youtu.be/abc"), "youtu.be\nA video");
         assert_eq!(toast_body(None, "https://youtu.be/abc"), "youtu.be");
         assert_eq!(toast_body(None, "https://example.com:8443/x"), "example.com:8443");
-        // A title can pose as another site: the host is still there on the line below it.
-        assert!(toast_body(Some("paypal.com - sign in"), "https://evil.example/").ends_with("\nevil.example"));
+        // A title can pose as another site: the host is the first line, so it is always seen.
+        assert!(toast_body(Some("paypal.com - sign in"), "https://evil.example/").starts_with("evil.example\n"));
+    }
+
+    #[test]
+    fn a_300_character_title_can_not_push_the_address_out_and_line_separators_are_flattened() {
+        let long = "x".repeat(300);
+        let body = toast_body(Some(&long), "https://example.com/");
+        assert!(body.starts_with("example.com\n"), "the address is the first line");
+        assert_eq!(body.lines().count(), 2);
+        assert!(body.chars().count() <= "example.com\n".len() + MAX_TOAST_TITLE_CHARS, "{}", body.chars().count());
+        assert!(body.ends_with('\u{2026}'));
+        // U+2028 and U+2029 (and NEL) would each be a line break for the toast: they are spaces.
+        let sneaky = "first\u{2028}second\u{2029}third\u{85}fourth\r\nfifth  \t sixth";
+        let body = toast_body(Some(sneaky), "https://example.com/");
+        assert_eq!(body, "example.com\nfirst second third fourth fifth \t sixth");
+        assert_eq!(body.lines().count(), 2, "one address line and one title line");
+        assert_eq!(toast_body(Some("\u{2028}\u{2029}  "), "https://example.com/"), "example.com", "a title of nothing is no title");
     }
 
     #[test]
@@ -162,7 +200,7 @@ mod tests {
         // B2: a homograph, a full-width host, an IDN and an odd IP are shown the way the browser reads them, marked.
         assert_eq!(toast_body(None, "https://\u{430}\u{440}\u{440}\u{4cf}\u{435}.com/"), "\u{26a0} xn--80ak6aa92e.com");
         assert_eq!(toast_body(None, "https://\u{ff47}\u{ff4f}\u{ff4f}\u{ff47}\u{ff4c}\u{ff45}.com/"), "\u{26a0} google.com");
-        assert_eq!(toast_body(Some("t"), "https://b\u{fc}cher.example/"), "t\n\u{26a0} xn--bcher-kva.example");
+        assert_eq!(toast_body(Some("t"), "https://b\u{fc}cher.example/"), "\u{26a0} xn--bcher-kva.example\nt");
         assert_eq!(toast_body(None, "https://0x7f.1/"), "\u{26a0} 127.0.0.1");
         assert_eq!(toast_body(None, "http://[::ffff:127.0.0.1]/"), "\u{26a0} [::ffff:7f00:1]");
     }

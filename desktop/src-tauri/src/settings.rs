@@ -123,6 +123,17 @@ pub struct Settings {
     /// "Open links from phone automatically" (2B.1, on by default): a `link` from the phone opens in the default browser at once. Off: a toast
     /// with Open and Copy. A fullscreen game or a presentation always gets the toast (phonelinks.rs).
     pub open_links_automatically: bool,
+    /// "Show phone notifications" (2B.2, **off by default**): the phone's notifications appear as toasts on this PC. While it is on the PC lists the `notif`
+    /// capability in its `hello`.
+    pub mirror_notifications: bool,
+    /// "Play a sound for phone notifications" (off: the phone has rung already).
+    pub mirror_sound: bool,
+    /// "Hide notification content" (off): every phone notification is shown as "Private notification".
+    pub mirror_hide_content: bool,
+    /// "Closing a phone notification here also dismisses it on the phone" (on): pressing X on a toast sends `notif.dismiss`.
+    pub mirror_dismiss_to_phone: bool,
+    /// The fallback of decision 2 (off): text only on the toasts, no reply box and no buttons, for a Windows where the activator doesn't work.
+    pub mirror_text_only: bool,
 }
 
 impl Default for Settings {
@@ -134,6 +145,11 @@ impl Default for Settings {
             images_to_clipboard: true,
             device_name: None,
             open_links_automatically: true,
+            mirror_notifications: false,
+            mirror_sound: false,
+            mirror_hide_content: false,
+            mirror_dismiss_to_phone: true,
+            mirror_text_only: false,
         }
     }
 }
@@ -173,6 +189,19 @@ impl Settings {
             Some(Value::Bool(b)) => settings.open_links_automatically = *b,
             Some(_) => problems.push("openLinksAutomatically must be true or false".to_string()),
         }
+        for (key, field) in [
+            ("mirrorNotifications", &mut settings.mirror_notifications),
+            ("mirrorSound", &mut settings.mirror_sound),
+            ("mirrorHideContent", &mut settings.mirror_hide_content),
+            ("mirrorDismissToPhone", &mut settings.mirror_dismiss_to_phone),
+            ("mirrorTextOnly", &mut settings.mirror_text_only),
+        ] {
+            match obj.get(key) {
+                None | Some(Value::Null) => {}
+                Some(Value::Bool(b)) => *field = *b,
+                Some(_) => problems.push(format!("{key} must be true or false")),
+            }
+        }
         match obj.get("deviceName") {
             None | Some(Value::Null) => {}
             Some(Value::String(s)) => settings.device_name = clean_device_name(s),
@@ -189,6 +218,11 @@ impl Settings {
             "imagesToClipboard": self.images_to_clipboard,
             "deviceName": self.device_name,
             "openLinksAutomatically": self.open_links_automatically,
+            "mirrorNotifications": self.mirror_notifications,
+            "mirrorSound": self.mirror_sound,
+            "mirrorHideContent": self.mirror_hide_content,
+            "mirrorDismissToPhone": self.mirror_dismiss_to_phone,
+            "mirrorTextOnly": self.mirror_text_only,
         })
     }
 
@@ -379,6 +413,11 @@ mod tests {
             images_to_clipboard: false,
             device_name: Some("Desk".into()),
             open_links_automatically: false,
+            mirror_notifications: true,
+            mirror_sound: true,
+            mirror_hide_content: true,
+            mirror_dismiss_to_phone: false,
+            mirror_text_only: true,
         };
         s.save(dir.path()).unwrap();
         assert_eq!(Settings::load(dir.path()), s);
