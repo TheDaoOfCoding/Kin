@@ -2,28 +2,49 @@
 
 Date: 2026-10-17. Integration agent (Claude Sonnet 5.5). **Not committed.**
 
-## Verdict: BLOCKED, none of the integration scenarios ran
+## Verdict: every scenario passes (second session, 2026-10-17 afternoon); no product bug found
 
-A game was running for the whole session, so every step that needs the dev Kin and the emulator was **skipped on purpose**. Nothing in this file is a pass or a fail of the product.
+The first session (earlier the same day) was blocked: Fortnite was running and the guard stopped every script. In the second session the game was closed. Only the idle Epic launcher and its helpers were left (`EpicGamesLauncher`, `EpicWebHelper`, `EpicOnlineServicesUserHelper`, `EOSOverlayRenderer`), and the old guard still refused because of them. The orchestrator narrowed the guard (see below), and the scripts then ran. **Nothing was committed.**
 
-* From 12:36 to the end of this session (14:30 and later, 2 hours or more) **Fortnite** was running with its anti-cheat: `FortniteClient-Win64-Shipping` (window title "Fortnite"), `FortniteClient-Win64-Shipping_EAC_EOS`, `FortniteLauncher`, `FortniteBootstrapper` and the `EasyAntiCheat_EOS` service, plus the Epic launcher.
-* `tools\check-2b3-desktop.ps1` (S0) stopped itself at `Assert-NoGameRunning` with "A game or an anti-cheat seems to be running ... Close the game and run this again". It wrote and touched nothing.
-* The rule for this task says to check for a fullscreen game or EasyAntiCheat before anything visible and to skip the step if one is there. I polled every 30 s for about 2 hours (one background watcher plus foreground loops) and the game never stopped. I did **not** bypass the guard, and I did not edit `kin-dev.ps1` to weaken it: the user is playing, and the run would also put an emulator, a dev Kin and a media session on a PC that is busy with the game.
-* One more thing for whoever runs this next: the guard also matches the Epic launcher's helper processes (`EpicGamesLauncher`, `EOSOverlayRenderer`, `EpicWebHelper`, `EpicOnlineServicesUserHelper`, all under `\Epic Games\`) and the idle `EasyAntiCheat_EOS` service. After Fortnite exits, those may still make `Assert-NoGameRunning` throw. Quit the Epic launcher too, or run with only the launcher left and decide whether that counts as "a game" (it does not, in my reading, but the shared guard says so).
+### The game guard was narrowed (`tools\kin-dev.ps1`, `tools\README.md`)
 
-**To run it:** close the game (and the Epic launcher), then, from the repo root, in this order, each once:
+The user's rule is "no disturbance while they play", so `Assert-NoGameRunning` now stops a script only when **(a)** a game process runs (`FortniteClient-Win64-Shipping*`, `FortniteLauncher`, `FortniteBootstrapper`, any `EasyAntiCheat*` process except the idle `EasyAntiCheat_EOS` service, `BEService`, `GameOverlayUI`, a few more, or a process from a game folder: `steamapps\common`, `Epic Games\<game>` but not `Launcher` or `Epic Online Services`, `Riot Games\VALORANT`, `XboxGames`, ...) **or (b)** Windows says `QUNS_BUSY`, `QUNS_RUNNING_D3D_FULL_SCREEN` or `QUNS_PRESENTATION_MODE` (`SHQueryUserNotificationState`, so any game or full-screen program). Idle launchers and services alone do not block. It prints what it saw (`Game guard: no game running (Windows notification state: QUNS_ACCEPTS_NOTIFICATIONS; ...)`). `e2e-2b-3.ps1` also calls it at the start of S1, S2 and S3. During the runs below it always passed.
 
-```
-tools\check-2b3-desktop.ps1                       S0 (silent, about a minute)
-tools\e2e-2b-3.ps1                                S1 .. S4 and S6 on kin_api37
-tools\e2e-2b-3.ps1 -Avd kin_api29 -Only S1,S2     the short Android 10 pass (1 and 2)
-tools\e2e-2b-2.ps1 -Only S1                       S5, pending since 2B.2
-tools\e2e-1-3.ps1 -Only S1,S4                     S5, one photo each way
-```
+### Builds used
+
+* `desktop\src-tauri\target\release\Kin.exe`: built by the 2B.4 desktop agent at 15:45:25, newer than every desktop source file (newest `cli.rs`, 15:41), so no rebuild was needed. The debug `Kin.exe`, the examples and the test binaries used by `check-2b3-desktop.ps1` were rebuilt (`cargo build`, `cargo build --examples`, `CARGO_BUILD_JOBS=2`, below-normal priority) because `cli.rs` was newer than the debug build.
+* **The release `Kin.exe` (15:45) predates the 2B.4 desktop review-round-1 fixes** (source edits 15:57 to 16:00 while this session ran; the desktop doc says the release build is to be rebuilt after the integration run). The 2B.3 / 2B.2 / 1.3 runs here were against the 15:45 build and are regression results for it; they should be re-run once after that rebuild. `check-2b4-desktop.ps1` used the debug build (16:01), which includes the fixes.
+* The APK is the **2B.4 pre-review-fix debug build** (`app-debug.apk`, 48,384,941 bytes, 15:25:23, from the working tree while the Android coder was still editing). It is fine for these regressions (the 2B.3 media code is unchanged by it), but the results are for that build, not for the final 2B.4 APK.
+
+### Shake-down: what was wrong in the new test scripts (no product code was changed)
+
+`e2e-2b-3.ps1` had never run; it took four runs to get green. All the failures were the test script's own:
+
+| Run | Failures | Cause and fix |
+|---|---|---|
+| 1 | 24 | **`MV` and `MI` are PowerShell aliases of `Move-Item`** (an alias beats a function of the same name), so every phone-state check read nothing. Renamed to `Mval` and `Mint`. The "phone's Kin log has none of the test strings" check matched `kinrelay` **case-insensitively** and so read adbd lines that quote the shell command (`--es title ZQPhoneSong`): now only the exact tag ` KinRelay: ` (case-sensitive) counts as the app's log |
+| 2 | 15 | the PC counters are read from `--dev-dump-view media` (current) and no longer from `status.json`, which is written on a state change only, so a command or a throttled state lags in it; the PC volume is `panel.volume` of that dump (the script looked in the wrong place); `Kin.exe --dev-media volume <n>` picks a level that is not the emulator's current one (the emulator keeps its volume between runs); the card state check tolerates the `dumpsys` format |
+| 3 | 3 | the phone's debug command `MEDIA_PC_CMD --es cmd volume --ei level 30` has `delta` default to **5**, which wins over a level unless `delta` is 0, so the script now passes `--ei delta 0`; a burst of 120 PC changes in under a second folds into one state by the reader's debounce, so the bound is 1..N, not 2..N |
+| 3 (also) | | the S2 "pause" press: the PC test session is always `Paused`, Windows lists no `pause` control for a Paused session (`controls=play,toggle,next,prev,position`), so the phone's pause button sends `toggle`, which Windows turns into a Play press: two `button play`, never a `button pause`. The check now says that (correct behavior, not a bug). The check of a phone that "lists media but never sent a status" now allows `media.status` (the PC's own switches go to any peer that lists `media`) and forbids `media.state`, `image`, `clear`, `volume`, `cmd` |
+
+`check-2b3-desktop.ps1` had two script bugs: the data directory path has a space (the user profile's name), so `--data-dir` must be quoted in `Start-DevKin` (also fixed in `check-2b2-desktop.ps1` and `check-2b4-desktop.ps1`); the "refuses the installed Kin's AUMID" check matched the word `Session` in PowerShell's own error text (now `-cnotmatch 'SESSION'`); and the dev Kin was still running when `cargo test` relinked `target\debug\Kin.exe` (os error 5), so it is stopped first.
+
+### Runs (each green run once; the failed first runs are the shake-down above)
+
+| Script | Result |
+|---|---|
+| `tools\check-2b3-desktop.ps1` | **PASS, 24 checks** (22 checks, the B1 refusal, the `#[ignore]`d `media_surface_real` test) |
+| `tools\e2e-2b-3.ps1` (kin_api37) | **PASS, 81 checks** |
+| `tools\e2e-2b-3.ps1 -Avd kin_api29 -Only S1,S2` | **PASS, 63 checks** (with the always-run setup, S4, S6) |
+| `tools\e2e-2b-2.ps1 -Only S1` | **PASS, 41 checks** (S1 and the always-run S7 privacy and registry checks), kin_api37 |
+| `tools\e2e-1-3.ps1 -Only S1,S4` | **PASS, 34 checks** (one photo each way; the real clipboard saved and restored in every format), kin_api37 |
+| `tools\check-2b4-desktop.ps1` | **PASS, 27 checks** (see [phase-2b-4-desktop.md](phase-2b-4-desktop.md), "Real-Windows check") |
+
+Screenshots are in `docs\results\phase-2b-3-integration-screens` (the S2 carousel with `ZQPcSong` / `ZQPcArtist · DESK-PC` and the play button; the Home volume slider with and without a PC session; the Android 10 shade). The PC name in them is `DESK-PC` (the script sets `COMPUTERNAME`).
 
 ## What was done
 
-### Builds (both sides changed since the last builds)
+### Builds of the first session (superseded: the second session ran the 15:45 desktop build and the 15:25 debug APK listed in "Builds used")
 
 Rebuilt on this PC on 2026-10-17, in the foreground. The desktop build ran with `CARGO_BUILD_JOBS=2` (the page file had run out during a parallel build before); it did not run out this time.
 
@@ -39,9 +60,9 @@ Rebuilt on this PC on 2026-10-17, in the foreground. The desktop build ran with 
 
 Both APK hashes differ from the Android results file (release 4,776,398 bytes, `D281B72...`; debug `9A65EAFE...`, same 49,214,099 bytes), as expected: the Android review round 1 fixes landed after that file's builds.
 
-### `tools\e2e-2b-3.ps1` (written, parse-checked, **not run**)
+### `tools\e2e-2b-3.ps1` (written in the first session; shaken down and green in the second, see above)
 
-Written to `tools/e2e-2b-3.ps1` and described in `tools/README.md`. It parses without errors; no line of it has been executed, so it **will need a first-run shake-down** (the likeliest places: the exact text of `MEDIA_STATE` fields, the slider's node in `uiautomator`, `cmd statusbar expand-settings` on the image, the `dumpsys media_session` text). It follows the 2B.2 script: lock, `kin-dev.ps1`, a headless emulator with no audio, a copy of the release `Kin.exe` as the test Kin on its own data directory and port 49371, `--dev-media-aumid` naming only the PC's own test session. Scenarios, all with only its own sessions:
+Written to `tools/e2e-2b-3.ps1` and described in `tools/README.md`. It follows the 2B.2 script: lock, `kin-dev.ps1`, a headless emulator with no audio, a copy of the release `Kin.exe` as the test Kin on its own data directory and port 49371, `--dev-media-aumid` naming only the PC's own test session. Scenarios, all with only its own sessions:
 
 | Id | What it does |
 |---|---|
@@ -54,31 +75,36 @@ Written to `tools/e2e-2b-3.ps1` and described in `tools/README.md`. It parses wi
 
 It never injects OS input on the PC (the emulator's `input tap/swipe` are on the emulator), never touches the clipboard, never sends a command to a session it did not create, and **cannot** write the real volume: the test Kin has the fake endpoint and the script never passes `--dev-media-real-volume`.
 
-### Read-only facts taken while blocked
+### Read-only facts
 
-* The real master volume, read only (`media_test_session volume-read`, no `Set*` call exists in it): `VOLUME level=100 muted=false steps=51`. This is the baseline for S6 and equals the value in the desktop results file.
-* The installed Kin (`C:\Program Files\Kin\Kin.exe`) has PID **25796** (the same as in the Android results file); I started, stopped and touched nothing of it. No process of mine is left (no dev Kin, fake phone, test session, emulator or adb server was started).
+* The real master volume, read only (`media_test_session volume-read`, no `Set*` call exists in it): `VOLUME level=100 muted=false steps=51` before and after every run. S6 of `e2e-2b-3.ps1` and the checks of `check-2b3-desktop.ps1` both pass on it.
+* The installed Kin (`C:\Program Files\Kin\Kin.exe`) has PID **25796** before and after every script of this session; nothing of it was started, stopped or touched. No process of mine is left (dev Kin, fake phone, test session, emulator).
 
 ## Scenario table
 
 | # | Scenario | Result |
 |---|---|---|
-| 0 | `check-2b3-desktop.ps1` (22 checks, the B1 refusal, the `#[ignore]`d surface test) | **not run** (guard: game and anti-cheat running) |
-| 1 | Phone to PC | **not run** |
-| 2 | PC to phone | **not run** |
-| 2b | API 29 short pass (1 and 2) | **not run** |
-| 3 | Gates and rate limits | **not run** |
-| 4 | Privacy grep | **not run** (the unit-test greps of both coders pass; the integration grep is pending) |
-| 5 | `e2e-2b-2.ps1 -Only S1`, one file each way | **not run** |
-| 6 | Guard | partly: real volume baseline read once (above), installed Kin PID 25796 unchanged for the whole session, nothing of mine left running. The "after" half needs a run |
+| 0 | `check-2b3-desktop.ps1` (22 checks, the B1 refusal, the `#[ignore]`d surface test) | **PASS** (24 checks) |
+| 1 | Phone to PC (flyout as `Paused` with title, artist, 200 s, thumbnail, position; track change; the flyout's toggle, next, prev, seek reach the phone's session; `--dev-media volume` moves the emulator's volume; share off is one `media.clear`; access revoked clears the PC card) | **PASS** (kin_api37) |
+| 2 | PC to phone (`kin-pc-media` with the PC test title, paused; `MediaStyle` notification on `kin_pc_media`, no media foreground service; carousel screenshot; the phone's buttons reach only the PC test session; fake PC volume 50, level 30, delta 5, `media.volume` back; the slider's final value; the slider with no PC session; Wi-Fi flap and PC restart leave no stale card) | **PASS** (kin_api37) |
+| 2b | API 29 short pass (1 and 2, plus setup, S4, S6) | **PASS** (63 checks) |
+| 3 | Gates and rate limits (each switch off sends nothing; 200 phone states reach the PC as 3..40; 120 PC changes fold into 1..N; 40 phone commands: at most 20 reach the PC; `--old-phone`, a phone with no status and one with `show:false` get no `media.state/image/clear/volume/cmd`) | **PASS** (kin_api37) |
+| 4 | Privacy grep (PC log, data directory, `status.json`, `--dev-dump-view media`, the phone's Kin log and app data hold none of the test strings; no picture on the PC's disk) | **PASS** |
+| 5 | `e2e-2b-2.ps1 -Only S1` (41 checks) and `e2e-1-3.ps1 -Only S1,S4` (34 checks, one photo each way, clipboard restored in every format) | **PASS** both |
+| 6 | Guard (real volume level 100, unmuted, before and after; installed Kin PID 25796 unchanged; no process left) | **PASS** |
 
 ## Bugs found
 
-None: nothing was run. (No product file was edited.)
+**No product bug.** Every failure of the first runs was in the test scripts (table above); no product file was edited. Things worth knowing that are *not* bugs:
 
-## What I'd look at first on the first run
+* `status.json`'s counters lag until the next state change (it is written on a state change). `--dev-dump-view media` is the current source for a script.
+* The phone's debug command `MEDIA_PC_CMD volume` takes `delta` (default 5) over `level` unless `delta` is 0. Debug-only (`android/app/src/debug/.../media/MediaHubDebug.kt:29`, `DebugMedia.kt:98`); a small trap for a script, not a release-code problem.
+* A Paused PC session cannot be sent a real `pause` (Windows lists no `pause` control then); the phone sends `toggle`. Matches the design.
+* The "S5" regressions ran against the **pre-review-fix 2B.4 debug APK**; they are green, but they say nothing about the final 2B.4 APK.
 
-These come from reading the coders' notes, not from a failure:
+## What I'd look at first on the first run (kept from the first session; all of it is now covered and passing)
+
+These came from reading the coders' notes, not from a failure:
 
 * **Review fix 8 (fast reconnect)** is hard to see from outside because the spec already clears the card on a connection close; the script checks the visible result (no stale card after a Wi-Fi flap or a PC restart with no PC session meanwhile), not the internal path.
 * **`media.cmd volume` from `MEDIA_PC_CMD`** goes through the phone's `VolumeProvider`, which exists only while "Use the phone's volume keys for the PC" is on; the script turns it on for the volume steps and off again, and uses the Home slider for the slider checks.

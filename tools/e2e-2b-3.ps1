@@ -108,9 +108,9 @@ function Flush-PhoneLog {
     # the phone's Kin log is saved to a file before every command (and the buffer cleared), so nothing rolls over and S4 reads all of it
     try {
         $all = @(A logcat -d -v threadtime)
-        $kinLines = @($all | Where-Object { $_ -match 'KinRelay' })
+        $kinLines = @($all | Where-Object { $_ -cmatch '\sKinRelay:\s' })   # the app's own tag (not adbd lines that quote our package name, nor system services)
         if ($kinLines.Count -gt 0) { Add-Content -Path $PhoneLog -Value $kinLines -Encoding UTF8 }
-        $hits = @($all | Where-Object { $l = $_; $l -notmatch 'KinRelay' -and $l -notmatch '\sadbd\s*:' -and ($TestStrings | Where-Object { $l.Contains($_) }) })
+        $hits = @($all | Where-Object { $l = $_; $l -cnotmatch '\sKinRelay:\s' -and $l -notmatch '\sadbd\s*:' -and ($TestStrings | Where-Object { $l.Contains($_) }) })
         if ($hits.Count -gt 0) { Add-Content -Path $SystemHits -Value ($hits | ForEach-Object { ($_ -replace '^\S+\s+\S+\s+\d+\s+\d+\s+\w\s+', '') -replace '(.{0,160}).*', '$1' }) -Encoding UTF8 }
         A logcat -c | Out-Null
     } catch { }
@@ -122,8 +122,8 @@ function Phone-Cmd([string]$Command, [string]$Extras = '', [int]$Wait = 900) {
     @(A logcat -d -s KinRelay | Where-Object { $_ -match 'CMD' } | ForEach-Object { ($_ -replace '^.*CMD ', 'CMD ') })
 }
 function Media-State { (Phone-Cmd 'MEDIA_STATE' '' 700 | Where-Object { $_ -match 'CMD MEDIA_STATE' } | Select-Object -Last 1) }
-function MV([string]$S, [string]$Name) { if ($S -match ("\b{0}=([^\s{{}}]+)" -f $Name)) { return $Matches[1] } return $null }
-function MI([string]$S, [string]$Name) { $v = MV $S $Name; if ($null -ne $v -and $v -match '^\d+$') { return [int]$v } return -1 }
+function Mval([string]$S, [string]$Name) { if ($S -match ("\b{0}=([^\s{{}}]+)" -f $Name)) { return $Matches[1] } return $null }
+function Mint([string]$S, [string]$Name) { $v = Mval $S $Name; if ($null -ne $v -and $v -match '^\d+$') { return [int]$v } return -1 }
 function MBrace([string]$S, [string]$Name) { if ($S -match ("\b{0}=\{{([^}}]*)\}}" -f $Name)) { return $Matches[1] } return '' }
 function MKey([string]$Brace, [string]$Key) { $m = [regex]::Match($Brace, ("\b{0}[:=]\s*(\d+)" -f [regex]::Escape($Key))); if ($m.Success) { return [int]$m.Groups[1].Value } return 0 }
 function Session-Dump { (A shell dumpsys media_session | Out-String) }
@@ -169,7 +169,9 @@ function Go-Home {
 # ---------------------------------------------------------------------------------------------------------------------------------- the PC
 function Kin-Log { Read-Shared (Join-Path $Data 'logs\kin.log') }
 function Get-Status { try { Get-Content (Join-Path $Data 'status.json') -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $null } }
-function Kc([string]$Path) { $v = (Get-Status).media.counts; foreach ($p in ($Path -split '\.')) { $v = $v.$p }; if ($null -eq $v) { return -1 }; [int]$v }
+function Kc([string]$Path) {
+    # The counters come from --dev-dump-view media (current): status.json is written only on a state change, so a command or a state that changes no state lags in it.
+    $v = (View-Media).counts; foreach ($p in ($Path -split '\.')) { $v = $v.$p }; if ($null -eq $v) { return -1 }; [int]$v }
 function Kv { (Get-Status).media.view }
 function View-Media {
     Remove-Item (Join-Path $Data 'view-media.json') -ErrorAction SilentlyContinue
@@ -177,7 +179,7 @@ function View-Media {
     Wait-Until { Test-Path (Join-Path $Data 'view-media.json') } 6 | Out-Null
     try { Get-Content (Join-Path $Data 'view-media.json') -Raw | ConvertFrom-Json } catch { $null }
 }
-function Pc-Volume { $v = (View-Media).volume; if ($v) { return [int]$v.level } return -1 }
+function Pc-Volume { $v = (View-Media).panel.volume; if ($v) { return [int]$v.level } return -1 }
 function Pc-Read { (& $Session read $script:KinAumid 2>$null) -join ' ' }
 function Pc-Flyout-Title([string]$Title) { (Pc-Read) -match ("title={0} " -f [regex]::Escape($Title)) }
 function Send-Session([string]$Line) {
@@ -273,19 +275,20 @@ try {
     # --- with the phone's switches off (the default), nothing flows
     Start-Sleep -Seconds 4
     $st = Media-State
-    Check 'setup: the phone''s switches are off by default and the PC sent no media' ((MV $st 'share') -eq 'False' -and (MV $st 'show') -eq 'False' -and (Kc 'sent.states') -eq 0) "$st | sent.states=$(Kc 'sent.states')"
-    Check 'setup: the PC said what it shows and shares (media.status reached the phone)' ((MV $st 'peerShow') -eq 'true' -and (MV $st 'peerShare') -eq 'true') $st
+    Check 'setup: the phone''s switches are off by default and the PC sent no media' ((Mval $st 'share') -eq 'False' -and (Mval $st 'show') -eq 'False' -and (Kc 'sent.states') -eq 0) "$st | sent.states=$(Kc 'sent.states')"
+    Check 'setup: the PC said what it shows and shares (media.status reached the phone)' ((Mval $st 'peerShow') -eq 'true' -and (Mval $st 'peerShare') -eq 'true') $st
 
     # --- the user's switches (the shell is the user) and the access the way the shell can grant it
     Phone-Cmd 'MEDIA_SET' '--ez share true --ez show true' | Out-Null
     A shell cmd notification allow_listener $Service | Out-Null
-    $statusOk = Wait-Until { $s = Media-State; (MV $s 'access') -eq 'true' -and (MV $s 'listener') -eq 'true' } $(if ($script:Sdk -lt 30) { 70 } else { 20 }) 1500
+    $statusOk = Wait-Until { $s = Media-State; (Mval $s 'access') -eq 'true' -and (Mval $s 'listener') -eq 'true' } $(if ($script:Sdk -lt 30) { 70 } else { 20 }) 1500
     Check 'setup: access granted and the phone''s reader runs (the PC shows media, so the phone reads)' $statusOk (Media-State)
     $pcLine = @((Kv).phones)[0].status
     Say "the PC's line for the phone: $pcLine"
 
     # ============================================================================================================================ S1 phone -> PC
     if (Want 'S1') {
+        Assert-NoGameRunning   # a game may have started since the last scenario: stop at the boundary
         Say '--- S1 phone -> PC'
         $r0 = Kc 'received.states'
         Phone-Cmd 'MEDIA_TEST_START' '--es title ZQPhoneSong --es artist ZQPhoneArtist --ei durationMs 200000' | Out-Null
@@ -315,19 +318,22 @@ try {
         $st = Media-State
         $in = MBrace $st 'cmdsReceived'
         Check 'S1 the flyout''s toggle, next, prev and seek were accepted by Windows (the dev Kin''s own session)' (($r1 -eq 'RESULT true') -and ($r2 -eq 'RESULT true') -and ($r3 -eq 'RESULT true') -and ($r4 -eq 'RESULT true')) "$r1 / $r2 / $r3 / $r4"
-        Check 'S1 the phone''s test session got next, prev, seek 120000 and a play or pause (media.cmd, the effect is the next state)' ((MKey $in 'next') -ge 1 -and (MKey $in 'prev') -ge 1 -and (MKey $in 'seek') -ge 1 -and ((MKey $in 'play') + (MKey $in 'pause')) -ge 1 -and (MV $st 'lastCmd') -match 'seek') "$in lastCmd=$(MV $st 'lastCmd')"
+        Check 'S1 the phone''s test session got next, prev, seek 120000 and a play or pause (media.cmd, the effect is the next state)' ((MKey $in 'next') -ge 1 -and (MKey $in 'prev') -ge 1 -and (MKey $in 'seek') -ge 1 -and ((MKey $in 'play') + (MKey $in 'pause')) -ge 1 -and (Mval $st 'lastCmd') -match 'seek') "$in lastCmd=$(Mval $st 'lastCmd')"
         Check 'S1 PC counted the commands out' ((Kc 'cmds.out') -ge 4) "out=$(Kc 'cmds.out')"
-        $mv0 = MV (Media-State) 'musicVolume'
-        Invoke-Kin --dev-media volume 40 | Out-Null; Start-Sleep -Milliseconds 1500
-        $mv1 = MV (Media-State) 'musicVolume'
+        $mv0 = Mval (Media-State) 'musicVolume'
+        # a target that is not the emulator's current volume (it keeps its volume between runs): 20 % or 80 %
+        $mvNow = if ($mv0 -match '^(\d+)/(\d+)$') { [int]$Matches[1] / [int]$Matches[2] } else { 0.4 }
+        $mvTarget = if ($mvNow -gt 0.5) { 20 } else { 80 }
+        Invoke-Kin --dev-media volume $mvTarget | Out-Null; Start-Sleep -Milliseconds 1500
+        $mv1 = Mval (Media-State) 'musicVolume'
         Check 'S1 PC -> phone volume command (Kin.exe --dev-media volume 40, the user''s own path) changes the EMULATOR''s music volume (not the PC''s)' ($mv0 -ne $mv1) "$mv0 -> $mv1"
 
         # --- share off -> one clear
-        $cl0 = MI (Media-State) 'clears'
+        $cl0 = Mint (Media-State) 'clears'
         Phone-Cmd 'MEDIA_SET' '--ez share false' 1500 | Out-Null
         Check 'S1 share off: the flyout session is cleared on the PC' (Wait-Until { (Pc-Read) -notmatch 'title=ZQPhone' } 10 500) (Pc-Read)
         $st = Media-State
-        Check 'S1 share off: exactly one media.clear was sent, and the reader stopped' ((MI $st 'clears') -eq ($cl0 + 1) -and (MV $st 'listener') -eq 'false') "clears $cl0 -> $(MI $st 'clears') listener=$(MV $st 'listener')"
+        Check 'S1 share off: exactly one media.clear was sent, and the reader stopped' ((Mint $st 'clears') -eq ($cl0 + 1) -and (Mval $st 'listener') -eq 'false') "clears $cl0 -> $(Mint $st 'clears') listener=$(Mval $st 'listener')"
         $s0 = Kc 'received.states'
         Phone-Cmd 'MEDIA_TEST_TRACK' '--es title ZQGateSong --es artist ZQPhoneArtist' 1500 | Out-Null
         Check 'S1 share off: a track change sends nothing' ((Kc 'received.states') -eq $s0) "received.states $s0 -> $(Kc 'received.states')"
@@ -338,7 +344,7 @@ try {
         A shell cmd notification disallow_listener $Service | Out-Null
         Check 'S1 access revoked while sharing: the stale card is cleared on the PC' (Wait-Until { (Pc-Read) -notmatch 'title=ZQ' } 15 750) (Pc-Read)
         $st = Media-State
-        Check 'S1 access revoked: the phone says access false, reader stopped' ((MV $st 'access') -eq 'false' -and (MV $st 'listener') -eq 'false') $st
+        Check 'S1 access revoked: the phone says access false, reader stopped' ((Mval $st 'access') -eq 'false' -and (Mval $st 'listener') -eq 'false') $st
         Say ("the PC's line after the revoke: " + (@((Kv).phones)[0].status))
         A shell cmd notification allow_listener $Service | Out-Null
         Check 'S1 access granted again: the session comes back' (Wait-Until { Pc-Flyout-Title 'ZQGateSong' } $(if ($script:Sdk -lt 30) { 70 } else { 30 }) 1500) (Pc-Read)
@@ -346,16 +352,18 @@ try {
 
     # ============================================================================================================================ S2 PC -> phone
     if (Want 'S2') {
+        Assert-NoGameRunning
         Say '--- S2 PC -> phone'
         Phone-Cmd 'MEDIA_TEST_STOP' '' 800 | Out-Null     # nothing of the phone's own now
         Set-PcSession @('title ZQPcSong', 'artist ZQPcArtist', 'state paused', 'pos 30000')
         Check 'S2 the phone shows the PC session (kin-pc-media is an active MediaSession)' (Wait-Until { Pc-Session-On-Phone } 20 1000) ''
         $card = Pc-Card-Text
-        Check 'S2 the session''s title is the PC test session''s, state paused' ($card -match 'ZQPcSong' -and $card -match 'state=2') ($card.Substring(0, [Math]::Min(300, $card.Length)) -replace '\s+', ' ')
+        $cardState = (($card -split "`n") | Where-Object { $_ -match 'PlaybackState|\bstate=' } | Select-Object -First 3) -join ' | '
+        Check 'S2 the session''s title is the PC test session''s, state paused' ($card -match 'ZQPcSong' -and $cardState -match '(?i)state=(2\b|PAUSED)') ($cardState -replace '\s+', ' ')
         $nd = Notif-Dump
         Check 'S2 a MediaStyle notification on channel kin_pc_media, no foreground media service' ($nd -match 'kin_pc_media' -and $nd -match 'MediaStyle' -and (A shell dumpsys activity services $Pkg | Out-String) -notmatch 'foregroundServiceType=0x2[0-9a-f]*\b.*mediaPlayback') ''
         $mst = Media-State
-        Check 'S2 the phone''s own state: pcSession true, pcState paused' ((MV $mst 'pcSession') -eq 'True' -and (MV $mst 'pcState') -eq 'paused') $mst
+        Check 'S2 the phone''s own state: pcSession true, pcState paused' ((Mval $mst 'pcSession') -eq 'True' -and (Mval $mst 'pcState') -eq 'paused') $mst
         if ($script:Sdk -ge 33) {
             A shell cmd statusbar expand-settings | Out-Null; Start-Sleep -Seconds 2
             Shot '02-s2-carousel-pc-media-paused'
@@ -372,13 +380,16 @@ try {
         }
         Start-Sleep -Seconds 1
         $ev = @(Ev-Lines | Select-Object -Skip $e0)
-        Check 'S2 the phone''s play, pause, next, prev, seek 90000 reached ONLY the PC test session (its own press log)' (($ev -contains 'button play') -and ($ev -contains 'button pause') -and ($ev -contains 'button next') -and ($ev -contains 'button prev') -and ($ev -contains 'seek 90000')) ($ev -join ' | ')
+        # The test session is always Paused, and Windows lists no `pause` control for a Paused session (read: controls=play,toggle,...), so the phone's pause button
+        # sends `toggle`, which Windows turns into a Play press: two `button play` (play, and pause as a toggle), never a `button pause`.
+        $plays = @($ev | Where-Object { $_ -eq 'button play' }).Count
+        Check 'S2 the phone''s play, pause (a toggle: the session is Paused), next, prev, seek 90000 reached ONLY the PC test session (its own press log)' (($plays -eq 2) -and ($ev -notcontains 'button pause') -and ($ev -contains 'button next') -and ($ev -contains 'button prev') -and ($ev -contains 'seek 90000') -and $ev.Count -eq 5) ($ev -join ' | ')
 
         # --- the volume: the FAKE endpoint (a test run), 51 steps of 2 %, starts at 50
         $v0 = Pc-Volume
         Check 'S2 the PC volume is the FAKE endpoint, starting at 50' ($v0 -eq 50 -and (Kv).mode -eq 'test') "level=$v0"
         Phone-Cmd 'MEDIA_SET' '--ez volkeys true' 1500 | Out-Null
-        Phone-Cmd 'MEDIA_PC_CMD' '--es cmd volume --ei level 30' 1500 | Out-Null
+        Phone-Cmd 'MEDIA_PC_CMD' '--es cmd volume --ei delta 0 --ei level 30' 1500 | Out-Null   # the debug command's delta defaults to 5 and wins over a level unless it is 0
         Check 'S2 media.cmd volume level 30 (the phone''s volume provider) sets the fake to 30' (Wait-Until { (Pc-Volume) -eq 30 } 8 1000) "level=$(Pc-Volume)"
         Phone-Cmd 'MEDIA_PC_CMD' '--es cmd volume --ei delta 5' 1500 | Out-Null
         $vd = Pc-Volume
@@ -437,6 +448,7 @@ try {
 
     # ============================================================================================================================ S3 gates and rates
     if (Want 'S3') {
+        Assert-NoGameRunning
         Say '--- S3 gates and rates'
         Set-PcSession @('state paused', 'title ZQPcSong')
         if (-not (Pc-Flyout-Title 'ZQGateSong') -and -not (Pc-Flyout-Title 'ZQPhoneTwo')) {
@@ -448,10 +460,10 @@ try {
         # --- the PC's "show" off: the phone stops reading and sending, the flyout session goes
         Invoke-Kin --dev-set mediaShow false | Out-Null
         Check 'S3 PC show off: the flyout session is removed at once' (Wait-Until { (Pc-Read) -notmatch 'title=ZQ' } 10 500) (Pc-Read)
-        Check 'S3 PC show off: the phone sees peerShow false and stops its reader (nothing is read while nobody shows it)' (Wait-Until { $s = Media-State; (MV $s 'peerShow') -eq 'false' -and (MV $s 'listener') -eq 'false' } 20 1500) (Media-State)
-        $st0 = MI (Media-State) 'sentStates'; $r0 = Kc 'received.states'
+        Check 'S3 PC show off: the phone sees peerShow false and stops its reader (nothing is read while nobody shows it)' (Wait-Until { $s = Media-State; (Mval $s 'peerShow') -eq 'false' -and (Mval $s 'listener') -eq 'false' } 20 1500) (Media-State)
+        $st0 = Mint (Media-State) 'sentStates'; $r0 = Kc 'received.states'
         Phone-Cmd 'MEDIA_TEST_TRACK' '--es title ZQGateSong2 --es artist ZQPhoneArtist' 2000 | Out-Null
-        Check 'S3 PC show off: a track change sends nothing (phone sentStates and PC received.states unchanged)' ((MI (Media-State) 'sentStates') -eq $st0 -and (Kc 'received.states') -eq $r0) "sent $st0, received $r0"
+        Check 'S3 PC show off: a track change sends nothing (phone sentStates and PC received.states unchanged)' ((Mint (Media-State) 'sentStates') -eq $st0 -and (Kc 'received.states') -eq $r0) "sent $st0, received $r0"
         Invoke-Kin --dev-set mediaShow true | Out-Null
         Check 'S3 PC show on again: the session returns' (Wait-Until { Pc-Flyout-Title 'ZQGateSong2' } 25 1000) (Pc-Read)
         # --- the PC's "share" off: the phone's PC card goes (one clear), nothing is sent
@@ -496,7 +508,7 @@ try {
         Start-Sleep -Seconds 2
         $ds = (Kc 'sent.states') - $s0
         $cap = [int]([Math]::Ceiling($took / 0.25) + 14)
-        Check "S3 rate: 120 changes of the PC session in $([int]$took) s reach the phone as a handful (2..$cap), never 120" ($ds -ge 2 -and $ds -le $cap) "sent.states +$ds"
+        Check "S3 rate: 120 changes of the PC session in $([int]$took) s reach the phone as a handful (1..$cap; the reader's debounce can fold a fast burst into one state), never 120" ($ds -ge 1 -and $ds -le $cap) "sent.states +$ds"
         Set-PcSession @('title ZQPcSong', 'state paused', 'pos 30000')
         Wait-Until { (Pc-Card-Text) -match 'ZQPcSong' } 15 1000 | Out-Null
         # a flood of commands: 40 'next' in about 2 s -> at most 20 reach the PC test session (the phone and the PC each limit it)
@@ -534,7 +546,7 @@ try {
             Set-PcSession @("title ZQPcTwo$vi")
             if (-not $p.WaitForExit(30000)) { Stop-OwnProcess $p $Fake }
             $txt = Get-Content $out -Raw -ErrorAction SilentlyContinue
-            Check "S3 $($v.Name): the PC sent it no media.* message (silent drop, nothing received)" (($txt -match 'hello|paired|connected|received') -and ($txt -notmatch 'received media\.')) (($txt -split "`n" | Select-Object -First 3) -join ' | ')
+            Check "S3 $($v.Name): the PC sent it no media.state, image, clear, volume or cmd (media.status, the PC's own switches, is allowed to a peer that lists media)" (($txt -match 'hello|paired|connected|received') -and ($txt -notmatch 'type=media\.(state|image|clear|volume|cmd)')) (($txt -split "`n" | Select-Object -First 3) -join ' | ')
         }
         Set-PcSession @('title ZQPcSong', 'state paused')
     }

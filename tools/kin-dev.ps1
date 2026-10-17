@@ -135,21 +135,53 @@ function Stop-OwnProcess {
 }
 
 function Get-RunningGames {
-    # A game or an anti-cheat service on this PC (a heuristic: well-known anti-cheat processes, and any process that runs from a game library folder).
-    # Scripts that show a window or bring one to the front check it first and stop (rules of the agents: no pop-ups while a game is running).
-    $anti = 'EasyAntiCheat', 'EasyAntiCheat_EOS', 'BEService', 'BEDaisy', 'vgc', 'vgtray', 'FACEITClient', 'ESEA', 'Ricochet', 'GameOverlayUI'
+    # A GAME that is running now (a heuristic): a process of a known game or of an anti-cheat that only runs with a game, or a process that runs from a
+    # game library folder. The rule behind it is "no disturbance while the user PLAYS", so an idle launcher or service does NOT count: the Epic launcher
+    # and its helpers (EpicGamesLauncher, EpicWebHelper, EpicOnlineServicesUserHelper, EOSOverlayRenderer), the Steam client, the Riot client and the
+    # EasyAntiCheat_EOS service (which stays up for hours after the game closes) are ignored. To add a game, add a pattern to $names or $paths.
+    $names = '^FortniteClient-Win64-Shipping', '^FortniteLauncher$', '^FortniteBootstrapper$', '^EasyAntiCheat(?!_EOS$)', '^BEService$', '^GameOverlayUI$', '^VALORANT-Win64-Shipping$', '^cs2$', '^csgo$', '^RocketLeague$'
+    $paths = '\\steamapps\\common\\', '\\Epic Games\\(?!Launcher\\|Epic Online Services\\)[^\\]+\\', '\\Riot Games\\(VALORANT|League of Legends)\\', '\\XboxGames\\', '\\Origin Games\\', '\\EA Games\\', '\\Ubisoft Game Launcher\\games\\', '\\GOG Galaxy\\Games\\'
+    $pathRx = '(?i)' + ($paths -join '|')
     $found = @()
     foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
-        if ($anti -contains $p.ProcessName) { $found += $p.ProcessName; continue }
+        $hit = $false
+        foreach ($n in $names) { if ($p.ProcessName -match $n) { $hit = $true; break } }
+        if ($hit) { $found += $p.ProcessName; continue }
         $path = $null; try { $path = $p.Path } catch { }
-        if ($path -and ($path -match '(?i)\\steamapps\\common\\|\\Epic Games\\[^\\]+\\|\\Riot Games\\|\\XboxGames\\|\\Origin Games\\|\\EA Games\\|\\Ubisoft Game Launcher\\games\\|\\GOG Galaxy\\Games\\')) { $found += $p.ProcessName }
+        if ($path -and ($path -match $pathRx)) { $found += $p.ProcessName }
     }
     return @($found | Sort-Object -Unique)
 }
 
+function Get-UserNotificationState {
+    # Windows' own answer to "is the user in a game or a full-screen program?": SHQueryUserNotificationState. Returns the name of the state, or $null if
+    # the call failed (no interactive desktop). Works for any game, not only the ones in Get-RunningGames.
+    if (-not ('KinDevShell.Quns' -as [type])) {
+        Add-Type -Namespace KinDevShell -Name Quns -MemberDefinition '[System.Runtime.InteropServices.DllImport("shell32.dll")] public static extern int SHQueryUserNotificationState(out int state);'
+    }
+    $s = 0
+    $hr = [KinDevShell.Quns]::SHQueryUserNotificationState([ref]$s)
+    if ($hr -ne 0) { return $null }
+    switch ($s) {
+        1 { 'QUNS_NOT_PRESENT' } 2 { 'QUNS_BUSY' } 3 { 'QUNS_RUNNING_D3D_FULL_SCREEN' } 4 { 'QUNS_PRESENTATION_MODE' }
+        5 { 'QUNS_ACCEPTS_NOTIFICATIONS' } 6 { 'QUNS_QUIET_TIME' } 7 { 'QUNS_APP' } default { "QUNS_$s" }
+    }
+}
+
 function Assert-NoGameRunning {
+    # Stops (throws) when a game runs (Get-RunningGames) OR Windows reports a full-screen / game / presentation state. Idle launchers and services alone do
+    # not stop anything. Says what it saw, so a run's log shows why it went on. Cheap (one process list and one call): call it again at the start of every
+    # visible step.
     $g = @(Get-RunningGames)
-    if ($g.Count -gt 0) { throw ("A game or an anti-cheat seems to be running ({0}): not showing any window now. Close the game and run this again." -f ($g -join ', ')) }
+    $state = $null; try { $state = Get-UserNotificationState } catch { }
+    $busy = @('QUNS_BUSY', 'QUNS_RUNNING_D3D_FULL_SCREEN', 'QUNS_PRESENTATION_MODE') -contains $state
+    if ($g.Count -gt 0 -or $busy) {
+        $why = @()
+        if ($g.Count -gt 0) { $why += ('game process(es): ' + ($g -join ', ')) }
+        if ($busy) { $why += "Windows says $state" }
+        throw ("A game seems to be running ({0}): not showing anything now. Close the game and run this again." -f ($why -join '; '))
+    }
+    Write-Host ("Game guard: no game running (Windows notification state: {0}; idle launchers and services do not count)." -f $(if ($state) { $state } else { 'unknown' }))
 }
 
 function Remove-DevDataDir {
