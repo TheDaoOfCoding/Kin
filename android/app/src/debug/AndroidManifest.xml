@@ -57,6 +57,19 @@
                 <action android:name="app.kinrelay.android.debug.MIRROR_STATE" />
                 <action android:name="app.kinrelay.android.debug.MIRROR_CANCEL" />
                 <action android:name="app.kinrelay.android.debug.MIRROR_CLEAR_ALL" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_SET" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_TEST_START" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_TEST_TRACK" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_TEST_STATE" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_TEST_STOP" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_TEST_BURST" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_STATE" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_PC_CMD" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_PC_FAKE" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_PC_FAKE_CLEAR" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_VOLUME" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_READ_ALL" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_PROBE" />
             </intent-filter>
         </receiver>
 

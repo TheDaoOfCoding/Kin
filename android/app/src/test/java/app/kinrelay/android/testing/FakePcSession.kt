@@ -28,6 +28,12 @@ import org.junit.Test
  *                 frame from the phone, `notif.*` and the `ack` or `error` of a `notif.action`, is in the events file as `frame from phone: ...` (a test
  *                 stub: it keeps the test strings the scripts post, so never point it at real notifications). `notifoff` / `notifon` send a new `hello`
  *                 without or with `notif`; `dismiss <nid>` sends `notif.dismiss`; `action <nid> <i> <label>` a button press; `reply <nid> <i> <label>|<text>` a reply.
+ *                 Milestone 2B.3 (media): the hello also lists `media` (`mediaoff` / `mediaon` send a new hello without or with it). Every frame from the
+ *                 phone is in the events file as before (the debug sessions carry test strings only). `mstatus <show> <share>` (true|false each) sends a
+ *                 `media.status`; `mstate <state> [title|artist|durationMs|positionMs|actions|art]` a `media.state` of a made-up PC player (actions are
+ *                 comma separated, `art` is 0 or 1: a `media.image` goes first); `mclear`; `mvolume <level> <muted>`; `mcmd <cmd> [arg]` a `media.cmd` for the
+ *                 `sid` of the phone's last `media.state` (`seek`'s arg is the position in ms, `volume`'s is `level=N`, `delta=N` or `mute=true|false`, which
+ *                 need no session); `mcmdsid <sid> <cmd> [arg]` the same with a `sid` of your choice (a stale one); `mraw <json>` any frame as it is.
  *
  *   KIN_FAKE_PC=1 gradlew.bat testDebugUnitTest --tests "*FakePcSession*" --rerun
  */
@@ -41,7 +47,7 @@ class FakePcSession {
         val command = File(dir, "command.txt").also { it.writeText("") }
         fun event(text: String) = events.appendText("${System.currentTimeMillis()} $text\n")
 
-        FakePc(name = "Fake PC", fixedPort = 47831).apply { autoPair = true; helloCapabilities = listOf("link", "notif") }.start().use { pc ->
+        FakePc(name = "Fake PC", fixedPort = 47831).apply { autoPair = true; helloCapabilities = listOf("link", "notif", "media") }.start().use { pc ->
             val token = "AAECAwQFBgcICQoLDA0ODw"
             File(dir, "pair-url.txt").writeText(
                 "kinrelay://pair?v=1&a=10.0.2.2:${pc.port}&id=${pc.identity.deviceId}&tk=$token&n=Fake%20PC"
@@ -49,8 +55,11 @@ class FakePcSession {
             event("listening on 127.0.0.1:${pc.port} pcId=${pc.identity.deviceId}")
             // `holdtext`: texts the PC "queued" while the phone was away; they go out right after the phone's next hello (the PC's own queue, milestone 1.4).
             val held = java.util.concurrent.ConcurrentLinkedQueue<String>()
+            // The sid of the phone's last `media.state`: what a `mcmd` of this stub is for.
+            var phoneSid: String? = null
             pc.onFrame = { _, frame ->
                 event("frame from phone: $frame")
+                if (frame["type"]?.jsonPrimitive?.content == "media.state") phoneSid = frame["sid"]?.jsonPrimitive?.content
                 if (frame["type"]?.jsonPrimitive?.content == "hello") {
                     while (true) { val t = held.poll() ?: break; pc.sendText("fake-pc-held-${System.nanoTime()}", t, isUrl = false); event("sent held text after the phone's hello") }
                 }
@@ -94,7 +103,56 @@ class FakePcSession {
                             "holdtext" -> held += argument
                             "used" -> pc.files.usedIds += argument.trim() // the PC has used this transfer ID up (canceled, failed or forgotten): POST, PUT and DELETE with it are 404
                             "notifon" -> { pc.helloCapabilities = listOf("link", "notif"); pc.send(pc.helloFrame()) }
-                            "notifoff" -> { pc.helloCapabilities = listOf("link"); pc.send(pc.helloFrame()) }
+                            "notifoff" -> { pc.helloCapabilities = listOf("link", "media"); pc.send(pc.helloFrame()) }
+                            "mediaon" -> { pc.helloCapabilities = listOf("link", "notif", "media"); pc.send(pc.helloFrame()) }
+                            "mediaoff" -> { pc.helloCapabilities = listOf("link", "notif"); pc.send(pc.helloFrame()) }
+                            "mstatus" -> {
+                                val (show, share) = argument.trim().split(' ')
+                                pc.send(kotlinx.serialization.json.buildJsonObject { put("type", "media.status"); put("id", "fake-pc-mstatus-${System.nanoTime()}"); put("show", show.toBoolean()); put("share", share.toBoolean()) }.toString())
+                            }
+                            "mstate" -> {
+                                val parts = argument.trim().split(' ', limit = 2)
+                                val fields = parts.getOrElse(1) { "" }.split('|')
+                                val art = fields.getOrElse(5) { "0" } == "1"
+                                val artBytes = if (art) fakeArt() else null
+                                if (artBytes != null) pc.send(kotlinx.serialization.json.buildJsonObject {
+                                    put("type", "media.image"); put("id", "fake-pc-mimage-${System.nanoTime()}"); put("hash", sha(artBytes).take(32)); put("kind", "art")
+                                    put("data", java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(artBytes))
+                                }.toString())
+                                pc.send(kotlinx.serialization.json.buildJsonObject {
+                                    put("type", "media.state"); put("id", "fake-pc-mstate-${System.nanoTime()}"); put("sid", sha("fake.pc.player".toByteArray()).take(32)); put("app", "Fake Player")
+                                    put("state", parts[0])
+                                    fields.getOrNull(0)?.takeIf { it.isNotEmpty() }?.let { put("title", it) }
+                                    fields.getOrNull(1)?.takeIf { it.isNotEmpty() }?.let { put("artist", it) }
+                                    fields.getOrNull(2)?.takeIf { it.isNotEmpty() }?.let { put("durationMs", it.toLong()) }
+                                    fields.getOrNull(3)?.takeIf { it.isNotEmpty() }?.let { put("positionMs", it.toLong()) }
+                                    fields.getOrNull(4)?.takeIf { it.isNotEmpty() }?.let { list -> put("actions", kotlinx.serialization.json.JsonArray(list.split(',').map { kotlinx.serialization.json.JsonPrimitive(it) })) }
+                                    if (artBytes != null) put("artHash", sha(artBytes).take(32))
+                                    put("volume", kotlinx.serialization.json.buildJsonObject { put("level", 40); put("muted", false) })
+                                }.toString())
+                            }
+                            "mclear" -> pc.send("""{"type":"media.clear","id":"fake-pc-mclear-${System.nanoTime()}"}""")
+                            "mvolume" -> {
+                                val (level, muted) = argument.trim().split(' ')
+                                pc.send(kotlinx.serialization.json.buildJsonObject { put("type", "media.volume"); put("id", "fake-pc-mvolume-${System.nanoTime()}"); put("level", level.toInt()); put("muted", muted.toBoolean()) }.toString())
+                            }
+                            "mcmd", "mcmdsid" -> {
+                                val parts = argument.trim().split(' ')
+                                val sidArg = if (text == "mcmdsid") parts[0] else phoneSid
+                                val cmd = parts[if (text == "mcmdsid") 1 else 0]
+                                val arg = parts.getOrNull(if (text == "mcmdsid") 2 else 1)
+                                pc.send(kotlinx.serialization.json.buildJsonObject {
+                                    put("type", "media.cmd"); put("id", "fake-pc-mcmd-${System.nanoTime()}"); put("cmd", cmd)
+                                    if (sidArg != null && cmd != "volume") put("sid", sidArg)
+                                    when {
+                                        cmd == "seek" -> put("seekMs", arg!!.toLong())
+                                        cmd == "volume" && arg!!.startsWith("level=") -> put("level", arg.substringAfter('=').toInt())
+                                        cmd == "volume" && arg!!.startsWith("delta=") -> put("delta", arg.substringAfter('=').toInt())
+                                        cmd == "volume" -> put("mute", arg!!.substringAfter('=').toBoolean())
+                                    }
+                                }.toString())
+                            }
+                            "mraw" -> pc.send(argument)
                             "dismiss" -> pc.send(kotlinx.serialization.json.buildJsonObject {
                                 put("type", "notif.dismiss"); put("id", "fake-pc-dismiss-${System.nanoTime()}"); put("nid", argument.trim())
                             }.toString())
@@ -157,6 +215,13 @@ class FakePcSession {
         val parts = spec.split(':')
         val size = parts.getOrNull(1)?.toInt() ?: 0
         return FakePcFiles.OfferedFile(fileId, parts[0], parts.getOrNull(2) ?: "application/octet-stream", ByteArray(size).also { java.util.Random(parts[0].hashCode().toLong()).nextBytes(it) })
+    }
+
+    /** A made-up cover: a 96 x 96 PNG of a generated gradient (what a PC's `media.image` of `art` is, small enough for the 24,576-byte cap). */
+    private fun fakeArt(): ByteArray {
+        val image = java.awt.image.BufferedImage(96, 96, java.awt.image.BufferedImage.TYPE_INT_RGB)
+        for (y in 0 until 96) for (x in 0 until 96) image.setRGB(x, y, (x * 2) shl 16 or ((y * 2) shl 8) or 0x60)
+        return java.io.ByteArrayOutputStream().also { javax.imageio.ImageIO.write(image, "png", it) }.toByteArray()
     }
 
     private fun sha(bytes: ByteArray): String = java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }

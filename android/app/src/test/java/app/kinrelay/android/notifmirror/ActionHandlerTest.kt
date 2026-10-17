@@ -122,9 +122,9 @@ class ActionHandlerTest {
     @Test
     fun theLabelIsComparedInToastForm() = runTest {
         val live = chat(actions = listOf(
-            ActionSnap(0, "Mute ", isActivity = false),
-            ActionSnap(1, "Reply", remoteInputs = listOf(RemoteInputSnap("k", " To Alice")), isActivity = false),
-            ActionSnap(2, "  ", isActivity = false),
+            ActionSnap(0, "Mute\u2029", isActivity = false),
+            ActionSnap(1, "Reply", remoteInputs = listOf(RemoteInputSnap("k", "\u2028To\u2028Alice")), isActivity = false),
+            ActionSnap(2, "\u2028\u2029", isActivity = false),
         ))
         val port = Port(listOf(live))
         // The PC sends the toast form ("Mute", "To Alice"); the phone's own label has the separators.

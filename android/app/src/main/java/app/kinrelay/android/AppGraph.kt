@@ -93,6 +93,9 @@ class AppGraph(private val context: Context) {
     /** Notification mirroring, phone to PC (2B.2): the user's choices, the sender and the listener's engine. Reacts only; starts nothing by itself. */
     val mirror: MirrorController by lazy { MirrorController(this) }
 
+    /** Media controls in both directions (2B.3): the phone's media on the PC and the PC's media on the phone. Reacts only; starts nothing by itself. */
+    val media: app.kinrelay.android.media.MediaHub by lazy { app.kinrelay.android.media.MediaHub(this) }
+
     /** Remembers what the PC just put on the clipboard, so "send clipboard" doesn't send it back. */
     val clipboardGuard = ClipboardGuard(System::currentTimeMillis)
 
@@ -227,6 +230,8 @@ class AppGraph(private val context: Context) {
         scope.launch(Dispatchers.IO) { runCatching { transfers.sweepOrphans() } }
         // Follows the user's notification-mirroring choices (turning it off or an app off takes its toasts down on the PC).
         mirror.start()
+        // Follows the user's media choices and the link, and takes the PC's media messages in order (it starts nothing else by itself).
+        media.start()
         // The paired PC shows up in the share sheet's top row (the direct-share shortcut) and goes away when it is unpaired.
         scope.launch {
             database.devices().observeAll().collect { ShareShortcuts.sync(appContext, it.firstOrNull(), log) }

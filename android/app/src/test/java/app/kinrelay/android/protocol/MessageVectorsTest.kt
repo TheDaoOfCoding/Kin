@@ -1,5 +1,6 @@
 package app.kinrelay.android.protocol
 
+import app.kinrelay.android.media.MediaMsg
 import app.kinrelay.android.testing.Vectors
 import app.kinrelay.android.testing.cases
 import app.kinrelay.android.testing.str
@@ -36,6 +37,8 @@ class MessageVectorsTest {
         "link-*",
         // 2B.2 (the PC's side of the phone's `notif.*` is `NotifInbound`, which stands for the PC here; the real one is the desktop's)
         "notif-*",
+        // 2B.3 (every `media.*` goes both ways, so the phone's own `MediaInbound` is the receiver on both roles)
+        "media-*",
     )
     private val invalidScope = listOf(
         "first-message-*", "hello-*", "ack-*", "error-*", "unpair-missing-id", "ping-*", "type-*",
@@ -50,6 +53,8 @@ class MessageVectorsTest {
         "link-*",
         // 2B.2
         "notif-*",
+        // 2B.3
+        "media-*",
     )
     private val sequenceScope = listOf(
         "second-hello-after-handshake-is-a-normal-message", "invalid-hello-does-not-count-as-accepted",
@@ -75,6 +80,9 @@ class MessageVectorsTest {
         "notif-is-not-in-the-dedup-memory", "notif-action-is-acked-and-a-repeat-is-not-run-twice", "notif-action-is-not-resent-after-reconnect",
         "notif-post-after-reconnect-needs-the-hellos-again", "notif-sync-removes-the-rest", "notif-invalid-post-keeps-the-connection-open",
         "notif-status-then-icon-then-post",
+        // 2B.3
+        "media-is-not-in-the-dedup-memory", "media-status-change-needs-no-new-hello", "media-capability-changes-with-a-new-hello",
+        "media-cmd-is-not-resent-after-reconnect", "media-image-before-state", "media-invalid-state-keeps-the-connection-open",
     )
 
     /** The invalid-UTF-8 case can only be checked on the PC side: OkHttp never shows the bad bytes. */
@@ -155,9 +163,60 @@ class MessageVectorsTest {
             }
             assertEquals("$name: notif", notif.jsonObject, got)
         }
+        // `expect.media` (2B.3) is what the receiver ends up with for a valid `media.*`, after cleaning.
+        expect["media"]?.let { media ->
+            val action = outcome.action as? Action.Media ?: error("$name: expected a media action, got ${outcome.action}")
+            assertEquals("$name: media", media.jsonObject, mediaExpectation(action.message))
+        }
         // `expect.sensitive` says how the receiver treats a delivered text (absent means false).
         (outcome.action as? Action.DeliverText)?.let {
             assertEquals("$name: sensitive", expect["sensitive"]?.jsonPrimitive?.boolean ?: false, it.sensitive)
+        }
+    }
+
+    /** A valid `media.*` message as the vectors write it (`expect.media`): optional fields left out when absent, `rateMilli` and `actions` always on a state, an image as hash, kind and size. */
+    private fun mediaExpectation(message: MediaMsg): JsonObject = buildJsonObject {
+        when (message) {
+            is MediaMsg.Status -> {
+                put("show", message.status.show)
+                put("share", message.status.share)
+                message.status.access?.let { put("access", it) }
+            }
+            is MediaMsg.State -> {
+                val s = message.state
+                put("sid", s.sid)
+                put("app", s.app)
+                put("state", s.state.wire)
+                s.title?.let { put("title", it) }
+                s.artist?.let { put("artist", it) }
+                s.album?.let { put("album", it) }
+                s.durationMs?.let { put("durationMs", it) }
+                s.positionMs?.let { put("positionMs", it) }
+                put("rateMilli", s.rateMilli)
+                put("actions", kotlinx.serialization.json.JsonArray(s.actions.map { JsonPrimitive(it.wire) }))
+                s.artHash?.let { put("artHash", it) }
+                s.iconHash?.let { put("iconHash", it) }
+                s.volume?.let { put("volume", buildJsonObject { put("level", it.level); put("muted", it.muted) }) }
+            }
+            is MediaMsg.Image -> {
+                put("hash", message.image.hash)
+                put("kind", message.image.kind)
+                put("bytes", message.image.bytes.size)
+            }
+            is MediaMsg.Clear -> Unit
+            is MediaMsg.Volume -> {
+                put("level", message.volume.level)
+                put("muted", message.volume.muted)
+            }
+            is MediaMsg.Cmd -> {
+                val c = message.cmd
+                c.sid?.let { put("sid", it) }
+                put("cmd", c.kind.wire)
+                c.seekMs?.let { put("seekMs", it) }
+                c.level?.let { put("level", it) }
+                c.delta?.let { put("delta", it) }
+                c.mute?.let { put("mute", it) }
+            }
         }
     }
 
@@ -325,7 +384,7 @@ class MessageVectorsTest {
     @Test
     fun sentFramesAreCompactAndStrictlyValid() {
         val hello = Frames.hello("0193a5c2-7b1e-7c3a-9d4f-5e6a7b8c9d32", "Pixel 8", "android", "0.1.0")
-        assertEquals("""{"type":"hello","id":"0193a5c2-7b1e-7c3a-9d4f-5e6a7b8c9d32","protocol":1,"name":"Pixel 8","platform":"android","appVersion":"0.1.0","capabilities":["link","notif"]}""", hello)
+        assertEquals("""{"type":"hello","id":"0193a5c2-7b1e-7c3a-9d4f-5e6a7b8c9d32","protocol":1,"name":"Pixel 8","platform":"android","appVersion":"0.1.0","capabilities":["link","notif","media"]}""", hello)
         // An app with no extra features sends no `capabilities` at all (a 0.1.0 hello).
         assertEquals("""{"type":"hello","id":"h","protocol":1,"name":"Pixel 8","platform":"android","appVersion":"0.1.0"}""", Frames.hello("h", "Pixel 8", "android", "0.1.0", capabilities = emptyList()))
         assertEquals("""{"type":"ping","id":"a","sentAt":1760443200000}""", Frames.ping("a", 1760443200000))

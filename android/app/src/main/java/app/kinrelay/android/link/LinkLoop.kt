@@ -1,6 +1,7 @@
 package app.kinrelay.android.link
 
 import app.kinrelay.android.log.KinLog
+import app.kinrelay.android.media.MediaMsg
 import app.kinrelay.android.notifmirror.NotifWire
 import app.kinrelay.android.pairing.PairingAddress
 import app.kinrelay.android.protocol.CloseAction
@@ -71,6 +72,12 @@ interface LinkHost {
     /** A `notif.action` from the PC: fire it, and return the frame to answer with. */
     suspend fun onNotifAction(request: NotifWire.ActionRequest): String =
         Frames.error("disabled", "Notification mirroring isn't available.", request.id)
+
+    /** A valid `media.*` message from the PC (ephemeral: no ack). Called from the socket's thread in arrival order: don't block. */
+    fun onMedia(message: MediaMsg) = Unit
+
+    /** A `media.*` message was dropped silently (counted): [notListed] when a side's `hello` doesn't list `media`, else an image that failed its checks. */
+    fun onMediaDropped(notListed: Boolean) = Unit
 }
 
 /**
@@ -180,6 +187,10 @@ class LinkLoop(
                 override fun onNotifDismiss(nid: String) = host.onNotifDismiss(nid)
 
                 override suspend fun onNotifAction(request: NotifWire.ActionRequest): String = host.onNotifAction(request)
+
+                override fun onMedia(message: MediaMsg) = host.onMedia(message)
+
+                override fun onMediaDropped(notListed: Boolean) = host.onMediaDropped(notListed)
 
                 override fun onPingReceived(fromName: String) = host.onPingReceived(fromName)
 

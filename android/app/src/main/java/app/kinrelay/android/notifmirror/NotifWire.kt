@@ -60,7 +60,7 @@ object NotifWire {
      * the ends are trimmed (spaces only), nothing else changes. The PC shows and sends this form, so the phone compares in it.
      */
     fun toastForm(input: String): String =
-        input.map { if (it == ' ' || it == ' ' || it == '￾' || it == '￿') ' ' else it }.joinToString("").trim(' ')
+        input.map { if (it == '\u2028' || it == '\u2029' || it == '\uFFFE' || it == '\uFFFF') ' ' else it }.joinToString("").trim(' ')
 
     /** `clean(toastForm(input), max)`: the label as the PC has it; null when nothing is left (a button with such a label is not offered). */
     fun cleanLabel(input: String?, max: Int): String? = input?.let { cleanText(toastForm(it), max) }

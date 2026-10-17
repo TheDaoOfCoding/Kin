@@ -89,7 +89,7 @@ class UrlRulesTest {
             "https://exa mple.com",
             "https://example.com/a b",
             "https://example.com/\u0000",
-            "https://example.com/ x",
+            "https://example.com/\u2028x",
             "https://example.com/\u0085x",
             "ht tps://example.com",
         )

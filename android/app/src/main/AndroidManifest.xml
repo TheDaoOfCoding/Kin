@@ -261,6 +261,11 @@
             </intent-filter>
         </service>
 
+        <!-- The buttons and the swipe of the notification that shows the PC's media (2B.3). Only our own PendingIntents reach it. -->
+        <receiver
+            android:name=".media.PcMediaReceiver"
+            android:exported="false" />
+
         <!-- The Cancel and Retry buttons of the transfer notifications. Only our own PendingIntents reach it. -->
         <receiver
             android:name=".transfer.TransferActionReceiver"

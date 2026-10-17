@@ -155,6 +155,7 @@ fun KinRoot(
                         androidx.compose.foundation.layout.Column(verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(6.dp)) {
                             Text("Notification mirroring", style = androidx.compose.material3.MaterialTheme.typography.titleMedium)
                             Text(graph.mirror.sender.stats.line() + " · announced ${graph.mirror.sender.announcedCount()} · last action ${graph.mirror.lastActionResult}", style = androidx.compose.material3.MaterialTheme.typography.bodySmall)
+                            Text(graph.media.stats.line(), style = androidx.compose.material3.MaterialTheme.typography.bodySmall)
                             DebugHooks.MirrorTest(graph, context)
                         }
                     },
@@ -216,6 +217,7 @@ fun KinRoot(
                     onOpenSetup = { screen = SETUP }, onOpenDebug = { screen = DEBUG },
                     onUnpair = { graph.link.unpair(context) },
                     mirrorCard = { MirrorSettingsCard(graph, context, permissions, onOpenSetup = { screen = MIRROR_SETUP }, onOpenApps = { screen = MIRROR_APPS }) },
+                    mediaCard = { MediaSettingsCard(graph, context, permissions) },
                 )
                 else -> HomeScreen(
                     pc = pc,
@@ -233,6 +235,7 @@ fun KinRoot(
                     recent = history, nowMillis = now, onSeeHistory = { tab = 1 },
                     onOpenItem = ::open, onRetryItem = { graph.retryItem(it) }, onCancelItem = { graph.cancelItem(it) },
                     mirrorCard = { MirrorHomeCard(graph, permissions, onOpenSetup = { screen = MIRROR_SETUP }) },
+                    mediaCard = { MediaHomeCard(graph, permissions) },
                 )
             }
         }

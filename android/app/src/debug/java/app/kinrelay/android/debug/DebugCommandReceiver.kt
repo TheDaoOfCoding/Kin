@@ -165,6 +165,12 @@ class DebugCommandReceiver : BroadcastReceiver() {
                     // Clears the shade (the listener's `cancelAllNotifications`): `adb shell cmd notification post` is limited to 50 notifications per package.
                     "MIRROR_CLEAR_ALL" -> {
                         app.kinrelay.android.notifmirror.MirrorListenerService.cancelAll()
+                        // The listener skips Kin's own notifications (cancelling the foreground service's one kills the process on API 29), so Kin's own debug test posts
+                        // (channel kin_debug_mirror*) are cancelled here, through the NotificationManager, and nothing else of Kin's.
+                        val manager = context.getSystemService(android.app.NotificationManager::class.java)
+                        manager.activeNotifications
+                            .filter { it.notification.channelId?.startsWith(app.kinrelay.android.notifmirror.MirrorController.DEBUG_CHANNEL) == true }
+                            .forEach { manager.cancel(it.tag, it.id) }
                         graph.log.i("debug", "CMD MIRROR_CLEAR_ALL done")
                     }
                     // Counts and settings, never content.
@@ -271,6 +277,7 @@ class DebugCommandReceiver : BroadcastReceiver() {
                             graph.log.w("debug", "CMD SET_PING_INTERVAL needs --ei seconds <n>")
                         }
                     }
+                    else -> if (command.startsWith("MEDIA_")) DebugMedia.handle(command, intent, context, graph)
                 }
             } finally {
                 pending.finish()

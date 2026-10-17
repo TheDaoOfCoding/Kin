@@ -129,13 +129,13 @@ class LinkVectorsTest {
     @Test
     fun theHelloTheAppSendsListsTheLinkAndNotifCapabilities() {
         val hello = kotlinx.serialization.json.Json.parseToJsonElement(Frames.hello("id-1", "Pixel", "android", "0.1.1")).jsonObject
-        assertEquals(listOf("link", "notif"), hello.getValue("capabilities").jsonArray.map { it.jsonPrimitive.content })
+        assertEquals(listOf("link", "notif", "media"), hello.getValue("capabilities").jsonArray.map { it.jsonPrimitive.content })
         assertFalse(hello["capabilities"] is JsonNull)
     }
 
     @Test
     fun aLinkFrameTheAppSendsCarriesTheCleanedTitleAndOmitsWhatIsEmpty() {
-        val frame = Frames.link("l-1", "https://www.youtube.com/watch?v=abc&t=83s", "  My‮ video\n ")!!
+        val frame = Frames.link("l-1", "https://www.youtube.com/watch?v=abc&t=83s", "  My\u202E video\n ")!!
         val parsed = kotlinx.serialization.json.Json.parseToJsonElement(frame).jsonObject
         assertEquals("link", parsed.getValue("type").str())
         assertEquals("the URL is written as it is, with its timestamp", "https://www.youtube.com/watch?v=abc&t=83s", parsed.getValue("url").str())

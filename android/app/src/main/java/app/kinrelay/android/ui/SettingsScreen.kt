@@ -69,6 +69,8 @@ fun SettingsScreen(
     modifier: Modifier = Modifier,
     /** "Show notifications on your PC" (2B.2). */
     mirrorCard: @Composable () -> Unit = {},
+    /** "Media" (2B.3): the four switches. */
+    mediaCard: @Composable () -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
     var name by rememberSaveable(deviceName) { mutableStateOf(deviceName) }
@@ -112,6 +114,8 @@ fun SettingsScreen(
         }
 
         mirrorCard()
+
+        mediaCard()
 
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {

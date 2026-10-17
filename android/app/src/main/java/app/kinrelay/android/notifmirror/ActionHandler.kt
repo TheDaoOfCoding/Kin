@@ -55,8 +55,7 @@ class ActionHandler<T>(
 ) {
     private val times = ArrayDeque<Long>()
 
-    private fun find(nid: String): T? {
-        val active = port.active() ?: return null
+    private fun find(nid: String, active: List<T>): T? {
         keyOf(nid)?.let { key -> active.firstOrNull { port.key(it) == key }?.let { return it } }
         return active.firstOrNull { Nid.of(port.key(it)) == nid }
     }
@@ -73,9 +72,9 @@ class ActionHandler<T>(
         val current = policy()
         // Mirroring off: nothing about the live notifications is looked at, so "off" says nothing about what is on the phone.
         if (!current.enabled) return error(NotifErrors.DISABLED, "Mirroring is off for this notification.")
-        if (port.active() == null) return error(NotifErrors.DISABLED, "Notification access is off on the phone.")
+        val active = port.active() ?: return error(NotifErrors.DISABLED, "Notification access is off on the phone.")
         // 1. The notification. One that Kin would not have mirrored (app not ticked, own, other profile) answers as a missing one, before any content is read.
-        val sbn = find(request.nid)?.takeIf { filter.pre(port.quick(it), current) == null } ?: return error(NotifErrors.NOT_FOUND, "That notification is gone.")
+        val sbn = find(request.nid, active)?.takeIf { filter.pre(port.quick(it), current) == null } ?: return error(NotifErrors.NOT_FOUND, "That notification is gone.")
         val snapshot = port.snapshot(sbn)
         // 2. Mirroring on, access held, the app allowed, and nothing that is sent without actions (flagged, hidden, redacted).
         val decision = filter.decide(snapshot, current)
@@ -110,7 +109,8 @@ class ActionHandler<T>(
     suspend fun onDismiss(nid: String): Boolean {
         val current = policy()
         if (!current.enabled || !current.dismissOnPhone) return false
-        val sbn = find(nid)?.takeIf { filter.pre(port.quick(it), current) == null } ?: return false
+        val active = port.active() ?: return false
+        val sbn = find(nid, active)?.takeIf { filter.pre(port.quick(it), current) == null } ?: return false
         val snapshot = port.snapshot(sbn)
         if (snapshot.notClearable || snapshot.ongoing || snapshot.foregroundService) return false
         onSelfCancel(nid)

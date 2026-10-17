@@ -29,13 +29,14 @@ class AndroidIcons(context: Context) {
 
     private val memory = HashMap<String, Entry>()
 
+    /** [disk] false (media, 2B.3): the icon is drawn and kept in memory only, nothing is read from or written to `cache/mirror-icons`. */
     @Synchronized
-    fun forPackage(packageName: String, sbn: StatusBarNotification?): IconData? {
+    fun forPackage(packageName: String, sbn: StatusBarNotification?, disk: Boolean = true): IconData? {
         val version = versionOf(packageName)
         memory[packageName]?.takeIf { it.version == version }?.let { return it.icon }
         // Drawing can fail in many ways (a broken adaptive icon, an out-of-memory bitmap): then the post goes out without an icon.
-        val icon = fromDisk(packageName, version) ?: try {
-            draw(packageName, sbn)?.also { toDisk(packageName, version, it) }
+        val icon = (if (disk) fromDisk(packageName, version) else null) ?: try {
+            draw(packageName, sbn)?.also { if (disk) toDisk(packageName, version, it) }
         } catch (_: Exception) {
             null
         } catch (_: OutOfMemoryError) {

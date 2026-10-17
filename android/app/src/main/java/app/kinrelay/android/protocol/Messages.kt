@@ -1,5 +1,6 @@
 package app.kinrelay.android.protocol
 
+import app.kinrelay.android.media.MediaWire
 import app.kinrelay.android.notifmirror.NotifWire
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -27,6 +28,9 @@ data class Hello(val id: String, val name: String, val platform: String, val app
 
     /** The peer's latest `hello` lists `notif` (2B.2): it understands the `notif.*` messages. The PC lists it only while "Show phone notifications" is on. */
     val understandsNotif: Boolean get() = NotifWire.CAPABILITY in capabilities
+
+    /** The peer's latest `hello` lists `media` (2B.3): it understands the `media.*` messages. Every 0.2.0 build lists it, whatever its switches say (they travel in `media.status`). */
+    val understandsMedia: Boolean get() = MediaWire.CAPABILITY in capabilities
 }
 
 object ErrorCodes {
@@ -39,8 +43,8 @@ object ErrorCodes {
 
 /** Builders for the frames this app sends. Output is compact JSON, as senders must write it. */
 object Frames {
-    /** [capabilities]: what this app understands beyond protocol 1; `link` since 2B.1 (the sender of a `link` asks the peer's `hello` for it), `notif` since 2B.2 (always listed on the phone). */
-    fun hello(id: String, name: String, platform: String, appVersion: String, capabilities: List<String> = listOf(LinkWire.CAPABILITY_LINK, NotifWire.CAPABILITY)): String = obj {
+    /** [capabilities]: what this app understands beyond protocol 1; `link` since 2B.1 (the sender of a `link` asks the peer's `hello` for it), `notif` since 2B.2 and `media` since 2B.3 (always listed on the phone). */
+    fun hello(id: String, name: String, platform: String, appVersion: String, capabilities: List<String> = listOf(LinkWire.CAPABILITY_LINK, NotifWire.CAPABILITY, MediaWire.CAPABILITY)): String = obj {
         put("type", "hello")
         put("id", id)
         put("protocol", PROTOCOL_VERSION)

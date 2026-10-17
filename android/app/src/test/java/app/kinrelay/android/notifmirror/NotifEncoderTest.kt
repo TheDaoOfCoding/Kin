@@ -48,7 +48,7 @@ class NotifEncoderTest {
     @Test
     fun stringsAreCleanedAndCutToTheLimits() {
         val x = "x".repeat(2000)
-        val post = encode(snap(title = "Bad‮Title$x", text = x, bigText = "$x!", subText = x), appLabel = x)
+        val post = encode(snap(title = "Bad\u202ETitle$x", text = x, bigText = "$x!", subText = x), appLabel = x)
         assertEquals(40, post.app.length)
         assertTrue(post.title.orEmpty().startsWith("Bad_Title"))
         assertEquals(150, post.title?.length)
@@ -176,10 +176,35 @@ class NotifEncoderTest {
         val post = encode(snap(text = huge, bigText = huge + "!", lines = List(5) { "y".repeat(150) }))
         assertTrue(post.frameSize() <= NotifWire.SENDER_FRAME_TARGET)
         val messages = List(5) { MessageSnap("s$it", "z".repeat(300), it.toLong()) }
-        val big = WirePost("a".repeat(32), "App", title = "t", bigText = huge, messages = messages.map { WireMessage(it.sender, it.text!!) }, lines = List(5) { "y".repeat(150) })
-        val fitted = big.copy(bigText = huge.repeat(20)).fit(2_000)
-        assertNull(fitted.bigText)
-        assertTrue(fitted.frameSize() <= 2_000 || fitted.messages.size == 1)
+        val lines = List(5) { "y".repeat(150) }
+        val full = WirePost("a".repeat(32), "App", title = "t", bigText = huge, messages = messages.map { WireMessage(it.sender, it.text!!) }, lines = lines)
+        // The order of the drops, one stage at a time: a limit that the post fits once the big text is gone leaves the lines and the messages alone ...
+        val withoutBigText = full.copy(bigText = null)
+        full.fit(withoutBigText.frameSize()).let {
+            assertNull("the big text goes first", it.bigText)
+            assertEquals(5, it.lines.size)
+            assertEquals(5, it.messages.size)
+        }
+        // ... a limit that needs the inbox lines too drops them (the oldest first, one stays) and still leaves every message ...
+        val withOneLine = withoutBigText.copy(lines = lines.takeLast(1))
+        full.fit(withOneLine.frameSize()).let {
+            assertNull(it.bigText)
+            assertEquals("the lines go second", 1, it.lines.size)
+            assertEquals(5, it.messages.size)
+        }
+        // ... and only a tighter one drops the oldest messages (the newest stays).
+        val withOneMessage = withOneLine.copy(messages = full.messages.takeLast(1))
+        full.fit(withOneMessage.frameSize()).let {
+            assertNull(it.bigText)
+            assertEquals(1, it.lines.size)
+            assertEquals("the messages go third", withOneMessage.messages, it.messages)
+        }
+        // The body text is cut last, and only once nothing else is left to drop.
+        val withText = full.copy(text = "t".repeat(400))
+        withText.fit(withOneMessage.copy(text = "t".repeat(400)).frameSize() - 1).let {
+            assertEquals(1, it.messages.size)
+            assertTrue(it.text!!.length < 400)
+        }
     }
 
     @Test
@@ -235,15 +260,15 @@ class NotifEncoderTest {
 
     @Test
     fun hintsAndButtonLabelsAreInToastFormAndAnEmptyOneIsNotOffered() {
-        val picked = NotifEncoder.pickActions(listOf(reply(0, "To Alice"), button(1, "  "), button(2, "Mu te￿")))
+        val picked = NotifEncoder.pickActions(listOf(reply(0, "To\u2028Alice"), button(1, "\u2028\u2029"), button(2, "Mu\u2029te\uFFFF")))
         assertEquals("To Alice", picked.reply?.hint)
         assertEquals(listOf(WireAction(2, "Mu te")), picked.actions)
-        assertNull("a hint of only separators is no hint", NotifEncoder.pickActions(listOf(reply(0, "  "))).reply?.hint)
+        assertNull("a hint of only separators is no hint", NotifEncoder.pickActions(listOf(reply(0, "\u2028\u2029"))).reply?.hint)
     }
 
     @Test
     fun theReplyHintIsTheCleanedRemoteInputLabel() {
-        assertEquals("Reply to Family", NotifEncoder.pickActions(listOf(reply(0, "Reply to ‮Family"))).reply?.hint?.replace("_", ""))
+        assertEquals("Reply to _Family", NotifEncoder.pickActions(listOf(reply(0, "Reply to \u202EFamily"))).reply?.hint)
         assertNull(NotifEncoder.pickActions(listOf(reply(0, null))).reply?.hint)
         assertNull("a remote input with choices only is not a reply", NotifEncoder.pickActions(listOf(reply(0, freeForm = false))).reply)
     }

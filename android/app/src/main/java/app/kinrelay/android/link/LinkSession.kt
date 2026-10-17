@@ -1,6 +1,8 @@
 package app.kinrelay.android.link
 
 import app.kinrelay.android.log.KinLog
+import app.kinrelay.android.media.MediaLink
+import app.kinrelay.android.media.MediaMsg
 import app.kinrelay.android.notifmirror.MirrorLink
 import app.kinrelay.android.notifmirror.NotifWire
 import app.kinrelay.android.pairing.PairingAddress
@@ -60,8 +62,14 @@ sealed interface AckResult {
 class HttpEndpoint(val client: OkHttpClient, val address: PairingAddress)
 
 /** One connection to the PC, as the reconnect loop and the UI see it. */
-interface LinkConnection : MirrorLink {
+interface LinkConnection : MirrorLink, MediaLink {
     override val isReady: Boolean
+
+    /** The PC's latest accepted `hello` on this connection lists `media` (2B.3): `media.*` messages may go to it. Checked per message by [app.kinrelay.android.media.MediaSender]. */
+    override val peerUnderstandsMedia: Boolean get() = false
+
+    /** The PC's name from its latest accepted `hello` (the viewer says "<app> on <PC>"), or null before one. */
+    val peerName: String? get() = null
 
     /**
      * The PC's latest accepted `hello` on this connection lists the `notif` capability (2B.2): it will show `notif.post`, and `notif.*` messages may
@@ -133,6 +141,15 @@ interface SessionListener {
     suspend fun onNotifAction(request: NotifWire.ActionRequest): String = Frames.error("disabled", "Notification mirroring isn't available.", request.id)
 
     /**
+     * A valid `media.*` message (2B.3). Ephemeral: no ack. Called in arrival order from the socket's thread: don't block (the app queues it and handles it on its own coroutine,
+     * so a state and the clear after it can't swap places).
+     */
+    fun onMedia(message: MediaMsg) = Unit
+
+    /** A `media.*` message was dropped silently (a side's `hello` didn't list `media`, or an image that failed its checks): counted by the app. */
+    fun onMediaDropped(notListed: Boolean) = Unit
+
+    /**
      * A valid, new `offer`, before it is acked: null accepts it, an error code (`disk_full`) answers with an `error` instead of the
      * ack. Runs on the socket's thread: keep it cheap.
      */
@@ -196,6 +213,10 @@ class LinkSession(
     override val peerUnderstandsLink: Boolean get() = receiver.peer?.understandsLink == true
 
     override val peerUnderstandsNotif: Boolean get() = receiver.peer?.understandsNotif == true
+
+    override val peerUnderstandsMedia: Boolean get() = receiver.peer?.understandsMedia == true
+
+    override val peerName: String? get() = receiver.peer?.name
 
     override fun sendEphemeral(frame: String): Boolean = isReady && send(frame)
 
@@ -344,6 +365,8 @@ class LinkSession(
                 }
             }
             Action.NotifIgnored, is Action.NotifReceived -> Unit
+            is Action.Media -> listener.onMedia(action.message)
+            is Action.MediaDropped -> listener.onMediaDropped(action.notListed)
             is Action.StartDownload -> listener.onOfferReceived(receiver.peer?.name ?: "PC", action.offer)
             is Action.RepeatOffer -> listener.onOfferRepeated(receiver.peer?.name ?: "PC", action.offer)
             is Action.CancelTransfer -> listener.onCancelReceived(action.transferId, action.reason)

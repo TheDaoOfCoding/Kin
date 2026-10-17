@@ -12,6 +12,7 @@ import app.kinrelay.android.Permissions
 import app.kinrelay.android.clipboard.AndroidClipboard
 import app.kinrelay.android.data.DeviceEntity
 import app.kinrelay.android.identity.DeviceIds
+import app.kinrelay.android.media.MediaMsg
 import app.kinrelay.android.notifmirror.NotifWire
 import app.kinrelay.android.pairing.PairingAddress
 import app.kinrelay.android.protocol.CloseAction
@@ -246,11 +247,19 @@ class LinkRuntime(
         }
 
         // 2B.2: notification mirroring. The PC's `hello` was accepted (the first, or a later one that changed its capabilities): the status and the sync go out.
-        override fun onHelloAccepted(connection: LinkConnection) = graph.mirror.onLinkReady(connection)
+        override fun onHelloAccepted(connection: LinkConnection) {
+            graph.mirror.onLinkReady(connection)
+            graph.media.onLinkReady(connection)
+        }
 
         override fun onNotifDismiss(nid: String) = graph.mirror.onDismiss(nid)
 
         override suspend fun onNotifAction(request: NotifWire.ActionRequest): String = graph.mirror.onAction(request)
+
+        // 2B.3: media controls. Ephemeral messages from the PC, handled by the hub in arrival order.
+        override fun onMedia(message: MediaMsg) = graph.media.onMedia(message)
+
+        override fun onMediaDropped(notListed: Boolean) = graph.media.onDropped(notListed)
 
         override fun acceptOffer(offer: Offer): String? = graph.transfers.acceptOffer(offer, device.deviceId)
 

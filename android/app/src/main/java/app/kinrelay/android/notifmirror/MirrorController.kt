@@ -152,6 +152,8 @@ class MirrorController(private val graph: AppGraph) {
         listenerConnected = connected
         graph.log.i("mirror", "mirror: listener ${if (connected) "connected" else "disconnected"}")
         graph.scope.launch { sender.statusChanged(status()) }
+        // Reading other apps' media uses the same access (2B.3): the media source may start or must stop, and media.status says whether access is there.
+        graph.media.accessChanged()
     }
 
     /** The PC's `hello` is accepted (also a later `hello` that changes its capabilities): status, then the sync with what is active now. */

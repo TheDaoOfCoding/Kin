@@ -1,5 +1,8 @@
 package app.kinrelay.android.protocol
 
+import app.kinrelay.android.media.MediaInbound
+import app.kinrelay.android.media.MediaMsg
+import app.kinrelay.android.media.MediaWire
 import app.kinrelay.android.notifmirror.NotifWire
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -53,6 +56,19 @@ sealed class Action(val category: String) {
      * or the list of `nid`s. [category] is `notif_status`, `notif_icon`, `notif_post`, `notif_remove` or `notif_sync`.
      */
     class NotifReceived(category: String, val notif: JsonObject) : Action(category)
+
+    /**
+     * A valid `media.*` message (2B.3), **ephemeral**: no ack, not in the de-duplication memory, no reply either way. [message] is what the receiver ends up with after cleaning.
+     * The category is `media_status`, `media_state`, `media_image`, `media_clear`, `media_volume` or `media_cmd`. What the app does with it depends on its own switches
+     * (a viewer whose `show` is off drops state, image, clear and volume silently; a source whose `share` is off answers a `media.cmd` with `disabled`).
+     */
+    class Media(val message: MediaMsg, category: String) : Action(category)
+
+    /**
+     * A `media.*` message dropped silently (counted): a side's latest `hello` doesn't list `media` ([notListed] true), or a `media.image` that fails its checks ([notListed] false).
+     * Never an `error`; the category is `media_dropped` either way.
+     */
+    class MediaDropped(val notListed: Boolean) : Action("media_dropped")
 
     /** A valid `offer`, acked: download the files. */
     class StartDownload(val offer: Offer) : Action("start_download")
@@ -121,12 +137,14 @@ class MessageReceiver(
         private set
 
     /** The capabilities of this side's own latest `hello` (protocol.md, validation step 6b): the phone always lists `notif`. The tests set it for the vectors. */
-    var ownCapabilities: Set<String> = setOf(LinkWire.CAPABILITY_LINK, NotifWire.CAPABILITY)
+    var ownCapabilities: Set<String> = setOf(LinkWire.CAPABILITY_LINK, NotifWire.CAPABILITY, MediaWire.CAPABILITY)
 
     val helloAccepted: Boolean get() = peer != null
 
     private val handled: Set<String> = buildSet {
         addAll(listOf("hello", "ack", "error", "ping", "unpair", "text", "link", "cancel"))
+        // 2B.3: both sides send and receive every `media.*` type (each is the source of one direction and the viewer of the other).
+        addAll(MediaWire.TYPES)
         if (role == ReceiverRole.PHONE) addAll(listOf("clipboard", "offer", NotifWire.DISMISS, NotifWire.ACTION))
         else addAll(listOf("complete", NotifWire.STATUS, NotifWire.ICON, NotifWire.POST, NotifWire.REMOVE, NotifWire.SYNC))
     }
@@ -163,6 +181,14 @@ class MessageReceiver(
             if (NotifWire.CAPABILITY !in ownCapabilities || peer?.understandsNotif != true) return Outcome(emptyList(), null, Action.NotifIgnored)
             val limit = if (type == NotifWire.ICON) NOTIF_ICON_FRAME_BYTES else NOTIF_FRAME_BYTES
             if (Utf8.size(text) > limit) return rejected(ErrorCodes.TOO_LARGE, "A notification message is at most ${limit / 1024} KiB.", ref)
+        }
+
+        // 6c. A `media.*` message is dropped silently when either side's latest `hello` doesn't list `media`; then the 32 KiB limit (48 KiB for an image); then the fields.
+        if (type.startsWith("media.")) {
+            if (MediaWire.CAPABILITY !in ownCapabilities || peer?.understandsMedia != true) return Outcome(emptyList(), null, Action.MediaDropped(notListed = true))
+            val limit = if (type == MediaWire.IMAGE) MediaWire.IMAGE_FRAME_BYTES else MediaWire.STATE_FRAME_BYTES
+            if (Utf8.size(text) > limit) return rejected(ErrorCodes.TOO_LARGE, "A media message is at most ${limit / 1024} KiB.", ref)
+            return onMedia(type, frame, ref)
         }
 
         return when (type) {
@@ -301,6 +327,16 @@ class MessageReceiver(
         val answer = notifAction(request) ?: return Outcome(emptyList(), null, Action.NotifAction(request))
         dedup.record(ref, answer)
         return Outcome(listOf(answer), null, Action.NotifAction(request))
+    }
+
+    /** `media.*`: ephemeral, so no ack and no de-duplication (a repeated `id` is processed again, and a rejected one is not remembered either). */
+    private fun onMedia(type: String, frame: JsonObject, ref: String?): Outcome {
+        if (ref == null) return rejected(ErrorCodes.BAD_REQUEST, "A media message needs an id.", ref)
+        return when (val result = MediaInbound.parse(type, ref, frame)) {
+            is MediaInbound.Result.Bad -> rejected(ErrorCodes.BAD_REQUEST, result.message, ref)
+            MediaInbound.Result.Dropped -> Outcome(emptyList(), null, Action.MediaDropped(notListed = false))
+            is MediaInbound.Result.Ok -> Outcome(emptyList(), null, Action.Media(result.message, type.replace('.', '_')))
+        }
     }
 
     private companion object {
