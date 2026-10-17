@@ -547,17 +547,23 @@ type Role = "phone" | "pc";
 const MAX_FRAME = 1048576;
 const MAX_OFFER_FILES = 800; // more files in one offer: the receiver answers error too_large
 const TRANSFER_ID = /^[A-Za-z0-9_-]{1,64}$/;
-const INT_FIELDS = ["protocol", "size", "totalSize", "offset", "received", "sentAt"];
+const INT_FIELDS = ["protocol", "size", "totalSize", "offset", "received", "sentAt", "importance", "apps", "i"];
 const DIRECTION: Record<string, Role | "both"> = {
   hello: "both", ack: "both", error: "both", text: "both", link: "both", clipboard: "pc", offer: "pc",
   complete: "phone", cancel: "both", unpair: "both", ping: "both",
+  // changelog 56: the value is the SENDER's role
+  "notif.status": "phone", "notif.icon": "phone", "notif.post": "phone", "notif.remove": "phone", "notif.sync": "phone", "notif.dismiss": "pc", "notif.action": "pc",
 };
-const ACKED = new Set(["text", "link", "clipboard", "offer", "complete", "cancel", "unpair", "ping"]);
+// notif.action is the one notif message that is acked; the other six are ephemeral (no ack, no de-duplication, never stored)
+const ACKED = new Set(["text", "link", "clipboard", "offer", "complete", "cancel", "unpair", "ping", "notif.action"]);
+const MAX_NOTIF_FRAME = 32768;
+const MAX_NOTIF_ICON_FRAME = 49152; // a 32,768-byte PNG is 43,691 base64url characters, so notif.icon has a larger frame limit
 const ACTION: Record<string, string> = {
   hello: "handshake_ok", ack: "mark_delivered", error: "mark_failed", text: "deliver_text", link: "deliver_link", clipboard: "set_clipboard",
   offer: "start_download", complete: "mark_transfer_done", cancel: "cancel_transfer", unpair: "remove_peer_and_close", ping: "show_ping_toast",
+  "notif.status": "notif_status", "notif.icon": "notif_icon", "notif.post": "notif_post", "notif.remove": "notif_remove", "notif.sync": "notif_sync", "notif.dismiss": "notif_dismiss", "notif.action": "notif_action",
 };
-type Outcome = { reply: "ack" | "error" | "none"; action?: string; code?: string; ref?: string | null; close: number | null; sensitive?: boolean; link?: any };
+type Outcome = { reply: "ack" | "error" | "none"; action?: string; code?: string; ref?: string | null; close: number | null; sensitive?: boolean; link?: any; notif?: any };
 const isObj = (x: any) => x !== null && typeof x === "object" && !Array.isArray(x);
 const isStr = (x: any) => typeof x === "string";
 const isNonEmptyStr = (x: any) => typeof x === "string" && x.length > 0;
@@ -643,6 +649,274 @@ function validateFields(type: string, o: any, badInts: Set<string>): boolean {
   return false;
 }
 
+// ------------------------------------------------------------------ notifications (changelog 56)
+const NID_RE = /^[0-9a-f]{32}$/;
+const nidOfKey = (key: string) => createHash("sha256").update(key, "utf8").digest("hex").slice(0, 32);
+const iconHashOf = (png: Uint8Array) => hex(sha256(png)).slice(0, 32);
+const NOTIF_LIMITS = { app: 40, title: 150, text: 500, bigText: 1000, subText: 80, conversation: 100, messageSender: 60, messageText: 300, line: 150, hint: 60, label: 30, messages: 5, lines: 5, actions: 3, nids: 200, actionText: 2000, iconBytes: 32768, iconMin: 24, iconMax: 128 };
+const BAD = Symbol("bad");
+const isIdx = (v: any, badInts: Set<string>) => !badInts.has("i") && Number.isSafeInteger(v) && v >= 0 && v <= 31;
+// the dimensions of a PNG (signature, then IHDR as the first chunk), or null
+function pngSize(b: Uint8Array): { w: number; h: number } | null {
+  const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  if (b.length < 33 || !sig.every((x, i) => b[i] === x)) return null;
+  if (String.fromCharCode(b[12], b[13], b[14], b[15]) !== "IHDR" || ((b[8] << 24) | (b[9] << 16) | (b[10] << 8) | b[11]) !== 13) return null;
+  const u = (o: number) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
+  return { w: u(16), h: u(20) };
+}
+// "ok" / "bad" (bad_request) / "drop" (silently dropped and counted) and the normalized content, for one notif.* frame that passed steps 1 to 6b
+function notifOf(type: string, o: any, badInts: Set<string>): any {
+  const L = NOTIF_LIMITS;
+  const optStr = (v: any, max: number): string | undefined => {
+    if (v === undefined || v === null) return undefined;
+    if (typeof v !== "string") throw BAD;
+    return cleanLinkText(v, max) ?? undefined;
+  };
+  const optBool = (v: any): boolean => {
+    if (v === undefined || v === null) return false;
+    if (typeof v !== "boolean") throw BAD;
+    return v;
+  };
+  const nid = (v: any) => {
+    if (typeof v !== "string" || !NID_RE.test(v)) throw BAD;
+    return v;
+  };
+  try {
+    if (!validMsgId(o.id)) throw BAD;
+    switch (type) {
+      case "notif.status": {
+        if (typeof o.enabled !== "boolean" || !["granted", "missing"].includes(o.access) || badInts.has("apps") || !Number.isSafeInteger(o.apps) || o.apps < 0) throw BAD;
+        return { enabled: o.enabled, access: o.access, apps: o.apps, otpHidden: optBool(o.otpHidden) };
+      }
+      case "notif.icon": {
+        if (typeof o.hash !== "string" || !NID_RE.test(o.hash) || typeof o.png !== "string") throw BAD;
+        // a png that is not base64url, not a PNG, the wrong size or over 32,768 bytes, or a hash that doesn't match, is dropped silently
+        if (!/^[A-Za-z0-9_-]*$/.test(o.png) || o.png.length % 4 === 1 || o.png.length > Math.ceil((L.iconBytes * 4) / 3) + 4) return "drop";
+        const bytes = new Uint8Array(Buffer.from(o.png, "base64url"));
+        if (bytes.length > L.iconBytes || iconHashOf(bytes) !== o.hash) return "drop";
+        const dim = pngSize(bytes);
+        if (!dim || dim.w !== dim.h || dim.w < L.iconMin || dim.w > L.iconMax) return "drop";
+        return { hash: o.hash, bytes: bytes.length };
+      }
+      case "notif.remove":
+      case "notif.dismiss":
+        return { nid: nid(o.nid) };
+      case "notif.sync": {
+        if (!Array.isArray(o.nids) || o.nids.length > L.nids) throw BAD;
+        return { nids: o.nids.map(nid) };
+      }
+      case "notif.action": {
+        nid(o.nid);
+        if (!isIdx(o.i, badInts) || typeof o.label !== "string") throw BAD;
+        const out: any = { nid: o.nid, i: o.i, label: cleanLinkText(o.label, L.label) ?? "" };
+        if (o.text !== undefined && o.text !== null) {
+          if (typeof o.text !== "string") throw BAD;
+          const t = trimWhiteSpace(o.text);
+          if (cps(t).length < 1 || cps(t).length > L.actionText) throw BAD;
+          out.text = t;
+        }
+        return out;
+      }
+      case "notif.post": {
+        const app = optStr(nid(o.nid) && o.app, L.app);
+        if (typeof o.app !== "string" || app === undefined) throw BAD;
+        const post: any = { nid: o.nid, app };
+        if (o.iconHash !== undefined && o.iconHash !== null) {
+          if (typeof o.iconHash !== "string" || !NID_RE.test(o.iconHash)) throw BAD;
+          post.iconHash = o.iconHash;
+        }
+        for (const [k, max] of [["title", L.title], ["text", L.text], ["bigText", L.bigText], ["subText", L.subText], ["conversation", L.conversation]] as const) {
+          const v = optStr(o[k], max);
+          if (v !== undefined) post[k] = v;
+        }
+        post.group = optBool(o.group);
+        const arr = (v: any) => {
+          if (v === undefined || v === null) return [];
+          if (!Array.isArray(v)) throw BAD;
+          return v;
+        };
+        const messages: any[] = [];
+        for (const m of arr(o.messages)) {
+          if (!isObj(m) || typeof m.text !== "string") throw BAD;
+          const sender = optStr(m.sender, L.messageSender);
+          const text = cleanLinkText(m.text, L.messageText);
+          if (text !== null) messages.push({ ...(sender !== undefined ? { sender } : {}), text });
+        }
+        if (messages.length > 0) post.messages = messages.slice(-L.messages);
+        const lines: string[] = [];
+        for (const l of arr(o.lines)) {
+          if (typeof l !== "string") throw BAD;
+          const c = cleanLinkText(l, L.line);
+          if (c !== null) lines.push(c);
+        }
+        if (lines.length > 0) post.lines = lines.slice(-L.lines);
+        if (o.importance === undefined || o.importance === null) post.importance = 3;
+        else if (badInts.has("importance") || !Number.isSafeInteger(o.importance) || o.importance < 2 || o.importance > 5) throw BAD;
+        else post.importance = o.importance;
+        post.silent = optBool(o.silent);
+        post.sensitive = optBool(o.sensitive);
+        post.redacted = optBool(o.redacted);
+        if (validCode(o.code)) post.code = o.code;
+        if (o.reply !== undefined && o.reply !== null) {
+          if (!isObj(o.reply) || !isIdx(o.reply.i, badInts)) throw BAD;
+          const hint = optStr(o.reply.hint, L.hint);
+          post.reply = { i: o.reply.i, ...(hint !== undefined ? { hint } : {}) };
+        }
+        const actions: any[] = [];
+        for (const a of arr(o.actions)) {
+          if (!isObj(a) || !isIdx(a.i, badInts) || typeof a.label !== "string") throw BAD;
+          const label = cleanLinkText(a.label, L.label);
+          if (label !== null) actions.push({ i: a.i, label });
+        }
+        if (actions.length > 0) post.actions = actions.slice(0, L.actions);
+        if (post.title === undefined && post.text === undefined && post.bigText === undefined && !post.messages && !post.lines && !post.redacted) throw BAD;
+        return post;
+      }
+    }
+  } catch (e) {
+    if (e === BAD) return "bad";
+    throw e;
+  }
+  return "bad";
+}
+
+// ---- rate limiters (integers only: millitokens, so there is no rounding to argue about)
+function pcLimiter(events: { t: number; nid: string; content: string }[]) {
+  const CAP = 20000, COST = 1000; // 1 token per 1000 ms = 1 millitoken per ms
+  let tokens = CAP, last = 0;
+  const lastAccepted = new Map<string, { t: number; content: string }>();
+  let lastErrorAt: number | null = null;
+  const outcomes: string[] = [];
+  const errorsAt: number[] = [];
+  for (const e of events) {
+    tokens = Math.min(CAP, tokens + (e.t - last));
+    last = e.t;
+    const prev = lastAccepted.get(e.nid);
+    if (prev && prev.content === e.content && e.t - prev.t < 2000) {
+      outcomes.push("ignored_duplicate");
+    } else if (tokens >= COST) {
+      tokens -= COST;
+      lastAccepted.set(e.nid, { t: e.t, content: e.content });
+      outcomes.push("accepted");
+    } else {
+      outcomes.push("dropped_rate");
+      if (lastErrorAt === null || e.t - lastErrorAt >= 10000) {
+        errorsAt.push(e.t);
+        lastErrorAt = e.t;
+      }
+    }
+  }
+  return { outcomes, errorsAt };
+}
+
+function phoneLimiter(events: { t: number; op: string; package?: string }[]) {
+  const CAP = 10000, COST = 1000; // 1 token per 500 ms = 2 millitokens per ms
+  let tokens = CAP, last = 0;
+  const pkg = new Map<string, number[]>();
+  const removes: number[] = [];
+  const outcomes: string[] = [];
+  for (const e of events) {
+    tokens = Math.min(CAP, tokens + 2 * (e.t - last));
+    last = e.t;
+    if (e.op === "remove") {
+      if (removes.filter((t) => t > e.t - 10000).length >= 50) outcomes.push("remove_dropped");
+      else {
+        removes.push(e.t);
+        outcomes.push("remove_sent");
+      }
+      continue;
+    }
+    const times = pkg.get(e.package!) ?? [];
+    if (times.filter((t) => t > e.t - 60000).length >= 20) outcomes.push("dropped_package");
+    else if (tokens < COST) outcomes.push("dropped_budget");
+    else {
+      tokens -= COST;
+      times.push(e.t);
+      pkg.set(e.package!, times);
+      outcomes.push("sent");
+    }
+  }
+  return { outcomes };
+}
+
+// ---- the phone's per-nid sender
+function coalesce(events: { t: number; op: string; nid: string; content?: string }[]) {
+  type S = { lastSentAt: number | null; lastContent: string | null; pending: string | null };
+  const st = new Map<string, S>();
+  const sent: any[] = [];
+  const get = (nid: string) => st.get(nid) ?? (st.set(nid, { lastSentAt: null, lastContent: null, pending: null }), st.get(nid)!);
+  const fireDue = (upTo: number | null) => {
+    for (;;) {
+      let best: { nid: string; due: number } | null = null;
+      for (const [nid, s] of st) {
+        if (s.pending !== null && s.lastSentAt !== null) {
+          const due = s.lastSentAt + 1000;
+          if ((upTo === null || due <= upTo) && (best === null || due < best.due)) best = { nid, due };
+        }
+      }
+      if (!best) return;
+      const s = st.get(best.nid)!;
+      const content = s.pending!;
+      s.pending = null;
+      if (content !== s.lastContent) {
+        sent.push({ t: best.due, op: "post", nid: best.nid, content });
+        s.lastSentAt = best.due;
+        s.lastContent = content;
+      }
+    }
+  };
+  for (const e of events) {
+    fireDue(e.t);
+    const s = get(e.nid);
+    if (e.op === "remove") {
+      s.pending = null;
+      sent.push({ t: e.t, op: "remove", nid: e.nid });
+      s.lastSentAt = null;
+      s.lastContent = null;
+      continue;
+    }
+    if (s.lastSentAt !== null && e.t < s.lastSentAt + 1000) {
+      s.pending = e.content!;
+    } else if (e.content === s.lastContent) {
+      // identical to what the PC already has: nothing goes out
+    } else {
+      sent.push({ t: e.t, op: "post", nid: e.nid, content: e.content });
+      s.lastSentAt = e.t;
+      s.lastContent = e.content!;
+    }
+  }
+  fireDue(null);
+  return { sent };
+}
+
+// ---- toast arguments
+function parseToastArgs(s: string): { d: string; n: string; a: string; i?: number } | null {
+  if (s.length > 200) return null;
+  const parts = s.split("&");
+  if (parts.length !== 4 && parts.length !== 5) return null;
+  const keys = ["kin", "d", "n", "a", "i"];
+  const v: string[] = [];
+  for (let k = 0; k < parts.length; k++) {
+    const at = parts[k].indexOf("=");
+    if (at < 0 || parts[k].slice(0, at) !== keys[k]) return null;
+    v.push(parts[k].slice(at + 1));
+  }
+  if (v[0] !== "1" || !/^[A-Z2-7]{8}$/.test(v[1]) || !/^[0-9a-f]{32}$/.test(v[2]) || !["tap", "reply", "copy", "btn"].includes(v[3])) return null;
+  const needsIndex = v[3] === "reply" || v[3] === "btn";
+  if (needsIndex !== (parts.length === 5)) return null;
+  const out: any = { d: v[1], n: v[2], a: v[3] };
+  if (needsIndex) {
+    if (!/^(0|[1-9][0-9]?)$/.test(v[4]) || Number(v[4]) > 31) return null;
+    out.i = Number(v[4]);
+  }
+  return out;
+}
+const validCode = (s: unknown) => typeof s === "string" && /^[0-9A-Z-]{4,10}$/.test(s);
+const syncRemove = (shown: string[], nids: string[]) => shown.filter((n) => !nids.includes(n));
+// A hint or a button label as it is on the toast (and so in notif.action.label): U+2028, U+2029, U+FFFE and U+FFFF become a space, the ends are trimmed.
+const toastLabel = (s: string) => s.replace(/[\u2028\u2029\ufffe\uffff]/g, " ").replace(/^ +| +$/g, "");
+
+
 class Receiver {
   state: "before_hello" | "open";
   // processed message IDs, per paired PC (`device|id`), as the database remembers them
@@ -651,13 +925,21 @@ class Receiver {
   offers = new Map<string, { device: string; how: "unfinished" | "done" | "canceled" | "failed"; files: string }>();
   // the paired PC on this connection
   device = "first";
-  constructor(public role: Role, state: "before_hello" | "open") {
+  // the capabilities of this side's own latest hello and of the peer's latest accepted hello (changelog 56: a notif.* message is dropped
+  // silently unless both list "notif")
+  ownCaps = new Set<string>();
+  peerCaps = new Set<string>();
+  constructor(public role: Role, state: "before_hello" | "open", caps?: { own?: string[]; peer?: string[] }) {
     this.state = state;
+    this.ownCaps = new Set(caps?.own ?? []);
+    this.peerCaps = new Set(caps?.peer ?? []);
   }
   // a new connection: the state starts again, the memory of IDs stays (it is stored in the database). `device`: the connection is from
   // another paired PC.
   reconnect(device?: string) {
     this.state = "before_hello";
+    this.ownCaps = new Set();
+    this.peerCaps = new Set();
     if (device !== undefined) this.device = device;
   }
   transferOver(transferId: string, how: "done" | "canceled" | "failed") {
@@ -699,12 +981,29 @@ class Receiver {
     // step 6: for hello, protocol is checked before every other field
     if (type === "hello" && !badInts.has("protocol") && typeof o.protocol === "number" && Number.isSafeInteger(o.protocol) && o.protocol >= 0 && o.protocol !== 1)
       return bad(ref, "unsupported_version", 4002);
+    const isNotif = type.startsWith("notif.");
     // step 7
-    if (!validateFields(type, o, badInts)) return bad(ref);
+    if (!isNotif && !validateFields(type, o, badInts)) return bad(ref);
     // a valid offer with more than 800 files is rejected (an error, no ack, nothing remembered)
     if (type === "offer" && o.files.length > MAX_OFFER_FILES) return bad(ref, "too_large");
+    // step 6b (changelog 56): a notif.* message is dropped silently unless this side's own latest hello and the sender's latest hello list "notif".
+    // It is the receiver that keeps both lists; a case or sequence sets them (a hello of a sequence sets the sender's list on the other side).
+    if (isNotif && !(this.ownCaps.has("notif") && this.peerCaps.has("notif"))) return { reply: "none", action: "notif_dropped", close: null };
+    if (isNotif && fb.bytes.length > (type === "notif.icon" ? MAX_NOTIF_ICON_FRAME : MAX_NOTIF_FRAME)) return bad(ref, "too_large");
+    // step 7
+    if (isNotif) {
+      const r = notifOf(type, o, badInts);
+      if (r === "bad") return bad(ref);
+      // ephemeral messages skip step 8; notif.action is acked and de-duplicated like the others
+      if (type !== "notif.action") return r === "drop" ? { reply: "none", action: "notif_dropped", close: null } : { reply: "none", action: ACTION[type], close: null, notif: r };
+      const seenKey = `${this.device}|${o.id}`;
+      if (this.seen.has(seenKey)) return { reply: "ack", ref: o.id, action: "ignore_duplicate", close: null };
+      this.seen.add(seenKey);
+      return { reply: "ack", ref: o.id, action: ACTION[type], close: null, notif: r };
+    }
     if (type === "hello") {
       this.state = "open";
+      this.peerCaps = capabilitiesOf(o);
       return { reply: "none", action: ACTION.hello, close: null };
     }
     // ack and error are never acked and have no id; an error without a ref has nothing to mark failed
@@ -766,6 +1065,8 @@ function sameOutcome(actual: Outcome, expect: any): boolean {
   if (actual.action === "deliver_text" && (expect.sensitive ?? false) !== (actual.sensitive ?? false)) return false;
   // a deliver_link case says what the receiver shows and opens: the url as sent, the cleaned title and sourceApp
   if (actual.action === "deliver_link" && expect.link !== undefined && !eq(actual.link, expect.link)) return false;
+  // a notif.* case says what the receiver got after cleaning (expect.notif)
+  if (expect.notif !== undefined && !eq(actual.notif, expect.notif)) return false;
   return true;
 }
 
@@ -1042,7 +1343,7 @@ function checkResponse(group: string, name: string, expected: any, actual: Reply
     check(g, `${c.name}: to is the other role`, c.to === (c.from === "pc" ? "phone" : "pc"));
   }
   for (const c of d.valid) {
-    const out = new Receiver(c.to, c.state).receive(c.from, c);
+    const out = new Receiver(c.to, c.state, { own: c.own, peer: c.peer }).receive(c.from, c);
     check(g, `valid ${c.name}`, sameOutcome(out, c.expect), () => `expected ${j(c.expect)}\n       got      ${j(out)}`);
     check(g, `valid ${c.name}: is not an error reply`, out.reply !== "error");
     if (c.frame && out.reply === "ack") check(g, `valid ${c.name}: the ack carries the frame id`, out.ref === c.frame.id, () => `${out.ref} vs ${c.frame.id}`);
@@ -1063,7 +1364,7 @@ function checkResponse(group: string, name: string, expected: any, actual: Reply
     }
   }
   for (const c of d.invalid) {
-    const out = new Receiver(c.to, c.state).receive(c.from, c);
+    const out = new Receiver(c.to, c.state, { own: c.own, peer: c.peer }).receive(c.from, c);
     check(g, `invalid ${c.name}`, sameOutcome(out, c.expect), () => `expected ${j(c.expect)}\n       got      ${j(out)}`);
   }
   for (const s of d.sequences) {
@@ -1084,6 +1385,8 @@ function checkResponse(group: string, name: string, expected: any, actual: Reply
       const to: Role = st.from === "pc" ? "phone" : "pc";
       // each role has its own receiver state, and the first message a role receives is its peer's hello
       const out = rx[to].receive(st.from, st);
+      // a hello that is accepted also sets the capabilities of its own sender's side (what that side lists when it is the receiver)
+      if (st.frame?.type === "hello" && out.action === "handshake_ok") rx[st.from as Role].ownCaps = capabilitiesOf(st.frame);
       check(g, `sequence ${s.name} step ${i + 1}`, sameOutcome(out, st.expect), () => `expected ${j(st.expect)}\n       got      ${j(out)}`);
     });
   }
@@ -1091,7 +1394,7 @@ function checkResponse(group: string, name: string, expected: any, actual: Reply
   const types = new Set(d.valid.map((c: any) => c.frame?.type));
   for (const t of Object.keys(DIRECTION)) check(g, `has a valid example of ${t}`, types.has(t));
   for (const t of ACKED) {
-    const ok = d.valid.filter((c: any) => c.frame?.type === t).every((c: any) => c.expect.reply === "ack");
+    const ok = d.valid.filter((c: any) => c.frame?.type === t).every((c: any) => c.expect.reply === "ack" || c.expect.action === "notif_dropped");
     check(g, `every valid ${t} is acked`, ok);
   }
   for (const t of ["hello", "ack", "error"]) check(g, `no valid ${t} is acked`, d.valid.filter((c: any) => c.frame?.type === t).every((c: any) => c.expect.reply === "none"));
@@ -1549,6 +1852,350 @@ function receiverModel(frame: any) {
   console.log(`milestone 2B.1 scope: ${inScope} link cases in messages.json, plus links.json`);
 }
 
+
+// ---- notif.json (changelog 56)
+{
+  const g = "notif";
+  const d = load("notif.json");
+  for (const k of ["nid", "iconHash", "icon", "clean", "post", "code", "toastIds", "toastArguments", "rate", "coalesce", "sendNotif", "syncDiff", "toastLabel"]) uniqueNames(g + "." + k, d[k]);
+  check(g, "limits", eq(d.limits, { ...NOTIF_LIMITS, frameBytes: MAX_NOTIF_FRAME, iconFrameBytes: MAX_NOTIF_ICON_FRAME, codeMin: 4, codeMax: 10 }), () => j(d.limits));
+  // nid: the first 32 hex characters of SHA-256 of the UTF-8 key
+  for (const c of d.nid) check(g, `nid ${c.name}`, nidOfKey(c.key) === c.nid && NID_RE.test(c.nid), () => nidOfKey(c.key));
+  check(g, "the nid examples of the design", d.nid.some((c: any) => c.key === "0|com.example.chat|42|null|10123" && c.nid === "54892d1f759b11f6762ff1bd98cda7df") && d.nid.some((c: any) => c.key === "0|com.whatsapp|1|null|10123" && c.nid === "36460390475e793c9a9e06dd5e2d421f"));
+  check(g, "nid has non-ASCII, empty-tag and long keys", d.nid.some((c: any) => Array.from(c.key as string).some((ch) => ch.codePointAt(0)! > 127)) && d.nid.some((c: any) => c.key.includes("||")) && d.nid.some((c: any) => c.key.length >= 1000));
+  for (const c of d.iconHash) {
+    const bytes = new Uint8Array(Buffer.from(c.png, "base64url"));
+    check(g, `iconHash ${c.name}`, iconHashOf(bytes) === c.hash && bytes.length === c.bytes && base64url(bytes) === c.png, () => iconHashOf(bytes));
+  }
+  // icon[]: a notif.icon frame through the receiver
+  for (const c of d.icon) {
+    const png = c.pngFile !== undefined ? base64url(new Uint8Array(readFileSync(join(dir, c.pngFile)))) : c.png;
+    const frame: any = { type: "notif.icon", id: "icon-case" };
+    if (c.hash !== undefined) frame.hash = c.hash;
+    if (png !== undefined) frame.png = png;
+    const out = new Receiver("pc", "open", { own: ["notif"], peer: ["notif"] }).receive("phone", { frame });
+    const got = out.reply === "error" ? (out.code === "bad_request" ? "bad_request" : out.code) : out.action === "notif_icon" ? "accepted" : out.action === "notif_dropped" ? "dropped" : "?";
+    check(g, `icon ${c.name}`, got === c.expect && out.reply !== "ack", () => `expected ${c.expect}, model says ${got}`);
+  }
+  check(g, "icon fixtures are exactly 32,768 and 32,769 bytes", readFileSync(join(dir, "fixtures/notif-icon-32768.png")).length === 32768 && readFileSync(join(dir, "fixtures/notif-icon-32769.png")).length === 32769);
+  const innerLimit: Record<string, number> = { app: 40, title: 150, text: 500, bigText: 1000, subText: 80, conversation: 100, messageSender: 60, messageText: 300, line: 150, hint: 60, label: 30 };
+  for (const c of d.clean) {
+    const max = innerLimit[c.field];
+    check(g, `clean ${c.name}: a known field`, max !== undefined && max === d.limits[c.field]);
+    const got = cleanLinkText(c.input, max);
+    check(g, `clean ${c.name}`, got === c.expected, () => `expected ${j(c.expected)}, model says ${j(got)}`);
+    if (got !== null) check(g, `clean ${c.name}: stable and within the limit`, cleanLinkText(got, max) === got && cps(got).length <= max);
+  }
+  for (const c of d.post) {
+    const out = new Receiver(c.to, c.state, { own: c.own, peer: c.peer }).receive(c.from, c);
+    check(g, `post ${c.name}`, sameOutcome(out, c.expect), () => `expected ${j(c.expect)}\n       got      ${j(out)}`);
+    if (c.synthesize) check(g, `post ${c.name}: synthesized size matches totalBytes`, frameBytes(c).bytes.length === c.synthesize.totalBytes, () => `${frameBytes(c).bytes.length} vs ${c.synthesize.totalBytes}`);
+  }
+  // a post that is accepted never comes out with more than the limits allow
+  for (const c of d.post.filter((c: any) => c.expect.notif)) {
+    const n = c.expect.notif;
+    check(g, `post ${c.name}: the expected post is within the limits`, cps(n.app).length <= 40 && (n.title === undefined || cps(n.title).length <= 150) && (n.messages ?? []).length <= 5 && (n.lines ?? []).length <= 5 && (n.actions ?? []).length <= 3);
+  }
+  for (const c of d.code) check(g, `code ${c.name}`, validCode(c.input) === c.valid, () => j(c.input));
+  for (const c of d.toastIds) {
+    check(g, `toastIds ${c.name}: tag is the nid, group is kin- and the short ID`, c.tag === c.nid && c.group === `kin-${c.shortId}` && /^[A-Z2-7]{8}$/.test(c.shortId));
+    const expectArgs = (a: string, i?: number) => `kin=1&d=${c.shortId}&n=${c.nid}&a=${a}` + (i !== undefined ? `&i=${i}` : "");
+    check(g, `toastIds ${c.name}: launch and arguments`, c.launch === expectArgs("tap") && c.copy === expectArgs("copy") && c.reply.arguments === expectArgs("reply", c.reply.i) && c.button.arguments === expectArgs("btn", c.button.i));
+    for (const a of [c.launch, c.copy, c.reply.arguments, c.button.arguments]) check(g, `toastIds ${c.name}: ${a.slice(-12)} parses`, parseToastArgs(a)?.n === c.nid && parseToastArgs(a)?.d === c.shortId);
+    check(g, `toastIds ${c.name}: the arguments hold no content`, [c.launch, c.copy, c.reply.arguments, c.button.arguments].every((a) => a.length <= 200 && /^[A-Za-z0-9=&-]+$/.test(a)));
+  }
+  for (const c of d.toastArguments) {
+    const got = parseToastArgs(c.input);
+    check(g, `toastArguments ${c.name}`, c.valid ? eq(got, c.parsed) : got === null, () => `model says ${j(got)}`);
+  }
+  check(g, "toastArguments has accepted and refused cases", d.toastArguments.some((c: any) => c.valid) && d.toastArguments.filter((c: any) => !c.valid).length >= 30);
+  for (const c of d.rate) {
+    check(g, `rate ${c.name}: events are in time order`, c.events.every((e: any, k: number) => k === 0 || c.events[k - 1].t <= e.t));
+    if (c.limiter === "pc") {
+      const r = pcLimiter(c.events);
+      check(g, `rate ${c.name}`, eq(r.outcomes, c.expect) && eq(r.errorsAt, c.errorsAt), () => `errors ${j(r.errorsAt)} expected ${j(c.errorsAt)}`);
+      // the bucket never gives more than its capacity plus the refill, and errors are at least 10 s apart
+      const accepted = r.outcomes.filter((o) => o === "accepted").length;
+      const span = c.events.length ? c.events[c.events.length - 1].t : 0;
+      check(g, `rate ${c.name}: accepted <= 20 + span in seconds`, accepted <= 20 + Math.floor(span / 1000));
+      check(g, `rate ${c.name}: errors are at least 10 s apart`, r.errorsAt.every((t: number, k: number) => k === 0 || t - r.errorsAt[k - 1] >= 10000));
+    } else {
+      check(g, `rate ${c.name}`, eq(phoneLimiter(c.events).outcomes, c.expect));
+    }
+    check(g, `rate ${c.name}: one outcome per event`, c.expect.length === c.events.length);
+  }
+  for (const c of d.coalesce) {
+    const r = coalesce(c.events);
+    check(g, `coalesce ${c.name}`, eq(r.sent, c.expect.sent), () => `model says ${j(r.sent)}`);
+    // a post is never sent twice in a row with the same content, and never twice within 1 s of the last for the same nid
+    const lastPost = new Map<string, { t: number; content: string }>();
+    for (const x of r.sent) {
+      if (x.op === "remove") {
+        lastPost.delete(x.nid);
+        continue;
+      }
+      const prev = lastPost.get(x.nid);
+      check(g, `coalesce ${c.name}: ${x.t} ms is not a repeat or inside the window`, !prev || (prev.content !== x.content && x.t - prev.t >= 1000));
+      lastPost.set(x.nid, { t: x.t, content: x.content });
+    }
+  }
+  for (const c of d.sendNotif) {
+    const hellos = c.hellos.map((h: any) => ({ type: "hello", id: "h", protocol: 1, name: "X", platform: "android", appVersion: "0.2.0", ...h }));
+    const mayRelay = hellos.length > 0 && capabilitiesOf(hellos[hellos.length - 1]).has("notif");
+    check(g, `sendNotif ${c.name}`, (mayRelay ? "send" : "nothing") === c.expected);
+  }
+  for (const c of d.syncDiff) check(g, `syncDiff ${c.name}`, eq(syncRemove(c.shown, c.nids), c.remove));
+  for (const c of d.toastLabel) {
+    check(g, `toastLabel ${c.name}`, toastLabel(c.input) === c.expected, () => `model says ${j(toastLabel(c.input))}`);
+    check(g, `toastLabel ${c.name} is idempotent`, toastLabel(toastLabel(c.input)) === toastLabel(c.input));
+  }
+}
+
+// ---- notif.json, the arrays that only the phone runs (design 3.11): otpDetect[], redactedText[], skip[], pickActions[]. Their reference models are written from design
+// 4.4, 4.7, 4.9 and 4.10; where the design is ambiguous the reading is the one the Android code settled on (see protocol/README.md, "notif.json").
+
+// ---- one-time code detector (design 4.10)
+const OTP_KEYWORDS: string[] = [
+  // English
+  "code", "otp", "passcode", "pass code", "verification", "verify", "one-time", "one time", "security code", "login code", "sign-in code", "sign in code", "2fa", "two-factor", "two factor", "pin", "confirmation code",
+  // Spanish / Portuguese
+  "código", "codigo", "verificación", "verificacion", "verificação", "clave", "contraseña de un solo uso", "senha", "confirmación", "confirmação",
+  // French
+  "code", "vérification", "verification", "confirmation", "mot de passe à usage unique",
+  // German
+  "code", "bestätigungscode", "verifizierung", "sicherheitscode", "einmalpasswort", "tan",
+  // Italian / Dutch
+  "codice", "verifica", "conferma", "password monouso", "verificatie", "verificatiecode", "bevestigingscode",
+  // Nordic / Polish
+  "kod", "kode", "bekräftelsekod", "verifieringskod", "engangskode", "weryfikacyjny", "jednorazowy",
+  // Turkish / Russian / Ukrainian
+  "kod", "doğrulama", "onay kodu", "tek kullanımlık", "код", "подтверждения", "проверочный", "одноразовый", "підтвердження",
+  // Arabic / Persian / Hindi
+  "رمز", "رمز التحقق", "كلمة مرور لمرة واحدة", "کد", "کد تایید", "कोड", "ओटीपी", "सत्यापन",
+  // Indonesian / Vietnamese / Thai
+  "kode", "verifikasi", "sandi sekali pakai", "mã", "xác minh", "mã xác thực", "รหัส", "ยืนยัน",
+  // Japanese / Korean
+  "認証コード", "確認コード", "認証番号", "確認番号", "ワンタイム", "コード", "인증번호", "인증 코드", "확인 코드", "일회용",
+  // Chinese
+  "验证码", "校验码", "动态码", "确认码", "驗證碼", "校驗碼", "動態密碼",
+];
+const OTP_WHOLE_WORD = new Set(["otp", "2fa", "pin"]);
+const OTP_PROMO = ["save", "off", "discount", "promo", "coupon", "sale"];
+const UNSPACED = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Thai}]/u;
+const isWordCh = (c: string) => /[\p{L}\p{N}\p{M}]/u.test(c);
+function foldDigitsAscii(s: string): string {
+  let out = "";
+  for (const ch of s) {
+    const cp = ch.codePointAt(0)!;
+    if (cp > 0x7f && /\p{Nd}/u.test(ch)) {
+      let run = cp;
+      while (/\p{Nd}/u.test(String.fromCodePoint(run - 1))) run--;
+      out += String((cp - run) % 10);
+    } else out += ch;
+  }
+  return out;
+}
+// lower-case one character at a time (Locale.ROOT): a character whose lower case has another length keeps its place
+function lowerPerChar(s: string): string {
+  let out = "";
+  for (const ch of s) {
+    const l = ch.toLowerCase();
+    out += l.length === ch.length ? l : ch;
+  }
+  return out;
+}
+function otpDetect(title: string | undefined, text: string | undefined, bigText: string | undefined, hasContact: boolean): string | null {
+  if (hasContact) return null;
+  const joined = [title, text, bigText].filter((x): x is string => typeof x === "string" && x.length > 0).join("\n");
+  if (joined.length === 0 || joined.length > 400) return null;
+  const folded = foldDigitsAscii(joined);
+  const lower = lowerPerChar(folded);
+  // gate 1: a keyword (the CJK, Thai and Hangul ones anywhere, the rest on word boundaries; otp, 2fa and pin always whole words)
+  const spans: [number, number][] = [];
+  for (const kw0 of OTP_KEYWORDS) {
+    const kw = lowerPerChar(kw0);
+    const substring = !OTP_WHOLE_WORD.has(kw) && UNSPACED.test(kw);
+    for (let at = lower.indexOf(kw); at >= 0; at = lower.indexOf(kw, at + 1)) {
+      const end = at + kw.length;
+      if (substring || ((at === 0 || !isWordCh(lower[at - 1])) && (end === lower.length || !isWordCh(lower[end])))) spans.push([at, end - 1]);
+    }
+  }
+  if (spans.length === 0) return null;
+  type Cand = { value: string; start: number; end: number; year: boolean };
+  const isDigit = (c: string) => c >= "0" && c <= "9";
+  const touches = (c: string) => (isDigit(c) ? true : /\p{L}/u.test(c) ? !UNSPACED.test(c) : false);
+  const UNIT_AFTER = /^ ?(?:usd|eur|gbp|jpy|cny|inr|rub|krw|chf|cad|aud|mxn|brl|pln|sek|nok|dkk|km|kg|min|mins|h|hr|hrs|m|cm|mm|mi|lb|lbs|mph|kph)(?![\p{L}\p{N}])/iu;
+  const standsAlone = (start: number, end: number): boolean => {
+    if (start > 0) {
+      const b = folded[start - 1];
+      if (touches(b) || "$€£¥₹₽₩+(".includes(b)) return false;
+      if (".,:/-".includes(b) && start >= 2 && isDigit(folded[start - 2])) return false;
+    }
+    if (end < folded.length) {
+      const a = folded[end];
+      if (touches(a) || a === "%") return false;
+      if (".,:/".includes(a) && end + 1 < folded.length && isDigit(folded[end + 1])) return false;
+    }
+    return !UNIT_AFTER.test(folded.slice(end, Math.min(folded.length, end + 8)));
+  };
+  const cands: Cand[] = [];
+  const add = (value: string, start: number, end: number) => {
+    if (standsAlone(start, end)) cands.push({ value, start, end, year: value.length === 4 && Number(value) >= 1900 && Number(value) <= 2099 });
+  };
+  for (const m of folded.matchAll(/[0-9]+(?:[ \-][0-9]+)*/g)) {
+    const groups: [string, number, number][] = [];
+    let at = m.index!;
+    for (const part of m[0].split(/[ \-]/)) {
+      groups.push([part, at, at + part.length]);
+      at += part.length + 1;
+    }
+    if (groups.length >= 3) continue; // "1234 5678 9012", a date, a phone number
+    if (groups.length === 2 && ((groups[0][0].length === 3 && groups[1][0].length === 3) || (groups[0][0].length === 4 && groups[1][0].length === 4))) add(groups[0][0] + groups[1][0], groups[0][1], groups[1][2]);
+    else for (const [d, s, e] of groups) if (d.length >= 4 && d.length <= 8) add(d, s, e);
+  }
+  const insideUrl = (idx: number) => {
+    let a = idx;
+    while (a > 0 && !/\s/.test(folded[a - 1])) a--;
+    let b = idx;
+    while (b < folded.length && !/\s/.test(folded[b])) b++;
+    const w = folded.slice(a, b).toLowerCase();
+    return w.includes("://") || w.startsWith("www.");
+  };
+  for (const m of folded.matchAll(/(?<![A-Za-z0-9])[A-Z0-9]{5,8}(?![A-Za-z0-9])/g)) {
+    const tok = m[0], start = m.index!, end = start + tok.length;
+    if (/[A-Z]/.test(tok) && /[0-9]/.test(tok) && !insideUrl(start) && (start === 0 || !touches(folded[start - 1])) && (end === folded.length || !touches(folded[end]))) cands.push({ value: tok, start, end, year: false });
+  }
+  const promoRe = new RegExp(`(?<![\\p{L}\\p{N}])(?:${OTP_PROMO.join("|")})(?![\\p{L}\\p{N}])`, "u");
+  const isPromo = (c: Cand) => {
+    if (OTP_PROMO.some((w) => lower.slice(c.start, c.end).includes(w))) return true;
+    return promoRe.test(lower.slice(Math.max(0, c.start - 30), c.start)) || promoRe.test(lower.slice(c.end, Math.min(lower.length, c.end + 30)));
+  };
+  const live = cands.filter((c) => !isPromo(c));
+  if (live.length === 0) return null;
+  const usable = live.filter((c) => !c.year).length > 0 ? live.filter((c) => !c.year) : live; // a year is a code only when nothing else is there
+  const dist = (c: Cand) => Math.min(...spans.map(([a, b]) => (b < c.start ? c.start - b - 1 : a >= c.end ? a - c.end : 0)));
+  const byValue = new Map<string, number>();
+  for (const c of usable) byValue.set(c.value, Math.min(byValue.get(c.value) ?? Infinity, dist(c)));
+  if (byValue.size === 1) return [...byValue.keys()][0];
+  const ranked = [...byValue.entries()].sort((a, b) => a[1] - b[1]);
+  // "at least 10 characters closer" is read as MORE than 10: the design's own example, "Verification code 123456 or 654321", must give no code
+  return ranked[1][1] - ranked[0][1] > 10 ? ranked[0][0] : null;
+}
+
+// ---- Android 15+ redaction (design 4.9)
+const redactedMatch = (sdk: number, texts: (string | null)[], known: string[]): boolean => {
+  const fold = (t: string) => lowerPerChar(t.trim());
+  const set = new Set(known.map(fold));
+  return sdk >= 35 && texts.some((t) => t !== null && set.has(fold(t)));
+};
+
+// ---- skip rules (design 4.4)
+const SKIPPED_CATEGORIES = new Set(["progress", "service", "sys", "status", "alarm", "call", "navigation"]);
+function skipDecide(c: any): string {
+  const s = { packageName: "com.example.chat", channelId: null, currentUser: true, ongoing: false, foregroundService: false, notClearable: false, groupSummary: false, localOnly: false, category: null, media: false, progressMax: 0, progressIndeterminate: false, importance: 3, suspended: false, visibility: 0, lockscreenOverride: -1000, title: "Alice", text: "hi", bigText: null, messages: 0, lines: 0, redacted: false, ...c.snapshot };
+  const policy = { enabled: true, allowed: ["com.example.chat"], hiddenAllowed: [], ...c.policy };
+  const flagged: string[] = c.flagged ?? [];
+  if (s.packageName === c.ownPackage && !(c.debugChannel != null && typeof s.channelId === "string" && s.channelId.startsWith(c.debugChannel))) return "own";
+  if (!(policy.enabled && policy.allowed.includes(s.packageName))) return "not_allowed";
+  if (!s.currentUser) return "other_profile";
+  if (s.ongoing || s.foregroundService || s.notClearable) return "ongoing";
+  if (s.groupSummary) return "summary";
+  if (s.localOnly) return "local_only";
+  if (s.media || s.category === "transport") return "media";
+  if ((s.category !== null && SKIPPED_CATEGORIES.has(s.category)) || (s.progressMax > 0 && !s.progressIndeterminate)) return "category";
+  if (s.importance <= 1 || s.suspended) return "importance";
+  const visibility = s.lockscreenOverride !== -1000 ? s.lockscreenOverride : s.visibility;
+  const secret = visibility === -1;
+  if (secret && !policy.hiddenAllowed.includes(s.packageName)) return "secret";
+  const hasContent = (typeof s.title === "string" && s.title.trim() !== "") || (typeof s.text === "string" && s.text.trim() !== "") || (typeof s.bigText === "string" && s.bigText.trim() !== "") || s.messages > 0 || s.lines > 0;
+  if (!hasContent && !s.redacted) return "empty";
+  return flagged.includes(s.packageName) || secret ? "send_sensitive" : "send";
+}
+
+// ---- reply and buttons (design 4.7)
+function pickActionsModel(actions: any[], clean: (s: string | null | undefined, max: number) => string | null) {
+  const usable = actions.filter((a) => (a.hasIntent ?? true) && a.index >= 0 && a.index <= 31 && !(a.contextual ?? false));
+  const free = (a: any) => (a.remoteInputs ?? []).some((r: any) => r.freeForm ?? true);
+  const replyCands = usable.filter((a) => a.isActivity !== true && free(a));
+  const replyAction = replyCands.find((a) => (a.semantic ?? 0) === 1) ?? replyCands[0];
+  let reply: any = null;
+  if (replyAction) {
+    const input = replyAction.remoteInputs.find((r: any) => r.freeForm ?? true);
+    const hint = clean(input.label, 60);
+    reply = { i: replyAction.index, ...(hint !== null ? { hint } : {}) };
+  }
+  const buttons: any[] = [];
+  for (const a of usable) {
+    if (a === replyAction || (a.remoteInputs ?? []).length > 0 || a.isActivity === true) continue;
+    const label = clean(a.title, 30);
+    if (label !== null) buttons.push({ i: a.index, label });
+    if (buttons.length === 3) break;
+  }
+  return { reply, actions: buttons };
+}
+
+{
+  const g = "notif-phone";
+  const d = load("notif.json");
+  for (const k of ["otpDetect", "skip", "pickActions"]) uniqueNames(g + "." + k, d[k]);
+  uniqueNames(g + ".redactedText", d.redactedText.cases);
+  for (const c of d.otpDetect) {
+    const got = otpDetect(c.title, c.text, c.bigText, c.personHasContactUri === true);
+    check(g, `otpDetect ${c.name}`, got === c.expect, () => `expected ${j(c.expect)}, model says ${j(got)}`);
+    // a code that is found is always one the PC accepts
+    if (got !== null) check(g, `otpDetect ${c.name}: a code the PC accepts`, validCode(got));
+  }
+  // every language of the keyword table has a positive, and every negative of design 4.10 is there
+  const langs = ["english", "spanish", "portuguese", "french", "german", "italian", "dutch", "swedish", "norwegian", "polish", "turkish", "russian", "ukrainian", "arabic", "persian-digits", "hindi-devanagari-digits", "indonesian", "vietnamese", "thai", "japanese", "korean", "chinese-simplified", "chinese-traditional"];
+  for (const l of langs) check(g, `otpDetect has a positive for ${l}`, d.otpDetect.some((c: any) => c.name === `positive-${l}` && c.expect !== null));
+  for (const n of ["order-number-has-no-keyword", "promo-code", "time-and-room-no-keyword", "amount", "phone-number-three-groups", "three-groups", "two-equal-candidates"]) check(g, `otpDetect has the negative ${n}`, d.otpDetect.some((c: any) => c.name === `negative-${n}` && c.expect === null));
+  check(g, "otpDetect: the year and the code", d.otpDetect.some((c: any) => c.name === "positive-year-and-code" && c.expect === "482913"));
+  for (const c of d.redactedText.cases) check(g, `redactedText ${c.name}`, redactedMatch(c.sdk, c.texts, d.redactedText.known) === c.expect);
+  for (const c of d.skip) {
+    const got = skipDecide(c);
+    check(g, `skip ${c.name}`, got === c.expect, () => `expected ${c.expect}, model says ${got}`);
+  }
+  // the first rule that matches decides: every reason has a case, and every case that sends says whether it is sensitive
+  const reasons = ["own", "not_allowed", "other_profile", "ongoing", "summary", "local_only", "media", "category", "importance", "secret", "empty", "send", "send_sensitive"];
+  for (const r of reasons) check(g, `skip has a case for ${r}`, d.skip.some((c: any) => c.expect === r));
+  check(g, "skipDefaults are the defaults of the model", eq(d.skipDefaults, { packageName: "com.example.chat", channelId: null, currentUser: true, ongoing: false, foregroundService: false, notClearable: false, groupSummary: false, localOnly: false, category: null, media: false, progressMax: 0, progressIndeterminate: false, importance: 3, suspended: false, visibility: 0, lockscreenOverride: -1000, title: "Alice", text: "hi", bigText: null, messages: 0, lines: 0, redacted: false }));
+  for (const c of d.pickActions) {
+    const got = pickActionsModel(c.actions, (x, max) => (typeof x === "string" ? cleanLinkText(x, max) : null));
+    check(g, `pickActions ${c.name}`, eq(got, c.expect), () => `expected ${j(c.expect)}, model says ${j(got)}`);
+    // never more than the PC allows: 3 buttons, indexes 0 to 31, a label of at most 30 and a hint of at most 60 code points
+    check(g, `pickActions ${c.name}: within the limits`, c.expect.actions.length <= 3 && c.expect.actions.every((a: any) => a.i >= 0 && a.i <= 31 && cps(a.label).length <= 30) && (c.expect.reply === null || (c.expect.reply.i >= 0 && c.expect.reply.i <= 31 && (c.expect.reply.hint === undefined || cps(c.expect.reply.hint).length <= 60))));
+  }
+}
+
+{
+  const g = "scope-2b.2";
+  const messages = load("messages.json");
+  const matches = (name: string, p: string) => (p.endsWith("*") ? name.startsWith(p.slice(0, -1)) : name === p);
+  const SCOPE: [string, any[], string[], number][] = [
+    ["messages.valid", messages.valid, ["notif-*"], 30],
+    ["messages.invalid", messages.invalid, ["notif-*"], 55],
+    ["messages.sequences", messages.sequences, ["notif-dropped-when-feature-off-is-silent", "notif-capability-changes-with-a-new-hello", "notif-is-not-in-the-dedup-memory", "notif-action-is-acked-and-a-repeat-is-not-run-twice", "notif-action-is-not-resent-after-reconnect", "notif-sync-removes-the-rest", "notif-invalid-post-keeps-the-connection-open", "notif-status-then-icon-then-post"], 8],
+  ];
+  let inScope = 0;
+  for (const [label, cases, patterns, atLeast] of SCOPE) {
+    for (const p of patterns) check(g, `${label}: "${p}" matches a case`, cases.some((c) => matches(c.name, p)));
+    const hits = cases.filter((c) => patterns.some((p) => matches(c.name, p)));
+    inScope += hits.length;
+    check(g, `${label}: at least ${atLeast} cases in scope`, hits.length >= atLeast, () => String(hits.length));
+  }
+  // every notif type has a valid example; ephemeral ones reply nothing, notif.action is acked; a dropped message never has a reply
+  for (const t of Object.keys(DIRECTION).filter((t) => t.startsWith("notif."))) {
+    const ex = messages.valid.filter((c: any) => c.frame?.type === t && c.expect.action !== "notif_dropped");
+    check(g, `${t}: has a valid example`, ex.length > 0);
+    check(g, `${t}: ${t === "notif.action" ? "is acked" : "is never acked"}`, ex.every((c: any) => c.expect.reply === (t === "notif.action" ? "ack" : "none")));
+  }
+  check(g, "every dropped case replies with nothing", messages.valid.filter((c: any) => c.expect.action === "notif_dropped").every((c: any) => c.expect.reply === "none" && c.expect.close === null));
+  check(g, "every notif case lists the capabilities of both sides", [...messages.valid, ...messages.invalid].filter((c: any) => c.name.startsWith("notif-")).every((c: any) => Array.isArray(c.own) && Array.isArray(c.peer)));
+  check(g, "wrong-direction notif messages are unsupported_type", messages.invalid.filter((c: any) => /^notif-.*wrong-direction/.test(c.name)).length >= 7);
+  const d = load("notif.json");
+  for (const k of ["nid", "iconHash", "icon", "clean", "post", "code", "toastIds", "toastArguments", "rate", "coalesce", "sendNotif", "syncDiff", "toastLabel", "otpDetect", "skip", "pickActions"]) check(g, `notif.json ${k}[] exists`, Array.isArray(d[k]) && d[k].length > 0);
+  console.log(`milestone 2B.2 scope: ${inScope} notif cases in messages.json, plus notif.json`);
+}
 
 // ---- fixtures/: DER certificates for the negative tls[] cases (made by fixtures/make-fixtures.ts)
 {
