@@ -88,4 +88,14 @@ windows = { version = "0.62.2", features = [
     "Data_Xml_Dom",
     "Foundation",
     "Foundation_Collections",
+    # Media controls (2B.3): the media sessions (GSMTC), the flyout (SystemMediaTransportControls on a hidden window), the master volume (Core Audio) and the
+    # lock notices of the hidden window.
+    "Media",
+    "Media_Control",
+    "Storage_Streams",
+    "Win32_System_WinRT",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_RemoteDesktop",
 ] }

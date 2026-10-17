@@ -22,6 +22,13 @@
 //!   `--notif-sync <nid,nid,...>` (empty: nothing is on the phone). It prints what the PC sends back: `received notif.dismiss nid=<nid>`,
 //!   `received notif.action id=<id> nid=<nid> i=<i> label=<label> text=<text>` (acked; `--notif-action-error <code>` answers with that `error` instead) and
 //!   an `error` of the PC (`rate_limited`). (A developer tool: it prints the reply text. Kin itself never logs it.)
+//! * (2B.3) **Media controls.** `--media` adds `media` to the phone's `capabilities`. Then, one per second in the order given: `--media-status <show>,<share>[,<access>]`
+//!   (for example `--media-status true,true,granted`), `--media-state '<json>'` (the fields of a `media.state` other than `type` and `id`; `"sid":"@sid"` is the `sid` of
+//!   `com.example.player`, `"artHash":"@art"` the hash of the generated 64 x 64 cover), `--media-image` (that cover as `media.image`), `--media-clear` and
+//!   `--media-volume <level>[,<muted>]`, and `--media-cmd '<json>'` (the fields of a `media.cmd`, for example `'{"sid":"<sid>","cmd":"toggle"}'` or
+//!   `'{"cmd":"volume","level":30}'`: the phone controlling the PC's media). It prints what the PC sends: `received media.status show=.. share=..`, `received media.state sid=.. state=.. app=.. title=..`,
+//!   `received media.image`, `received media.clear`, `received media.volume level=.. muted=..` and `received media.cmd id=.. sid=.. cmd=.. seekMs=..`
+//!   (`--media-cmd-error <code>` answers a command with that `error`, as a source would; media is never acked). (A developer tool: it prints titles. Kin itself never does.)
 //! * `--no-ack` doesn't ack `text` and `clipboard` from the PC (to see the PC's 5 s ack timeout and its notice).
 //! * What it receives is printed on one line each, for scripts to look for: `received clipboard id=<id> text=<text>` and
 //!   `received text id=<id> isUrl=<bool> text=<text>`. (This is a developer tool: it prints the text. Kin itself never logs it.)
@@ -115,13 +122,62 @@ impl ServerCertVerifier for Pinned {
     }
 }
 
-/// The phone's `hello`. A 2B.1 phone lists the `link` capability; `--old-phone` is a 0.1.x phone, which doesn't; `--notif` (2B.2) adds `notif`.
-fn hello_of(name: &str, id: &str, old_phone: bool, notif: bool) -> Value {
+/// The phone's `hello`. A 2B.1 phone lists the `link` capability; `--old-phone` is a 0.1.x phone, which doesn't; `--notif` (2B.2) adds `notif` and `--media` (2B.3)
+/// adds `media`.
+fn hello_of(name: &str, id: &str, old_phone: bool, notif: bool, media: bool) -> Value {
     let mut hello = json!({ "type": "hello", "id": id, "protocol": 1, "name": name, "platform": "android", "appVersion": "0.0.0" });
     if !old_phone {
-        hello["capabilities"] = if notif { json!(["link", "notif"]) } else { json!(["link"]) };
+        let mut caps = vec!["link"];
+        if notif {
+            caps.push("notif");
+        }
+        if media {
+            caps.push("media");
+        }
+        hello["capabilities"] = json!(caps);
     }
     hello
+}
+
+/// The 64 x 64 picture that `--media-image` sends as the cover (stored uncompressed: about 16 KiB, under the 24,576 bytes of the wire), and its hash.
+fn generated_art() -> (String, Vec<u8>) {
+    let png = kin_lib::mirror::icons::test_png(64, 64, [220, 90, 40, 255]);
+    (kin_lib::media::wire::hash_of(&png), png)
+}
+
+/// The frame of one of the `--media-*` things the phone sends on its own (2B.3). `@sid` in a `sid` is the `sid` of `com.example.player`, `@art` in `artHash` the hash of
+/// the generated picture.
+fn media_frame(kind: &str, value: &str, id: &str) -> Value {
+    let (art_hash, art_png) = generated_art();
+    match kind {
+        "media.status" => {
+            let mut parts = value.split(',');
+            let flag = |p: Option<&str>| p == Some("true");
+            let mut frame = json!({ "type": kind, "id": id, "show": flag(parts.next()), "share": flag(parts.next()) });
+            if let Some(access) = parts.next().filter(|a| !a.is_empty()) {
+                frame["access"] = json!(access);
+            }
+            frame
+        }
+        "media.image" => kin_lib::media::wire::image_frame(id, kin_lib::media::wire::ImageKind::Art, &art_png),
+        "media.clear" => json!({ "type": kind, "id": id }),
+        "media.volume" => {
+            let mut parts = value.split(',');
+            json!({ "type": kind, "id": id, "level": parts.next().and_then(|l| l.parse::<u64>().ok()).unwrap_or(50), "muted": parts.next() == Some("true") })
+        }
+        _ => {
+            let mut frame: Value = serde_json::from_str(value).expect("--media-state and --media-cmd take a JSON object");
+            frame["type"] = json!(kind);
+            frame["id"] = json!(id);
+            if frame["sid"] == "@sid" {
+                frame["sid"] = json!(kin_lib::media::wire::sid_of("com.example.player"));
+            }
+            if frame["artHash"] == "@art" {
+                frame["artHash"] = json!(art_hash);
+            }
+            frame
+        }
+    }
 }
 
 /// The 48 x 48 icon that `--notif-icon` sends (a real phone sends a compressed PNG of up to 32 KiB; this generated one is stored uncompressed, so it is
@@ -506,6 +562,8 @@ async fn main() {
     let link_title = arg(&args, "--send-link-title");
     let notif = args.iter().any(|a| a == "--notif");
     let notif_action_error = arg(&args, "--notif-action-error");
+    let media = args.iter().any(|a| a == "--media");
+    let media_cmd_error = arg(&args, "--media-cmd-error");
     // What the phone sends on its own: texts, links and (2B.2) notification messages, one a second. The notification ones keep the order of the command line.
     let mut texts: Vec<(&'static str, String)> = all_args(&args, "--send-text")
         .into_iter()
@@ -521,6 +579,12 @@ async fn main() {
             "--notif-post" => texts.push(("notif.post", next())),
             "--notif-remove" => texts.push(("notif.remove", next())),
             "--notif-sync" => texts.push(("notif.sync", next())),
+            "--media-status" => texts.push(("media.status", next())),
+            "--media-state" => texts.push(("media.state", next())),
+            "--media-image" => texts.push(("media.image", String::new())),
+            "--media-clear" => texts.push(("media.clear", String::new())),
+            "--media-volume" => texts.push(("media.volume", next())),
+            "--media-cmd" => texts.push(("media.cmd", next())),
             _ => {}
         }
         i += 1;
@@ -606,7 +670,7 @@ async fn main() {
     // WebSocket.
     let (mut ws, _) =
         tokio_tungstenite::client_async(format!("ws://{host}:{port}/v1/ws"), net.connect().await).await.expect("WebSocket upgrade");
-    let hello = hello_of(&name, "fake-hello", old_phone, notif);
+    let hello = hello_of(&name, "fake-hello", old_phone, notif, media);
     ws.send(Message::Text(hello.to_string().into())).await.unwrap();
     say("connected, hello sent");
     let mut hello_sent_at = Instant::now();
@@ -647,7 +711,7 @@ async fn main() {
                     let (new_ws, _) = tokio_tungstenite::client_async(format!("ws://{host}:{port}/v1/ws"), net.connect().await).await.expect("WebSocket upgrade after the reconnect");
                     ws = new_ws;
                     hellos += 1;
-                    let hello = hello_of(&name, &format!("fake-hello-{hellos}"), old_phone, notif);
+                    let hello = hello_of(&name, &format!("fake-hello-{hellos}"), old_phone, notif, media);
                     ws.send(Message::Text(hello.to_string().into())).await.unwrap();
                     hello_sent_at = Instant::now();
                     say(&format!("reconnected at={} (hello sent)", unix_ms()));
@@ -663,6 +727,8 @@ async fn main() {
                     let id = format!("fake-{kind}-{}", i + 1);
                     let frame = if kind.starts_with("notif.") {
                         notif_frame(kind, &text, &id)
+                    } else if kind.starts_with("media.") {
+                        media_frame(kind, &text, &id)
                     } else if kind == "link" {
                         let mut f = json!({ "type": "link", "id": id, "url": text, "sourceApp": "Fake Phone" });
                         if let Some(t) = &link_title {
@@ -773,6 +839,39 @@ async fn main() {
                                 None => json!({ "type": "ack", "ref": v["id"] }),
                             };
                             ws.send(Message::Text(answer.to_string().into())).await.unwrap();
+                        }
+                        // Media (2B.3): all ephemeral, so nothing is acked. A command can be answered with an error (`--media-cmd-error <code>`), as a source would.
+                        Some("media.status") => say(&format!("received media.status show={} share={}", v["show"], v["share"])),
+                        Some("media.state") => say(&format!(
+                            "received media.state sid={} state={} app={} title={} artist={} position={} duration={} actions={} artHash={} volume={}",
+                            v["sid"].as_str().unwrap_or(""),
+                            v["state"].as_str().unwrap_or(""),
+                            v["app"].as_str().unwrap_or(""),
+                            v["title"].as_str().unwrap_or(""),
+                            v["artist"].as_str().unwrap_or(""),
+                            v["positionMs"],
+                            v["durationMs"],
+                            v["actions"],
+                            v["artHash"].as_str().unwrap_or(""),
+                            v["volume"]
+                        )),
+                        Some("media.image") => say(&format!("received media.image kind={} hash={}", v["kind"].as_str().unwrap_or(""), v["hash"].as_str().unwrap_or(""))),
+                        Some("media.clear") => say("received media.clear"),
+                        Some("media.volume") => say(&format!("received media.volume level={} muted={}", v["level"], v["muted"])),
+                        Some("media.cmd") => {
+                            say(&format!(
+                                "received media.cmd id={} sid={} cmd={} seekMs={} level={} delta={} mute={}",
+                                v["id"],
+                                v["sid"].as_str().unwrap_or(""),
+                                v["cmd"].as_str().unwrap_or(""),
+                                v["seekMs"],
+                                v["level"],
+                                v["delta"],
+                                v["mute"]
+                            ));
+                            if let Some(code) = &media_cmd_error {
+                                ws.send(Message::Text(json!({ "type": "error", "ref": v["id"], "code": code, "message": "refused by the fake phone" }).to_string().into())).await.unwrap();
+                            }
                         }
                         Some("error") => say(&format!("received error code={} ref={}", v["code"].as_str().unwrap_or(""), v["ref"])),
                         Some("unpair") => {

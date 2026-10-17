@@ -27,6 +27,13 @@ pub struct Config {
     /// Developer setting (2B.2): every phone notification goes to the Action Center without a popup and without a sound, so a test never puts a popup on the
     /// screen of the person at the keyboard.
     pub dev_toast_quiet: bool,
+    /// Developer setting (2B.3): in a test run (every instance but the installed Kin) the PC reads and controls **only** the media session whose
+    /// `SourceAppUserModelId` is this (it has to be a test session of Kin's own making, `media::guard::TEST_AUMID_PREFIX`); with it missing no session is read.
+    pub dev_media_aumid: Option<String>,
+    /// Developer setting (2B.3): a test run writes the PC's real master volume after all. **No agent and no automated test ever passes it.**
+    pub dev_media_real_volume: bool,
+    /// Developer setting (2B.3): the media flyout never shows `Playing`. A test run does that anyway; the flag only says it out loud.
+    pub dev_media_quiet: bool,
     /// Developer setting: received files go here instead of `Downloads\Kin` (and instead of `receivedFolder` of settings.json), so
     /// a test never writes to the real Downloads folder.
     pub dev_received_dir: Option<PathBuf>,
@@ -56,6 +63,9 @@ impl Config {
             dev_no_toasts: false,
             dev_no_open: false,
             dev_toast_quiet: false,
+            dev_media_aumid: None,
+            dev_media_real_volume: false,
+            dev_media_quiet: false,
             dev_received_dir: None,
             dev_free_bytes: None,
             dev_clock_offset_secs: None,
@@ -83,6 +93,9 @@ impl Config {
             || self.dev_no_toasts
             || self.dev_no_open
             || self.dev_toast_quiet
+            || self.dev_media_aumid.is_some()
+            || self.dev_media_real_volume
+            || self.dev_media_quiet
             || self.dev_received_dir.is_some()
             || self.dev_free_bytes.is_some()
             || self.dev_clock_offset_secs.is_some()
@@ -175,6 +188,10 @@ pub enum Command {
     /// Developer hook (2B.2): what a click, a reply or the X does to a phone notification that is on screen, without Windows: `reply <nid> <text>`, `copy <nid>`,
     /// `button <nid> <index>`, `dismiss <nid>`. Refused unless the app was started with a developer setting.
     DevToast { action: String, nid: String, arg: Option<String> },
+    /// Developer hook (2B.3): what a button of the Windows media flyout does, without Windows: `play`, `pause`, `toggle`, `next`, `prev`, `seek <ms>`, `volume
+    /// <level>`, `volume-delta <n>`, `mute`, `unmute`. It sends the `media.cmd` to the phone the phone's media is shown from. Refused unless the app was started with a
+    /// developer setting.
+    DevMedia { action: String, arg: Option<String> },
     /// Quit.
     Quit,
 }
@@ -200,6 +217,7 @@ impl Command {
             Command::DevSet { .. } => "dev set",
             Command::DevHistory { .. } => "dev history",
             Command::DevToast { .. } => "dev toast",
+            Command::DevMedia { .. } => "dev media",
             Command::Quit => "quit",
         }
     }
@@ -243,6 +261,9 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
     let mut no_toasts = truthy(env("KIN_DEV_NO_TOASTS"));
     let mut no_open = truthy(env("KIN_DEV_NO_OPEN"));
     let mut toast_quiet = truthy(env("KIN_DEV_TOAST_QUIET"));
+    let mut media_aumid = env("KIN_DEV_MEDIA_AUMID");
+    let mut media_real_volume = truthy(env("KIN_DEV_MEDIA_REAL_VOLUME"));
+    let mut media_quiet = truthy(env("KIN_DEV_MEDIA_QUIET"));
     let mut received_dir = env("KIN_DEV_RECEIVED_DIR").map(PathBuf::from);
     let mut free_bytes = env("KIN_DEV_FREE_BYTES");
     let mut clock_offset = env("KIN_DEV_CLOCK_OFFSET");
@@ -268,6 +289,14 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
             "--dev-no-toasts" => no_toasts = true,
             "--dev-no-open" => no_open = true,
             "--dev-toast-quiet" => toast_quiet = true,
+            "--dev-media-aumid" => media_aumid = Some(value(name)?),
+            "--dev-media-real-volume" => media_real_volume = true,
+            "--dev-media-quiet" => media_quiet = true,
+            "--dev-media" => {
+                let action = value(name)?;
+                let arg = it.next_if(|a| !a.starts_with("--")).cloned();
+                commands.push(Command::DevMedia { action, arg });
+            }
             // What COM adds to the command line when a click on a toast starts Kin (`mirror/registration.rs`): Kin starts as usual and the click reaches the
             // class it registers.
             "--toast-activated" | "-Embedding" => {}
@@ -370,6 +399,9 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Pa
     config.dev_no_toasts = no_toasts;
     config.dev_no_open = no_open;
     config.dev_toast_quiet = toast_quiet;
+    config.dev_media_aumid = media_aumid.filter(|a| !a.is_empty());
+    config.dev_media_real_volume = media_real_volume;
+    config.dev_media_quiet = media_quiet;
     config.dev_received_dir = received_dir;
     if let Some(v) = free_bytes {
         config.dev_free_bytes = Some(v.parse().map_err(|_| format!("--dev-free-bytes: {v:?} is not a number of bytes"))?);
@@ -627,6 +659,36 @@ mod tests {
         assert!(crate::instance::dev_settings_refusal(p.config.dev_hooks_enabled(), p.config.instance_key().as_deref()).is_some());
         let p = parse(&args(r"--data-dir C:\tmp\kin-test-x --dev-no-toasts"), &appdata).unwrap();
         assert!(crate::instance::dev_settings_refusal(p.config.dev_hooks_enabled(), p.config.instance_key().as_deref()).is_none());
+    }
+
+    #[test]
+    fn the_media_settings_are_developer_settings_and_a_dev_media_command_takes_an_optional_value() {
+        let p = parse(
+            &args("--data-dir x --dev-media-aumid app.kinrelay.dev.mediatest-9 --dev-media-quiet --dev-media seek 5000 --dev-media toggle"),
+            &no_env,
+        )
+        .unwrap();
+        assert_eq!(p.config.dev_media_aumid.as_deref(), Some("app.kinrelay.dev.mediatest-9"));
+        assert!(p.config.dev_media_quiet && !p.config.dev_media_real_volume && p.config.dev_hooks_enabled());
+        assert_eq!(
+            p.commands,
+            [
+                Command::DevMedia { action: "seek".into(), arg: Some("5000".into()) },
+                Command::DevMedia { action: "toggle".into(), arg: None }
+            ]
+        );
+        // Every one of them counts as a developer setting by itself, so none can be used against the installed Kin's data.
+        for flag in ["--dev-media-aumid a", "--dev-media-real-volume", "--dev-media-quiet"] {
+            let p = parse(&args(flag), &appdata).unwrap();
+            assert!(p.config.dev_hooks_enabled(), "{flag}");
+            assert!(
+                crate::instance::dev_settings_refusal(p.config.dev_hooks_enabled(), p.config.instance_key().as_deref()).is_some(),
+                "{flag}"
+            );
+            assert!(!p.config.autostart_is_real(), "{flag}");
+        }
+        assert!(!parse(&args("--data-dir x"), &no_env).unwrap().config.dev_media_real_volume, "off unless asked for");
+        assert_eq!(Command::DevMedia { action: "play".into(), arg: None }.name(), "dev media");
     }
 
     #[test]

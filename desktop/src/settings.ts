@@ -20,6 +20,21 @@ type Mirror = {
   unavailable: string | null;
   phones: { name: string; status: string }[];
 };
+type Media = {
+  /** This PC's media goes to the phone. */
+  share: boolean;
+  /** The phone's media shows on this PC. */
+  show: boolean;
+  /** "installed", or "test" (a copy beside the installed Kin, a debug build, a build folder: it never touches your real media or volume). */
+  mode: string;
+  reading: boolean;
+  flyout: boolean;
+  readerUnavailable: string | null;
+  flyoutUnavailable: string | null;
+  phoneMedia: string;
+  pcMedia: string;
+  phones: { name: string; status: string }[];
+};
 type View = {
   deviceName: string;
   customDeviceName: string | null;
@@ -28,6 +43,7 @@ type View = {
   imagesToClipboard: boolean;
   openLinksAutomatically: boolean;
   mirror: Mirror;
+  media: Media;
   receivedFolder: string;
   receivedFolderIsDefault: boolean;
   hotkey: { accelerator: string; registered: boolean; error: string | null };
@@ -104,6 +120,16 @@ export function startSettingsWindow(root: HTMLElement): void {
     return out;
   };
 
+  /** What belongs under the two media switches: where it can't run, and what each phone says. */
+  const mediaDetails = (m: Media): HTMLElement[] => {
+    const out: HTMLElement[] = [];
+    if (m.mode === "test") out.push(el("p", { className: "hint" }, "This copy of Kin is a test run: it reads and controls no media of yours and never changes the PC's volume, and it never shows Playing."));
+    if (m.share && m.readerUnavailable) out.push(el("p", { className: "hint bad" }, `The PC's media can't be read here: ${m.readerUnavailable}.`));
+    if (m.show && m.flyoutUnavailable) out.push(el("p", { className: "hint bad" }, `${m.flyoutUnavailable}. The tray menu and the panel of the window you open with a click on the tray icon still work.`));
+    for (const p of m.phones) out.push(el("p", { className: "hint" }, `${p.name}: ${p.status}`));
+    return out;
+  };
+
   const draw = (v: View) => {
     // device name
     const name = el("input", { type: "text", value: v.customDeviceName ?? "", placeholder: v.defaultDeviceName, maxLength: 64 });
@@ -177,6 +203,12 @@ export function startSettingsWindow(root: HTMLElement): void {
         "Phone notifications",
         toggle("Show phone notifications on this PC", "Notifications of the apps you chose in Kin on your phone appear here as Windows notifications, with the reply box and buttons the app offers. The text stays in Windows' Action Center until it expires or you clear it. Needs Kin 0.2.0 on your phone.", v.mirror.enabled, (on) => void invoke("set_mirror_notifications", { on }).then(() => refresh(), (e) => flash(note, String(e), true))),
         ...mirrorDetails(v.mirror),
+      ),
+      section(
+        "Media",
+        toggle("Show the phone's media on this PC", "What plays on your phone appears in the Windows media flyout (volume keys menu) with its buttons, and in the panel of the tray icon. The title is only shown there. Needs Kin 0.2.0 on your phone, with sharing turned on.", v.media.show, (on) => void invoke("set_media_option", { name: "show", on }).then(() => refresh(), (e) => flash(note, String(e), true))),
+        toggle("Share this PC's media with the phone", "What plays on this PC appears in your phone's media controls, and the phone's buttons can pause, skip and change the PC's volume. Nothing is stored.", v.media.share, (on) => void invoke("set_media_option", { name: "share", on }).then(() => refresh(), (e) => flash(note, String(e), true))),
+        ...mediaDetails(v.media),
       ),
       section(
         "Received files",

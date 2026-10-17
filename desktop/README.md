@@ -147,6 +147,21 @@ Off by default (`mirrorNotifications` in `settings.json`, or `--dev-set mirrorNo
 | The whole check against the real Windows | `tools\check-2b2-desktop.ps1` (a debug build and the examples; about 4 minutes, saves and restores the clipboard, refuses to run while a game is running) |
 | `status.json` | `mirror.view` (the settings, whether the toast layer and the activator run, each phone's line) and `mirror.counts` (shown, replaced, removed, swept, dropped by reason, icons, actions, refusals, codes copied): numbers only |
 
+### Media controls (2B.3)
+
+Both directions are off by default (`mediaShare` and `mediaShow` in `settings.json`, or `--dev-set mediaShare|mediaShow true`). **A test Kin (every instance but the installed one, every debug build) never touches your real media or volume**: it reads and controls only the session named by `--dev-media-aumid`, uses a fake volume, and never shows `Playing` in the Windows media flyout (`docs/windows.md`, "Media controls": the guard).
+
+| What | How |
+|---|---|
+| The one session a test Kin may read and control | `--dev-media-aumid app.kinrelay.dev.mediatest-<n>` (`KIN_DEV_MEDIA_AUMID`): only an id of that form is accepted, so it can't be pointed at a real app. Missing: no session is read at all |
+| The real master volume | `--dev-media-real-volume` (`KIN_DEV_MEDIA_REAL_VOLUME=1`): **never used by a test or an agent**, only by the person's own manual test. Without it the volume is a fake of 51 steps |
+| Never `Playing` | `--dev-media-quiet` (`KIN_DEV_MEDIA_QUIET=1`): a test run does it anyway; the flag says so out loud |
+| A press of the flyout, without Windows | `Kin.exe --data-dir <dir> --dev-media play\|pause\|toggle\|next\|prev\|seek <ms>\|volume <0-100>\|volume-delta <n>\|mute\|unmute`: a `media.cmd` to the phone whose media is shown |
+| A silent session of its own, and a reader of one named session | `cargo run --example media_test_session -- serve [--log <file>]` (a hidden window, `Paused`, a random title, commands on stdin), `... -- read <aumid>`, `... -- control <aumid> toggle\|next\|seek <ms>`, `... -- volume-read` (read only). `read` and `control` refuse any id not starting with `app.kinrelay.` |
+| The phone | `cargo run --example fake_phone -- <url> --host 127.0.0.1 --media --media-status true,true,granted --media-state '<json>' ...` (see the top of `examples/fake_phone.rs`) |
+| The whole check against the real Windows | `tools\check-2b3-desktop.ps1` (a debug build and the examples; about 1 minute; silent, refuses to run while a game is running, checks that the real volume is unchanged and the installed Kin untouched) |
+| `status.json` | `media.view` (the switches, `mode` installed or test, whether the reader and the flyout run, a line per phone, `none\|playing\|paused` for each direction) and `media.counts` (sent, received, commands, drops: numbers only). `--dev-dump-view media` also writes the panel the drop window shows, with every title, artist, app name and picture replaced by `<redacted>` (shape, states, positions and volume stay) |
+
 ### Settings (first launch)
 
 A flag wins over its environment variable.

@@ -294,6 +294,8 @@ pub fn open_debug_window(app: &AppHandle) {
 pub fn lists_changed(app: &AppHandle) {
     let _ = app.emit_to(HISTORY_WINDOW, "history-changed", ());
     let _ = app.emit_to(SETTINGS_WINDOW, "settings-changed", ());
+    // The media strip of the drop window follows the phone's session and the PC's own.
+    let _ = app.emit_to(DROP_WINDOW, "media-changed", ());
 }
 
 // ----- the history window
@@ -389,6 +391,56 @@ pub fn set_mirror_option(window: WebviewWindow, state: State<'_, AppState>, name
         other => return Err(format!("no such option: {other}")),
     }
     Ok(())
+}
+
+/// The two switches of "Media" (2B.3), each off by default: `share` (this PC's media to the phone) and `show` (the phone's media on this PC). Turning one on starts
+/// the reader or the flyout session, which touch Windows and start threads: not on the thread that runs the window.
+#[tauri::command]
+pub async fn set_media_option(window: WebviewWindow, state: State<'_, AppState>, name: String, on: bool) -> Result<(), String> {
+    only(&window, &[SETTINGS_WINDOW], "set_media_option")?;
+    let core = state.core.clone();
+    match name.as_str() {
+        "share" => tauri::async_runtime::spawn_blocking(move || core.set_media_share(on)).await.map_err(|e| e.to_string()),
+        "show" => tauri::async_runtime::spawn_blocking(move || core.set_media_show(on)).await.map_err(|e| e.to_string()),
+        other => Err(format!("no such option: {other}")),
+    }
+}
+
+/// The buttons of the drop window's media strip: `toggle`, `next` and `prev` of the phone's media (a `media.cmd` to the phone), `seek` (a position in ms) and
+/// `volume` of the **phone** (a level 0 to 100), and `pc-volume` and `pc-mute` for the PC's own master volume (the user's own slider; in a test run it moves a fake).
+#[tauri::command]
+pub async fn media_command(window: WebviewWindow, state: State<'_, AppState>, action: String, value: Option<i64>) -> Result<(), String> {
+    only(&window, &[DROP_WINDOW], "media_command")?;
+    use crate::media::wire::{CmdKind, VolumeOp};
+    let core = state.core.clone();
+    let level =
+        |v: Option<i64>| v.filter(|n| (0..=100).contains(n)).map(|n| n as u8).ok_or_else(|| "a level from 0 to 100 is needed".to_string());
+    match action.as_str() {
+        "toggle" | "next" | "prev" => {
+            core.media_press(&action);
+            Ok(())
+        }
+        "seek" => {
+            let ms = value.filter(|n| *n >= 0).ok_or_else(|| "a position is needed".to_string())?;
+            core.media_send_cmd(CmdKind::Seek(ms as u64));
+            Ok(())
+        }
+        "volume" => {
+            core.media_send_cmd(CmdKind::Volume(VolumeOp::Level(level(value)?)));
+            Ok(())
+        }
+        "pc-volume" => {
+            let level = level(value)?;
+            tauri::async_runtime::spawn_blocking(move || core.media_set_pc_volume(VolumeOp::Level(level)))
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        "pc-mute" => {
+            let on = value.unwrap_or(1) != 0;
+            tauri::async_runtime::spawn_blocking(move || core.media_set_pc_volume(VolumeOp::Mute(on))).await.map_err(|e| e.to_string())?
+        }
+        other => Err(format!("no such media command: {other}")),
+    }
 }
 
 /// "Choose folder…": the Windows folder picker, then the folder is checked and kept. `None` if the user closed the dialog.

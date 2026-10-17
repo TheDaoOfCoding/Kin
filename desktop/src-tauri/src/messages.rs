@@ -98,6 +98,12 @@ pub enum Action {
     /// A `notif.*` message dropped silently (no reply, no error): the receiver's own `hello` or the sender's didn't list `notif`, or it was an icon that
     /// failed its checks. Counted.
     NotifDropped(NotifDrop),
+    /// A `media.*` message (changelog 57) that passed validation. None is acked or remembered. The rules about who shows what (a viewer whose `show` is off, a source
+    /// whose `share` is off) are the app's (`Core::media_message`).
+    Media(crate::media::wire::Inbound),
+    /// A `media.*` message dropped silently (no reply, no error): the receiver's own `hello` or the sender's didn't list `media`, or it was an image that failed its
+    /// checks. Counted.
+    MediaDropped,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +135,8 @@ impl Action {
             Action::CloseOnly => "close_only",
             Action::Notif(m) => crate::mirror::wire::vector_name(m),
             Action::NotifDropped(_) => "notif_dropped",
+            Action::Media(m) => crate::media::wire::vector_name(&m.msg),
+            Action::MediaDropped => "media_dropped",
         })
     }
 }
@@ -227,8 +235,9 @@ impl Peer {
     }
 }
 
-/// What this PC says it can do in its own `hello`.
-pub const CAPABILITIES: &[&str] = &["link"];
+/// What this PC says it can do in its own `hello`: `link`, and `media` always (changelog 57: the switches of media travel in `media.status`, not in a new `hello`).
+/// `notif` is added by the core while "Show phone notifications" is on.
+pub const CAPABILITIES: &[&str] = &["link", "media"];
 
 /// The capabilities of a `hello`: an array of strings, anything else counts as none and entries that are not strings are skipped. A bad
 /// value never fails a `hello`.
@@ -259,6 +268,10 @@ fn receivable(role: Role, ty: &str) -> bool {
     // A `notif.*` message is received by the side it goes to: the phone sends five of them to the PC, the PC two to the phone.
     if let Some((phone_sends, _)) = crate::mirror::wire::kind(ty) {
         return phone_sends == (role == Role::Pc);
+    }
+    // A `media.*` message is received by both roles: each device is the source of one direction and the viewer of the other (changelog 57).
+    if crate::media::wire::is_media(ty) {
+        return true;
     }
     match ty {
         "hello" | "ack" | "error" | "text" | "link" | "cancel" | "unpair" | "ping" => true,
@@ -333,6 +346,9 @@ impl Receiver {
         if crate::mirror::wire::kind(ty).is_some() {
             return self.notif(ty, &obj, text.len(), reference, dedup);
         }
+        if crate::media::wire::is_media(ty) {
+            return self.media(ty, &obj, text.len(), reference);
+        }
         match ty {
             "hello" => self.hello(&obj, reference),
             "ack" => ack(&obj),
@@ -371,6 +387,29 @@ impl Receiver {
         let reply = ack_message(id);
         dedup.remember(id, &reply.to_string());
         Outcome { reply: Some(reply), action: Action::Notif(msg), close: None }
+    }
+
+    /// A `media.*` message (validation step 6c): dropped silently unless both sides list `media`, then the 32 KiB rule (48 KiB for an image), then the fields
+    /// (`media::wire`). None is acked, remembered or de-duplicated: a repeated `id` is processed again.
+    fn media(&mut self, ty: &str, obj: &Map<String, Value>, frame_bytes: usize, reference: Option<&str>) -> Outcome {
+        use crate::media::wire;
+        let capable =
+            self.own_capabilities.iter().any(|c| c == wire::CAPABILITY) && self.peer.as_ref().is_some_and(|p| p.has(wire::CAPABILITY));
+        if !capable {
+            return Outcome { reply: None, action: Action::MediaDropped, close: None };
+        }
+        if frame_bytes > wire::frame_limit(ty) {
+            let message = format!("A {ty} message can be at most {} KiB.", wire::frame_limit(ty) / 1024);
+            return Outcome::error("too_large", &message, reference, None);
+        }
+        match wire::parse(ty, obj) {
+            wire::Parsed::Bad => bad_fields(reference),
+            wire::Parsed::Drop => Outcome { reply: None, action: Action::MediaDropped, close: None },
+            wire::Parsed::Ok(msg) => {
+                let id = reference.unwrap_or_default().to_string();
+                Outcome { reply: None, action: Action::Media(wire::Inbound { id, msg }), close: None }
+            }
+        }
     }
 
     fn hello(&mut self, obj: &Map<String, Value>, reference: Option<&str>) -> Outcome {

@@ -45,6 +45,10 @@ pub enum ConnCommand {
         frame: serde_json::Value,
         reply: Option<oneshot::Sender<SendOutcome>>,
     },
+    /// Send a `media.*` message (changelog 57): only to a peer whose latest `hello` lists `media` (else it is dropped, silently). Never acked, never queued, never re-sent.
+    Media {
+        frame: serde_json::Value,
+    },
     /// Send a new `hello` (the name of this PC changed, or the setting "Show phone notifications" did).
     Hello,
     /// Tell the phone it was removed: an `unpair` message, then close after the `ack` (or 5 seconds).

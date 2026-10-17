@@ -111,6 +111,8 @@ pub struct Snapshot {
     pub transfers: Option<String>,
     /// How many sends wait in the queue for the phone.
     pub queued: usize,
+    /// While a phone's media is shown on this PC: `playing` or `paused` (never the title: the tray is visible to anyone near the PC).
+    pub media: Option<&'static str>,
 }
 
 impl Snapshot {
@@ -207,6 +209,8 @@ pub struct Core {
     pub(crate) queue: crate::queue::QueueState,
     /// Phone notifications on the PC (2B.2, mirror/). In memory only, and nothing of a notification is ever stored.
     pub(crate) mirror: crate::mirror::Mirror,
+    /// Media controls in both directions (2B.3, media/). In memory only, and nothing about what plays is ever stored or logged.
+    pub(crate) media: crate::media::Media,
     pub(crate) next_toast_id: AtomicU32,
     pub(crate) clipboard: Arc<dyn Clipboard>,
     pub(crate) opener: Arc<dyn UrlOpener>,
@@ -283,6 +287,7 @@ impl Core {
             hooks: hooks_of(&config_for_hooks),
             queue: crate::queue::QueueState::default(),
             mirror: crate::mirror::Mirror::new(&config_for_hooks.data_dir),
+            media: crate::media::Media::new(),
             next_toast_id: AtomicU32::new(0),
             clipboard: services.clipboard,
             opener: services.opener,
@@ -358,6 +363,7 @@ impl Core {
             auto_clipboard_sync: self.auto_clipboard_sync(),
             transfers: self.transfer_summary(),
             queued: self.queue_len(),
+            media: self.media_tray_state(),
         }
     }
 
@@ -396,6 +402,7 @@ impl Core {
             "clipboardSync": sync["clipboardSync"],
             "transfers": self.transfers_status(),
             "mirror": { "view": self.mirror_view(), "counts": self.mirror.counters_json() },
+            "media": { "view": self.media_view(), "counts": self.media.counters_json() },
             "updatedAtMs": unix_ms(),
         })
     }

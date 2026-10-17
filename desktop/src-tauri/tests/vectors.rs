@@ -294,6 +294,13 @@ fn check_outcome(name: &str, out: &messages::Outcome, expect: &Value, frame_id: 
             other => panic!("{name}: expected a notification, got {other:?}"),
         }
     }
+    // A `media.*` message says what the receiver ended up with (changelog 57): `expect.media`.
+    if let Some(want) = expect.get("media") {
+        match &out.action {
+            messages::Action::Media(m) => assert_eq!(&m.msg.to_json(), want, "{name}: what the receiver ends up with"),
+            other => panic!("{name}: expected a media message, got {other:?}"),
+        }
+    }
     // A text that is delivered says whether it is sensitive: `expect.sensitive`, false when the case doesn't say.
     if let messages::Action::DeliverText { sensitive, .. } = &out.action {
         assert_eq!(*sensitive, expect["sensitive"].as_bool().unwrap_or(false), "{name}: sensitive");
@@ -399,6 +406,17 @@ const MESSAGES_SEQUENCE_SCOPE_2B2: &[&str] = &[
     "notif-invalid-post-keeps-the-connection-open",
     "notif-status-then-icon-then-post",
 ];
+/// 2B.3 (media controls, changelog 57): the `media-*` cases. The policy ones (who may send what, what a source answers) are in `media.json`: `media_vectors.rs`.
+const MESSAGES_VALID_SCOPE_2B3: &[&str] = &["media-*"];
+const MESSAGES_INVALID_SCOPE_2B3: &[&str] = &["media-*"];
+const MESSAGES_SEQUENCE_SCOPE_2B3: &[&str] = &[
+    "media-is-not-in-the-dedup-memory",
+    "media-status-change-needs-no-new-hello",
+    "media-capability-changes-with-a-new-hello",
+    "media-cmd-is-not-resent-after-reconnect",
+    "media-image-before-state",
+    "media-invalid-state-keeps-the-connection-open",
+];
 const MESSAGES_SEQUENCE_SCOPE_1_2: &[&str] =
     &["handshake-then-text-then-duplicate", "invalid-message-keeps-connection-open", "rejected-message-id-is-not-remembered"];
 
@@ -434,12 +452,18 @@ fn names(cases: &Value) -> Vec<&str> {
 fn messages_valid_and_invalid() {
     let root = load("messages.json");
     let valid = with(
-        &with(&with(&with(MESSAGES_VALID_SCOPE, MESSAGES_VALID_SCOPE_1_2), MESSAGES_VALID_SCOPE_1_3), MESSAGES_VALID_SCOPE_2B1),
-        MESSAGES_VALID_SCOPE_2B2,
+        &with(
+            &with(&with(&with(MESSAGES_VALID_SCOPE, MESSAGES_VALID_SCOPE_1_2), MESSAGES_VALID_SCOPE_1_3), MESSAGES_VALID_SCOPE_2B1),
+            MESSAGES_VALID_SCOPE_2B2,
+        ),
+        MESSAGES_VALID_SCOPE_2B3,
     );
     let invalid = with(
-        &with(&with(&with(MESSAGES_INVALID_SCOPE, MESSAGES_INVALID_SCOPE_1_2), MESSAGES_INVALID_SCOPE_1_3), MESSAGES_INVALID_SCOPE_2B1),
-        MESSAGES_INVALID_SCOPE_2B2,
+        &with(
+            &with(&with(&with(MESSAGES_INVALID_SCOPE, MESSAGES_INVALID_SCOPE_1_2), MESSAGES_INVALID_SCOPE_1_3), MESSAGES_INVALID_SCOPE_2B1),
+            MESSAGES_INVALID_SCOPE_2B2,
+        ),
+        MESSAGES_INVALID_SCOPE_2B3,
     );
     for (key, scope) in [("valid", valid.as_slice()), ("invalid", invalid.as_slice())] {
         assert_patterns_match(key, scope, &names(&root[key]));
@@ -486,12 +510,15 @@ fn messages_sequences() {
     let scope = with(
         &with(
             &with(
-                &with(&with(MESSAGES_SEQUENCE_SCOPE, MESSAGES_SEQUENCE_SCOPE_1_2), MESSAGES_SEQUENCE_SCOPE_1_3),
-                MESSAGES_SEQUENCE_SCOPE_1_4,
+                &with(
+                    &with(&with(MESSAGES_SEQUENCE_SCOPE, MESSAGES_SEQUENCE_SCOPE_1_2), MESSAGES_SEQUENCE_SCOPE_1_3),
+                    MESSAGES_SEQUENCE_SCOPE_1_4,
+                ),
+                MESSAGES_SEQUENCE_SCOPE_2B1,
             ),
-            MESSAGES_SEQUENCE_SCOPE_2B1,
+            MESSAGES_SEQUENCE_SCOPE_2B2,
         ),
-        MESSAGES_SEQUENCE_SCOPE_2B2,
+        MESSAGES_SEQUENCE_SCOPE_2B3,
     );
     assert_patterns_match("sequences", &scope, &names(&root["sequences"]));
     let mut with_events = 0;
@@ -692,10 +719,11 @@ fn links_json_send_as_and_text_fallback() {
     }
 }
 
-/// This PC says in its own `hello` that it understands `link` (the phone sends a `link` only to a peer that says so).
+/// This PC says in its own `hello` that it understands `link` (the phone sends a `link` only to a peer that says so) and `media` (always: its switches travel in
+/// `media.status`, changelog 57).
 #[test]
-fn the_pcs_hello_lists_the_link_capability() {
-    assert_eq!(messages::CAPABILITIES, ["link"]);
+fn the_pcs_hello_lists_the_link_and_media_capabilities() {
+    assert_eq!(messages::CAPABILITIES, ["link", "media"]);
 }
 
 #[test]

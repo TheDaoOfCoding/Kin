@@ -134,6 +134,11 @@ pub struct Settings {
     pub mirror_dismiss_to_phone: bool,
     /// The fallback of decision 2 (off): text only on the toasts, no reply box and no buttons, for a Windows where the activator doesn't work.
     pub mirror_text_only: bool,
+    /// "Share this PC's media with the phone" (2B.3, **off by default**): what plays on the PC shows in the phone's media controls (and the phone's buttons and
+    /// volume keys can control it).
+    pub media_share: bool,
+    /// "Show the phone's media on this PC" (2B.3, **off by default**): what plays on the phone shows in the Windows media flyout and the tray panel.
+    pub media_show: bool,
 }
 
 impl Default for Settings {
@@ -150,6 +155,8 @@ impl Default for Settings {
             mirror_hide_content: false,
             mirror_dismiss_to_phone: true,
             mirror_text_only: false,
+            media_share: false,
+            media_show: false,
         }
     }
 }
@@ -195,6 +202,8 @@ impl Settings {
             ("mirrorHideContent", &mut settings.mirror_hide_content),
             ("mirrorDismissToPhone", &mut settings.mirror_dismiss_to_phone),
             ("mirrorTextOnly", &mut settings.mirror_text_only),
+            ("mediaShare", &mut settings.media_share),
+            ("mediaShow", &mut settings.media_show),
         ] {
             match obj.get(key) {
                 None | Some(Value::Null) => {}
@@ -223,6 +232,8 @@ impl Settings {
             "mirrorHideContent": self.mirror_hide_content,
             "mirrorDismissToPhone": self.mirror_dismiss_to_phone,
             "mirrorTextOnly": self.mirror_text_only,
+            "mediaShare": self.media_share,
+            "mediaShow": self.media_show,
         })
     }
 
@@ -262,6 +273,17 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_media_switches_are_off_by_default_and_a_wrong_type_keeps_the_default() {
+        let s = Settings::default();
+        assert!(!s.media_share && !s.media_show, "both directions are off until the user turns them on");
+        let (s, problems) = Settings::from_json(r#"{ "mediaShare": true, "mediaShow": "yes" }"#);
+        assert!(s.media_share && !s.media_show);
+        assert_eq!(problems.len(), 1);
+        let v = Settings::default().to_json();
+        assert_eq!((v["mediaShare"].as_bool(), v["mediaShow"].as_bool()), (Some(false), Some(false)));
+    }
 
     #[test]
     fn defaults_are_on_and_the_documented_hotkey() {
@@ -418,6 +440,8 @@ mod tests {
             mirror_hide_content: true,
             mirror_dismiss_to_phone: false,
             mirror_text_only: true,
+            media_share: true,
+            media_show: true,
         };
         s.save(dir.path()).unwrap();
         assert_eq!(Settings::load(dir.path()), s);

@@ -3,5 +3,5 @@
   "identifier": "settings-window",
   "description": "The settings window: it listens for the app's events and may call only its own commands, nothing else",
   "windows": ["settings"],
-  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten", "allow-settings-view", "allow-set-device-name", "allow-set-auto-clipboard-sync", "allow-set-images-to-clipboard", "allow-set-open-links-automatically", "allow-set-mirror-notifications", "allow-set-mirror-option", "allow-choose-received-folder", "allow-reset-received-folder", "allow-set-hotkey", "allow-set-start-with-windows", "allow-remove-device", "allow-open-window", "allow-close-window"]
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten", "allow-settings-view", "allow-set-device-name", "allow-set-auto-clipboard-sync", "allow-set-images-to-clipboard", "allow-set-open-links-automatically", "allow-set-mirror-notifications", "allow-set-mirror-option", "allow-set-media-option","allow-choose-received-folder", "allow-reset-received-folder", "allow-set-hotkey", "allow-set-start-with-windows", "allow-remove-device", "allow-open-window", "allow-close-window"]
 }

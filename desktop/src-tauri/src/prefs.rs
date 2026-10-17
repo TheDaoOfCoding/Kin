@@ -105,6 +105,7 @@ impl Core {
             "imagesToClipboard": s.images_to_clipboard,
             "openLinksAutomatically": s.open_links_automatically,
             "mirror": self.mirror_view(),
+            "media": self.media_view(),
             "receivedFolder": self.received_dir().to_string_lossy(),
             "receivedFolderIsDefault": s.received_folder.is_none() && self.config.dev_received_dir.is_none(),
             "hotkey": { "accelerator": hotkey.accelerator, "registered": hotkey.registered, "error": hotkey.error },

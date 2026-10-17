@@ -28,6 +28,16 @@ main.drop h1 { text-align: center; }
 .transfer.failed .hint, .transfer.canceled .hint { color: #b45309; opacity: 1; }
 button.small { padding: 2px 10px; font-size: 12px; }
 
+/* The media strip of the drop window (2B.3) */
+.media { margin: 0 0 14px; padding: 10px 12px; border-radius: 10px; background: rgba(128, 128, 128, 0.12); }
+.media[hidden] { display: none; }
+.mediacard { display: flex; gap: 10px; align-items: center; }
+.mediacard .art { width: 56px; height: 56px; border-radius: 6px; object-fit: cover; flex: none; }
+.mediacard .text { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.mediacard .text strong, .mediacard .text span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.media input[type="range"] { flex: 1; min-width: 0; }
+.media label.hint { display: flex; align-items: center; gap: 8px; text-align: left; }
+
 /* The history, settings and debug windows (1.4) */
 main.list { text-align: left; padding: 16px 20px; }
 main.list h1 { text-align: left; }

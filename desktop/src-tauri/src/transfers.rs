@@ -1477,6 +1477,7 @@ impl Core {
             "active": status["active"],
             "recent": status["recent"],
             "folder": status["receivedFolder"],
+            "media": self.media_panel(),
         })
     }
 

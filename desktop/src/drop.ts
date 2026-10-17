@@ -7,6 +7,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { button } from "./dom";
 
 type Transfer = {
   id: string;
@@ -23,7 +24,26 @@ type Transfer = {
   names: string[];
   cancelable?: boolean;
 };
-type View = { phone: string | null; connected: boolean; active: Transfer[]; recent: Transfer[]; folder: string };
+/** The media strip (2B.3): the phone's session (with its title: this window was opened by the user), the PC's own session being shared (read-only) and the PC's volume. */
+type PhoneMedia = {
+  from: string;
+  app: string;
+  title: string;
+  artist: string | null;
+  state: "playing" | "paused" | "buffering" | "stopped";
+  positionMs: number | null;
+  durationMs: number | null;
+  actions: string[];
+  art: string | null;
+  volume?: { level: number; muted: boolean };
+};
+type Media = {
+  phone: PhoneMedia | null;
+  pc: { title: string; artist: string | null; app: string; state: string } | null;
+  volume: { level: number; muted: boolean } | null;
+  testMode: boolean;
+};
+type View = { phone: string | null; connected: boolean; active: Transfer[]; recent: Transfer[]; folder: string; media: Media };
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, props: Partial<HTMLElementTagNameMap[K]> = {}, ...children: (Node | string)[]): HTMLElementTagNameMap[K] {
   const node = Object.assign(document.createElement(tag), props);
@@ -66,7 +86,79 @@ export function startDropWindow(root: HTMLElement): void {
   const status = el("p", { className: "hint" });
   const list = el("div", { className: "transfers" });
   const folder = el("p", { className: "hint small" });
-  root.append(el("h1", {}, "Send to phone"), zone, status, list, folder);
+  const media = el("div", { className: "media" });
+  root.append(el("h1", {}, "Send to phone"), media, zone, status, list, folder);
+
+  const command = (action: string, value?: number) => void invoke("media_command", { action, value: value ?? null });
+  const time = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
+  let dragging = false;
+  let mediaKey = "";
+  let progress: HTMLInputElement | null = null;
+  let clock: HTMLElement | null = null;
+  let stateLine: HTMLElement | null = null;
+
+  /** A button of the media strip, enabled only if the phone's player offers it. */
+  const control = (label: string, onClick: () => void, enabled: boolean): HTMLButtonElement => {
+    const b = button(label, onClick, "secondary small");
+    b.disabled = !enabled;
+    return b;
+  };
+
+  const slider = (value: number, max: number, onChange: (v: number) => void, label: string): HTMLInputElement => {
+    const r = el("input", { type: "range", min: "0", max: String(max), value: String(value), ariaLabel: label });
+    r.addEventListener("pointerdown", () => (dragging = true));
+    r.addEventListener("change", () => {
+      dragging = false;
+      onChange(Number(r.value));
+    });
+    r.addEventListener("input", () => onChange(Number(r.value)));
+    return r;
+  };
+
+  /** The phone's session, the PC's session and the PC's volume. Rebuilt when something but the position changed; the position and the state are updated in place. */
+  const drawMedia = (m: Media) => {
+    const p = m.phone;
+    const key = JSON.stringify([p && [p.from, p.app, p.title, p.artist, p.actions, p.art, p.durationMs, p.volume !== undefined], m.pc && [m.pc.title, m.pc.artist, m.pc.app], m.volume !== null]);
+    if (key === mediaKey) {
+      if (p && !dragging) {
+        if (progress && p.positionMs !== null) progress.value = String(p.positionMs);
+        if (clock && p.positionMs !== null && p.durationMs) clock.textContent = `${time(p.positionMs)} / ${time(p.durationMs)}`;
+      }
+      if (p && stateLine) stateLine.textContent = `${p.app} on ${p.from} · ${p.state}`;
+      return;
+    }
+    mediaKey = key;
+    progress = null;
+    clock = null;
+    stateLine = null;
+    const parts: Node[] = [];
+    if (p) {
+      const can = (a: string) => p.actions.includes(a);
+      const playPause = can("toggle") || can("play") || can("pause");
+      const art = p.art ? [el("img", { className: "art", src: p.art, alt: "" })] : [];
+      stateLine = el("span", { className: "hint small" }, `${p.app} on ${p.from} · ${p.state}`);
+      const controls = el(
+        "div",
+        { className: "row left" },
+        control("⏮", () => command("prev"), can("prev")),
+        control(p.state === "playing" ? "⏸" : "▶", () => command("toggle"), playPause),
+        control("⏭", () => command("next"), can("next")),
+      );
+      parts.push(
+        el("div", { className: "mediacard" }, ...art, el("div", { className: "text" }, el("strong", {}, p.title), el("span", {}, p.artist ?? ""), stateLine), controls),
+      );
+      if (can("seek") && p.durationMs && p.positionMs !== null) {
+        progress = slider(p.positionMs, p.durationMs, (v) => command("seek", v), "Position");
+        clock = el("span", { className: "hint small" }, `${time(p.positionMs)} / ${time(p.durationMs)}`);
+        parts.push(el("div", { className: "row left" }, progress, clock));
+      }
+      if (p.volume) parts.push(el("label", { className: "hint small" }, "Phone volume ", slider(p.volume.level, 100, (v) => command("volume", v), "Phone volume")));
+    }
+    if (m.pc) parts.push(el("p", { className: "hint small" }, `PC media → phone: ${m.pc.title}${m.pc.artist ? ` — ${m.pc.artist}` : ""} (${m.pc.state})`));
+    if (m.volume) parts.push(el("label", { className: "hint small" }, "PC volume ", slider(m.volume.level, 100, (v) => command("pc-volume", v), "PC volume")));
+    media.replaceChildren(...parts);
+    media.hidden = parts.length === 0;
+  };
 
   const choose = () => void invoke("pick_files");
   zone.addEventListener("click", choose);
@@ -96,6 +188,7 @@ export function startDropWindow(root: HTMLElement): void {
     status.textContent = view.phone ? (view.connected ? `${view.phone} is connected.` : `${view.phone} is not connected. Files can't be sent now.`) : "No phone is paired.";
     list.replaceChildren(...view.active.map(row), ...view.recent.filter((t) => !view.active.some((a) => a.id === t.id)).slice(0, 5).map(row));
     folder.textContent = `Received files go to ${view.folder}`;
+    drawMedia(view.media);
   };
 
   let busy = false;
@@ -118,6 +211,7 @@ export function startDropWindow(root: HTMLElement): void {
   });
 
   void listen("transfers-changed", () => void refresh());
+  void listen("media-changed", () => void refresh());
   // A transfer's numbers move all the time and a change of state is announced; this keeps the bars moving smoothly.
   window.setInterval(() => void refresh(), 700);
   void refresh();

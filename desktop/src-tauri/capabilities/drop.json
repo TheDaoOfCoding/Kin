@@ -3,5 +3,5 @@
   "identifier": "drop-window",
   "description": "The drop window: it listens for the app's events and may call only its own commands, nothing else",
   "windows": ["drop"],
-  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten", "allow-drop-view", "allow-send-files", "allow-pick-files", "allow-cancel-transfer", "allow-close-window"]
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten", "allow-drop-view", "allow-send-files", "allow-pick-files", "allow-cancel-transfer", "allow-media-command","allow-close-window"]
 }

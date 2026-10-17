@@ -316,6 +316,16 @@ impl Conn {
             }
             Action::NotifDropped(NotifDrop::Capability) => self.core.mirror_dropped_by_receiver(),
             Action::NotifDropped(NotifDrop::BadIcon) => self.core.mirror_icon_dropped(),
+            // What plays on the phone, and what the phone asks of the PC's media (changelog 57). The only thing that can come back is an `error`: `disabled`,
+            // `rate_limited`, `not_found`, `stale` or `action_failed` for a `media.cmd` (with its `ref`), or a `rate_limited` for too many states (no `ref`).
+            Action::Media(inbound) => {
+                if let Some(frame) = self.core.media_message(&self.device_id, inbound).await
+                    && let Err(e) = self.send(&frame).await
+                {
+                    return Some(End::Error(e));
+                }
+            }
+            Action::MediaDropped => self.core.media_dropped_by_receiver(),
             // `clipboard` and `offer` only go PC to phone: the receiver answers `unsupported_type` before it gets here.
             Action::None
             | Action::ShowErrorOnly
@@ -339,11 +349,15 @@ impl Conn {
         // The latest accepted `hello` decides what may be sent to the phone (and the PC's own list is what it said last).
         self.core.connections.set_capabilities(&self.device_id, self.conn_id, &peer.capabilities);
         if self.hello_accepted {
+            // Media (changelog 57): after each accepted `hello` the peer is told this side's `media.status` again.
+            self.core.media_peer_hello(&self.device_id, false);
             return;
         }
         self.hello_accepted = true;
         let _ = self.core.db.touch(&self.device_id, unix_ms() as i64, Some(&self.remote.to_string()));
         self.core.connections.mark_open(&self.device_id, self.conn_id);
+        // Media (changelog 57): a new connection starts with nothing known about the peer, and tells it this side's `media.status`.
+        self.core.media_peer_hello(&self.device_id, true);
         log::info!(
             "phone connected: {:?} ({}, app {}, capabilities {:?}) device {} from {}",
             peer.name,
@@ -388,6 +402,7 @@ impl Conn {
                 }
             }
             ConnCommand::Notif { frame, reply } => self.send_notif(frame, reply).await,
+            ConnCommand::Media { frame } => self.send_media(frame).await,
             ConnCommand::Unpair => {
                 let id = uuid_v7(unix_ms());
                 match self.send(&json!({ "type": "unpair", "id": id })).await {
@@ -425,6 +440,18 @@ impl Conn {
             self.actions.insert(id.to_string(), Pending { sent, reply });
         }
         None
+    }
+
+    /// A `media.*` message to the phone. Sent only if the phone's latest `hello` lists `media` (else dropped). Ephemeral: no ack, no queue, no re-send. The type is
+    /// all that is logged, and only as a count (nothing of what plays is ever written down).
+    async fn send_media(&mut self, frame: serde_json::Value) -> Option<End> {
+        if !(self.receiver.is_open() && self.receiver.peer().is_some_and(|p| p.has(crate::media::wire::CAPABILITY))) {
+            return None;
+        }
+        match self.send(&frame).await {
+            Ok(()) => None,
+            Err(e) => Some(End::Error(e)),
+        }
     }
 
     /// Sends a message that needs an `ack` and waits for it: `Timer::Ack` ends the connection after 5 s, and `on_message`
@@ -470,6 +497,10 @@ impl Conn {
             let _ = p.reply.send(SendOutcome::Lost);
         }
         let current = self.core.connections.remove(&self.device_id, self.conn_id);
+        // What the phone's media showed on this PC goes with the connection (a newer connection of the same phone keeps what it has).
+        if current {
+            self.core.media_connection_closed(&self.device_id);
+        }
         if self.hello_accepted {
             let _ = self.core.db.touch(&self.device_id, unix_ms() as i64, None);
             self.core.log_connection("disconnected", &format!("after {} s: {why}", self.opened.elapsed().as_secs()));

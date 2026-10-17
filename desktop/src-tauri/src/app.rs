@@ -103,6 +103,8 @@ pub fn run(parsed: Parsed) {
             ui::set_open_links_automatically,
             ui::set_mirror_notifications,
             ui::set_mirror_option,
+            ui::set_media_option,
+            ui::media_command,
             ui::choose_received_folder,
             ui::reset_received_folder,
             ui::set_hotkey,
@@ -133,6 +135,7 @@ pub fn run(parsed: Parsed) {
                 // every registry key it made with it; the installed Kin keeps its own (they are how a click on a toast finds Kin again).
                 state.core.mirror_clear_code_now();
                 state.core.mirror_stop(state.core.config.instance_key().is_some());
+                state.core.media_stop();
                 write_status(&state.core, true);
             }
             log::info!("Kin stopped");
@@ -241,6 +244,9 @@ fn setup(app: &mut tauri::App, parsed: Parsed, aumid: std::result::Result<(), St
     // Phone notifications (2B.2): the toast layer, the registry keys and the COM class, only while the switch is on.
     core.mirror.set_runtime(tauri::async_runtime::block_on(async { tokio::runtime::Handle::current() }));
     core.mirror_start();
+    // Media controls (2B.3): the reader of the PC's sessions and the flyout session, only for the switches that are on.
+    core.media.set_runtime(tauri::async_runtime::block_on(async { tokio::runtime::Handle::current() }));
+    core.media_start();
 
     let handle = app.handle().clone();
     tauri::async_runtime::spawn(event_loop(handle.clone(), core.clone(), events_rx));
@@ -653,6 +659,16 @@ pub fn on_menu(app: &AppHandle, id: &str) {
             }
         }
         tray::MENU_OPEN_FOLDER => open_received_folder(app),
+        tray::MENU_MEDIA_TOGGLE | tray::MENU_MEDIA_NEXT | tray::MENU_MEDIA_PREV => {
+            if let Some(state) = app.try_state::<AppState>() {
+                let name = match id {
+                    tray::MENU_MEDIA_TOGGLE => "toggle",
+                    tray::MENU_MEDIA_NEXT => "next",
+                    _ => "prev",
+                };
+                state.core.media_press(name);
+            }
+        }
         tray::MENU_PAIR => handle_commands(app, &[Command::Pair]),
         tray::MENU_HISTORY => handle_commands(app, &[Command::History]),
         tray::MENU_SETTINGS => handle_commands(app, &[Command::Settings]),
@@ -729,6 +745,7 @@ pub fn handle_commands(app: &AppHandle, commands: &[Command]) {
                 let (action, nid, arg) = (action.clone(), nid.clone(), arg.clone());
                 tauri::async_runtime::spawn(async move { core.mirror_dev_toast(&action, &nid, arg).await });
             }
+            Command::DevMedia { action, arg } => core.media_dev(action, arg.clone()),
             Command::DevSetClipboard { text, mark } => {
                 let (text, mark) = (text.clone(), *mark);
                 tauri::async_runtime::spawn(async move { core.dev_set_clipboard(text, mark).await });
@@ -836,8 +853,14 @@ async fn dev_dump_view(app: &AppHandle, core: &Arc<Core>, name: &str) {
             v
         }
         "debug" => ui::debug_json(core).await,
+        "media" => {
+            // Numbers and words only, like `status.json`: the panel has what plays, so its titles, artists, app names and pictures are redacted.
+            let mut panel = core.media_panel();
+            crate::media::viewer::redact_panel(&mut panel);
+            serde_json::json!({ "view": core.media_view(), "panel": panel, "counts": core.media.counters_json() })
+        }
         other => {
-            log::warn!("--dev-dump-view: no view called {other:?} (history, queue, settings, debug)");
+            log::warn!("--dev-dump-view: no view called {other:?} (history, queue, settings, debug, media)");
             return;
         }
     };
@@ -914,6 +937,15 @@ fn dev_set(app: &AppHandle, core: &Arc<Core>, key: &str, value: &str) {
         }
         "mirrorTextOnly" => {
             core.set_mirror_text_only(on);
+            write(true, on.to_string());
+        }
+        // Media controls (2B.3): each direction has its own switch, off by default.
+        "mediaShare" => {
+            core.set_media_share(on);
+            write(true, on.to_string());
+        }
+        "mediaShow" => {
+            core.set_media_show(on);
             write(true, on.to_string());
         }
         "receivedFolder" => match core.set_received_folder(Some(value)) {

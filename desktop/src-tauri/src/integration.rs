@@ -309,14 +309,22 @@ pub fn reconcile(data_dir: &Path, exe: &Path, send_to_dir: &Path, autostart: &dy
     Report { send_to, autostart: autostart_result }
 }
 
-/// `…\target\release` and `…\target\debug`: the build folder of a developer, where Kin must not set itself up.
+/// `…\target\release` and `…\target\debug`, and the same under a target triple (`…\target\x86_64-pc-windows-msvc\release`, `cargo build --target`): the build
+/// folder of a developer, where Kin must not set itself up.
 pub fn is_build_folder(exe: &Path) -> bool {
     let Some(dir) = exe.parent() else {
         return false;
     };
-    let name = dir.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-    let parent = dir.parent().and_then(Path::file_name).map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-    parent == "target" && (name == "release" || name == "debug")
+    let lower = |p: Option<&std::ffi::OsStr>| p.map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let profile = lower(dir.file_name());
+    if profile != "release" && profile != "debug" {
+        return false;
+    }
+    let parent = dir.parent();
+    let name = lower(parent.and_then(Path::file_name));
+    // A target triple is `<arch>-<vendor>-<os>[-<env>]`: at least two dashes, and the folder above it is `target`.
+    let triple_under_target = name.matches('-').count() >= 2 && lower(parent.and_then(Path::parent).and_then(Path::file_name)) == "target";
+    name == "target" || triple_under_target
 }
 
 #[cfg(test)]
@@ -489,6 +497,13 @@ mod tests {
     fn the_build_folder_of_a_developer_is_recognised() {
         assert!(is_build_folder(Path::new(r"C:\Dev\ecosystem-app\desktop\src-tauri\target\release\Kin.exe")));
         assert!(is_build_folder(Path::new(r"c:\dev\x\TARGET\DEBUG\kin.exe")));
+        assert!(is_build_folder(Path::new(r"C:\Dev\k\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\Kin.exe")));
+        assert!(is_build_folder(Path::new(r"C:\Dev\k\target\aarch64-pc-windows-msvc\debug\Kin.exe")));
+        assert!(
+            !is_build_folder(Path::new(r"C:\Program Files\x86_64-pc-windows\release\Kin.exe")),
+            "a triple-like folder not under target is not it"
+        );
+        assert!(!is_build_folder(Path::new(r"C:\Dev\target\release-x\Kin.exe")));
         assert!(!is_build_folder(Path::new(r"C:\Program Files\Kin\Kin.exe")));
         assert!(!is_build_folder(Path::new(r"C:\Users\Anna Berg\release\Kin.exe")), "a folder called release alone is not it");
         assert!(!is_build_folder(Path::new("Kin.exe")));

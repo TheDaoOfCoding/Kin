@@ -18,6 +18,11 @@ pub const MENU_OPEN_FOLDER: &str = "open_folder";
 pub const MENU_HISTORY: &str = "history";
 pub const MENU_SETTINGS: &str = "settings";
 pub const MENU_QUIT: &str = "quit";
+/// The three items that appear while a phone's media is shown (2B.3): the fallback of the Windows media flyout, and the way to reach it without the mouse over
+/// the flyout. They carry no title: the menu and the tooltip are visible to anyone near the PC.
+pub const MENU_MEDIA_TOGGLE: &str = "media_toggle";
+pub const MENU_MEDIA_NEXT: &str = "media_next";
+pub const MENU_MEDIA_PREV: &str = "media_prev";
 
 /// The tray icon is drawn at this size. The shell scales it to 16 to 32 px, and a small image keeps the memory use low.
 const ICON_SIZE: usize = 64;
@@ -26,6 +31,10 @@ pub struct Tray {
     status: MenuItem<Wry>,
     /// The icon without a state dot, at `ICON_SIZE`.
     base: (Vec<u8>, usize),
+    menu: Menu<Wry>,
+    /// Play/pause, next and previous of the phone's media, in the menu only while a phone's media is shown.
+    media_items: [MenuItem<Wry>; 3],
+    media_shown: std::sync::atomic::AtomicBool,
 }
 
 /// Shrinks an RGBA image to a square of `size` by averaging blocks of pixels.
@@ -109,6 +118,11 @@ pub fn tooltip_with(snapshot: &Snapshot, seen: Option<&str>) -> String {
             None => format!("Kin: {} offline", d.name),
         },
     };
+    // "Kin: Pixel 8 connected, media playing": the state, never what plays.
+    let base = match snapshot.media {
+        Some(word) => format!("{base}, media {word}"),
+        None => base,
+    };
     let text = match &snapshot.transfers {
         Some(progress) => format!("{base}, {progress}"),
         None => base,
@@ -151,6 +165,11 @@ pub fn build(app: &App, snapshot: &Snapshot) -> tauri::Result<Tray> {
     let history = MenuItem::with_id(app, MENU_HISTORY, "History", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, MENU_SETTINGS, "Settings", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, MENU_QUIT, "Quit", true, None::<&str>)?;
+    let media_items = [
+        MenuItem::with_id(app, MENU_MEDIA_TOGGLE, "\u{25b6} Play/Pause phone media", true, None::<&str>)?,
+        MenuItem::with_id(app, MENU_MEDIA_NEXT, "\u{23ed} Next", true, None::<&str>)?,
+        MenuItem::with_id(app, MENU_MEDIA_PREV, "\u{23ee} Previous", true, None::<&str>)?,
+    ];
     let menu = Menu::with_items(
         app,
         &[
@@ -187,7 +206,9 @@ pub fn build(app: &App, snapshot: &Snapshot) -> tauri::Result<Tray> {
             }
         })
         .build(app)?;
-    Ok(Tray { status, base })
+    let tray = Tray { status, base, menu, media_items, media_shown: std::sync::atomic::AtomicBool::new(false) };
+    tray.show_media_items(snapshot.media.is_some());
+    Ok(tray)
 }
 
 /// Whether Shift is held down right now (the tray click that opens the debug window).
@@ -206,6 +227,18 @@ impl Tray {
         let _ = tray.set_tooltip(Some(tooltip(snapshot)));
         let _ = tray.set_icon(Some(icon(&self.base, &snapshot.state)));
         let _ = self.status.set_text(status_line(snapshot));
+        self.show_media_items(snapshot.media.is_some());
+    }
+
+    /// The three media items go under the status line while a phone's media is shown, and out of the menu again when it isn't.
+    fn show_media_items(&self, show: bool) {
+        use std::sync::atomic::Ordering;
+        if self.media_shown.swap(show, Ordering::SeqCst) == show {
+            return;
+        }
+        for (i, item) in self.media_items.iter().enumerate() {
+            let _ = if show { self.menu.insert(item, 1 + i) } else { self.menu.remove(item) };
+        }
     }
 }
 
@@ -219,7 +252,20 @@ mod tests {
     }
 
     fn s(state: LinkState, devices: Vec<DeviceRow>) -> Snapshot {
-        Snapshot { state, devices, auto_clipboard_sync: true, transfers: None, queued: 0 }
+        Snapshot { state, devices, auto_clipboard_sync: true, transfers: None, queued: 0, media: None }
+    }
+
+    #[test]
+    fn the_tooltip_names_the_state_of_the_phones_media_and_never_what_plays() {
+        let playing = Snapshot { media: Some("playing"), ..s(LinkState::PhoneConnected, vec![device("Pixel 8", true)]) };
+        assert_eq!(tooltip_with(&playing, None), "Kin: Pixel 8 connected, media playing");
+        let paused = Snapshot {
+            media: Some("paused"),
+            transfers: Some("sending 5%".into()),
+            ..s(LinkState::PhoneConnected, vec![device("Pixel 8", true)])
+        };
+        assert_eq!(tooltip_with(&paused, None), "Kin: Pixel 8 connected, media paused, sending 5%");
+        assert_eq!(tooltip_with(&s(LinkState::PhoneConnected, vec![device("Pixel 8", true)]), None), "Kin: Pixel 8 connected");
     }
 
     #[test]

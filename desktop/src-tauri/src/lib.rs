@@ -25,6 +25,7 @@ pub mod json;
 pub mod links;
 pub mod localtime;
 pub mod mdns;
+pub mod media;
 pub mod messages;
 pub mod metrics;
 pub mod mirror;

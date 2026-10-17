@@ -766,6 +766,12 @@ impl Core {
         let PressedAction { nid, i, label, text } = action;
         let is_reply = text.is_some();
         let now = self.clock.now_ms();
+        // Only a paired phone ever gets an entry (a device ID that came from the arguments of a click is not trusted to make one).
+        if !self.db.is_paired(device_id).unwrap_or(false) {
+            log::warn!("an action on a phone notification was refused: the device is not a paired phone");
+            self.mirror.count(|c| c.activations_refused += 1);
+            return;
+        }
         // From the first action on: a phone that has sent no `notif.status` yet has no entry, and gets one.
         let allowed = {
             let mut state = self.mirror.state();
@@ -1070,6 +1076,14 @@ impl Core {
     #[doc(hidden)]
     pub fn mirror_icon_dir(&self) -> std::path::PathBuf {
         self.mirror.icons().dir().to_path_buf()
+    }
+
+    /// For tests: presses a button for this device ID the way a click does, and says how many phones the ledger knows afterwards.
+    #[doc(hidden)]
+    pub async fn mirror_press_for_tests(&self, device_id: &str, nid: &str) -> usize {
+        let action = PressedAction { nid: nid.to_string(), i: 0, label: "Open".to_string(), text: None };
+        self.mirror_send_action(device_id, "a phone", action).await;
+        self.mirror.state().phones.len()
     }
 
     /// For tests: forget the ledger (what a restart of Kin does), leaving the toasts that Windows holds.

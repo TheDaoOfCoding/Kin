@@ -23,6 +23,8 @@ const COMMANDS: &[&str] = &[
     "set_open_links_automatically",
     "set_mirror_notifications",
     "set_mirror_option",
+    "set_media_option",
+    "media_command",
     "choose_received_folder",
     "reset_received_folder",
     "set_hotkey",

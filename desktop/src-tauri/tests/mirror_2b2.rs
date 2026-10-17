@@ -54,7 +54,7 @@ impl Rig {
         let mut ws = w.try_open_ws().await.expect("the upgrade works for a paired phone");
         let hello = next_json(&mut ws).await;
         assert_eq!(hello["type"], "hello");
-        assert_eq!(hello["capabilities"], json!(["link", "notif"]), "the PC lists notif while the switch is on");
+        assert_eq!(hello["capabilities"], json!(["link", "media", "notif"]), "the PC lists notif while the switch is on");
         send_json(&mut ws, &hello_with(json!(["link", "notif"]))).await;
         w.wait_for_state(LinkState::PhoneConnected).await;
         let short = short_of(&w.phone.device_id).unwrap();
@@ -141,23 +141,23 @@ async fn the_pcs_hello_lists_notif_only_while_the_switch_is_on_and_a_new_hello_s
     capture_logs();
     let w = World::new().await;
     w.pair().await;
-    // Off (the default): `link` only.
+    // Off (the default): `link` and `media` (2B.3: every 0.2.0 build lists it), no `notif`.
     let mut ws = w.try_open_ws().await.unwrap();
-    assert_eq!(next_json(&mut ws).await["capabilities"], json!(["link"]));
+    assert_eq!(next_json(&mut ws).await["capabilities"], json!(["link", "media"]));
     send_json(&mut ws, &hello_with(json!(["link", "notif"]))).await;
     w.wait_for_state(LinkState::PhoneConnected).await;
-    assert!(w.core().capabilities() == ["link"]);
+    assert!(w.core().capabilities() == ["link", "media"]);
     // On: a new `hello` goes out on the open connection.
     let surface = Arc::new(FakeSurface::default());
     w.core().mirror_for_tests(surface);
     w.core().connections.send_hello_to_all();
     let second = next_json(&mut ws).await;
     assert_eq!(second["type"], "hello");
-    assert_eq!(second["capabilities"], json!(["link", "notif"]));
+    assert_eq!(second["capabilities"], json!(["link", "media", "notif"]));
     // Off again: the toasts go and the next `hello` drops `notif`.
     w.env.core.set_mirror_notifications(false);
     let third = next_json(&mut ws).await;
-    assert_eq!(third["capabilities"], json!(["link"]));
+    assert_eq!(third["capabilities"], json!(["link", "media"]));
 }
 
 // ----- post, update, remove ----------------------------------------------------------------------------------------------
@@ -306,7 +306,7 @@ async fn with_the_switch_off_everything_is_dropped_without_a_word() {
     let mut r = Rig::new().await;
     r.core().set_mirror_notifications(false);
     let hello = next_json(&mut r.ws).await;
-    assert_eq!(hello["capabilities"], json!(["link"]));
+    assert_eq!(hello["capabilities"], json!(["link", "media"]));
     r.post(NID, json!({ "title": "x" })).await;
     r.send(json!({ "type": "notif.status", "id": uuid(), "enabled": true, "access": "granted", "apps": 1 })).await;
     r.send(json!({ "type": "notif.post", "id": uuid(), "app": "no nid, and invalid on top" })).await;
@@ -323,7 +323,7 @@ async fn a_phone_that_did_not_list_notif_is_not_obeyed() {
     let surface = Arc::new(FakeSurface::default());
     w.core().mirror_for_tests(surface.clone());
     let mut ws = w.try_open_ws().await.unwrap();
-    assert_eq!(next_json(&mut ws).await["capabilities"], json!(["link", "notif"]));
+    assert_eq!(next_json(&mut ws).await["capabilities"], json!(["link", "media", "notif"]));
     send_json(&mut ws, &phone_hello()).await;
     w.wait_for_state(LinkState::PhoneConnected).await;
     send_json(&mut ws, &json!({ "type": "notif.post", "id": uuid(), "nid": NID, "app": "Chat", "title": "x" })).await;
@@ -762,12 +762,12 @@ async fn turning_the_switch_on_registers_a_dev_identity_and_turning_it_off_remov
     assert_eq!(identity.kind, Kind::Dev, "a test's data directory is never the installed Kin's");
     assert_ne!(identity.aumid, registration::RELEASE_AUMID);
     let result = std::panic::AssertUnwindSafe(async {
-        assert!(core.capabilities() == ["link"], "off by default");
+        assert!(core.capabilities() == ["link", "media"], "off by default");
         assert!(registration::leftovers(&identity).is_empty());
         core.set_mirror_notifications(true);
         assert!(core.mirror_view()["running"] == true, "{}", core.mirror_view());
         assert!(core.mirror_view()["activator"] == true, "the COM class is registered: {}", core.mirror_view());
-        assert!(core.capabilities() == ["link", "notif"]);
+        assert!(core.capabilities() == ["link", "media", "notif"]);
         let (command, activator) = registration::registered(&identity);
         assert!(command.unwrap().ends_with("--toast-activated"));
         assert_eq!(activator.as_deref(), Some(identity.clsid.as_str()));
@@ -775,7 +775,7 @@ async fn turning_the_switch_on_registers_a_dev_identity_and_turning_it_off_remov
         let arguments = ToastArgs::new("ABCD2345", NID, ToastAction::Tap, None).to_arguments();
         kin_lib::mirror::activator::call_class(identity.clsid_u128(), &identity.aumid, &arguments, &[]).expect("the COM class answers");
         core.set_mirror_notifications(false);
-        assert!(core.capabilities() == ["link"]);
+        assert!(core.capabilities() == ["link", "media"]);
         assert!(core.mirror_view()["running"] == false);
     });
     let outcome = futures_util::FutureExt::catch_unwind(result).await;
@@ -925,4 +925,19 @@ async fn a_hint_and_a_label_that_windows_reads_back_with_spaces_still_match_afte
     assert_eq!(action_frame(&frame).2, "Mu te");
     r.send(json!({ "type": "ack", "ref": frame["id"] })).await;
     task.await.unwrap();
+}
+
+/// 2B.3 carry-over from the 2B.2 review: a device ID that came from the arguments of a click never makes the ledger an entry unless it is a paired phone.
+#[tokio::test]
+async fn pressing_a_button_for_a_device_that_is_not_paired_makes_no_ledger_entry() {
+    let r = Rig::new().await;
+    let before = r.core().mirror_press_for_tests(&r.w.phone.device_id, NID).await;
+    let refused_before = r.core().mirror_counters().activations_refused;
+    let after = r.core().mirror_press_for_tests("a-device-id-that-nobody-paired-----------------", NID).await;
+    assert_eq!(before, after, "an unknown device gets no entry (and the press is refused)");
+    assert_eq!(
+        r.core().mirror_counters().activations_refused,
+        refused_before + 1,
+        "the press of the unknown device is refused exactly once"
+    );
 }
