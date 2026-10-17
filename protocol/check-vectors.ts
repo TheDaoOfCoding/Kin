@@ -547,7 +547,7 @@ type Role = "phone" | "pc";
 const MAX_FRAME = 1048576;
 const MAX_OFFER_FILES = 800; // more files in one offer: the receiver answers error too_large
 const TRANSFER_ID = /^[A-Za-z0-9_-]{1,64}$/;
-const INT_FIELDS = ["protocol", "size", "totalSize", "offset", "received", "sentAt", "importance", "apps", "i", "durationMs", "positionMs", "rateMilli", "seekMs", "level", "delta"];
+const INT_FIELDS = ["protocol", "size", "totalSize", "offset", "received", "sentAt", "importance", "apps", "i", "durationMs", "positionMs", "rateMilli", "seekMs", "level", "delta", "remainingMs"];
 const SIGNED_INT_FIELDS = new Set(["delta"]); // the one integer of the protocol that may be negative (media.cmd, changelog 57)
 const DIRECTION: Record<string, Role | "both"> = {
   hello: "both", ack: "both", error: "both", text: "both", link: "both", clipboard: "pc", offer: "pc",
@@ -556,9 +556,12 @@ const DIRECTION: Record<string, Role | "both"> = {
   "notif.status": "phone", "notif.icon": "phone", "notif.post": "phone", "notif.remove": "phone", "notif.sync": "phone", "notif.dismiss": "pc", "notif.action": "pc",
   // changelog 57: both sides send and receive every media.* type (each is the source of one direction and the viewer of the other); none is acked
   "media.status": "both", "media.state": "both", "media.image": "both", "media.clear": "both", "media.volume": "both", "media.cmd": "both",
+  // changelog 58: presence goes both ways; ring.start and ring.stop are sent by the PC, ring.status by the phone
+  presence: "both", "ring.start": "pc", "ring.stop": "pc", "ring.status": "phone",
 };
-// notif.action is the one notif message that is acked; the other six are ephemeral (no ack, no de-duplication, never stored)
-const ACKED = new Set(["text", "link", "clipboard", "offer", "complete", "cancel", "unpair", "ping", "notif.action"]);
+// notif.action is the one notif message that is acked; the other six are ephemeral (no ack, no de-duplication, never stored).
+// ring.start and ring.stop (changelog 58) are acked like notif.action; presence and ring.status are ephemeral.
+const ACKED = new Set(["text", "link", "clipboard", "offer", "complete", "cancel", "unpair", "ping", "notif.action", "ring.start", "ring.stop"]);
 const MAX_NOTIF_FRAME = 32768;
 const MAX_NOTIF_ICON_FRAME = 49152; // a 32,768-byte PNG is 43,691 base64url characters, so notif.icon has a larger frame limit
 const ACTION: Record<string, string> = {
@@ -566,10 +569,13 @@ const ACTION: Record<string, string> = {
   offer: "start_download", complete: "mark_transfer_done", cancel: "cancel_transfer", unpair: "remove_peer_and_close", ping: "show_ping_toast",
   "notif.status": "notif_status", "notif.icon": "notif_icon", "notif.post": "notif_post", "notif.remove": "notif_remove", "notif.sync": "notif_sync", "notif.dismiss": "notif_dismiss", "notif.action": "notif_action",
   "media.status": "media_status", "media.state": "media_state", "media.image": "media_image", "media.clear": "media_clear", "media.volume": "media_volume", "media.cmd": "media_cmd",
+  presence: "presence", "ring.start": "ring_start", "ring.stop": "ring_stop", "ring.status": "ring_status",
 };
+const MAX_PRESENCE_FRAME = 4096; // a presence or ring.status frame over this is error too_large (ring.status: the 2 KiB of every ring.* frame)
+const MAX_RING_FRAME = 2048;
 const MAX_MEDIA_FRAME = 32768; // a received media.state or any other media.* frame over this is error too_large
 const MAX_MEDIA_IMAGE_FRAME = 49152; // a 24,576-byte image is 32,768 base64url characters
-type Outcome = { reply: "ack" | "error" | "none"; action?: string; code?: string; ref?: string | null; close: number | null; sensitive?: boolean; link?: any; notif?: any; media?: any };
+type Outcome = { reply: "ack" | "error" | "none"; action?: string; code?: string; ref?: string | null; close: number | null; sensitive?: boolean; link?: any; notif?: any; media?: any; presence?: any };
 const isObj = (x: any) => x !== null && typeof x === "object" && !Array.isArray(x);
 const isStr = (x: any) => typeof x === "string";
 const isNonEmptyStr = (x: any) => typeof x === "string" && x.length > 0;
@@ -651,8 +657,66 @@ function validateFields(type: string, o: any, badInts: Set<string>): boolean {
     case "cancel": return id() && isStr(o.transferId) && TRANSFER_ID.test(o.transferId) && isStr(o.reason);
     case "unpair": return id();
     case "ping": return id() && int("sentAt");
+    case "ring.start": case "ring.stop": return id();
   }
   return false;
+}
+
+// ------------------------------------------------------------------ presence, pause and ring (changelog 58)
+const PRESENCE_LIMITS = {
+  frame: 4096, ringFrame: 2048, maxPauseMs: 691200000,
+  batteryMinStep: 2, batteryCrossings: [15, 20, 100], batteryEveryMs: 30000, pauseTrailingMs: 1000,
+  receiverCapacity: 10, receiverRefillMs: 3000, receiverErrorSpacingMs: 10000,
+  ringTimeoutMs: 30000, ringStartsPerWindow: 3, ringWindowMs: 60000, ringCapMs: 120000, ringLockoutMs: 60000, pcRingEveryMs: 10000,
+  tomorrowHour: 8, tomorrowMinAheadMs: 7200000,
+  nudgeAt: 15, nudgeRearmAt: 20,
+  shotStaleSec: 15, shotRateCapacity: 5, shotRateRefillMs: 20000, shotHoldMs: 5000,
+};
+// "bad" or the normalized content of one presence or ring.status frame that passed steps 1 to 6d
+function presenceOf(type: string, o: any, badInts: Set<string>): any {
+  const present = (v: any) => v !== undefined && v !== null;
+  const bool = (v: any): boolean => {
+    if (typeof v !== "boolean") throw BAD;
+    return v;
+  };
+  try {
+    if (!validMsgId(o.id)) throw BAD;
+    if (type === "presence") {
+      const out: any = {};
+      if (present(o.battery)) {
+        const b = o.battery;
+        if (!isObj(b)) throw BAD;
+        if (badInts.has("level") || typeof b.level !== "number" || !Number.isSafeInteger(b.level) || b.level < 0 || b.level > 100) throw BAD;
+        const battery: any = { level: b.level, charging: bool(b.charging) };
+        if (present(b.saver)) battery.saver = bool(b.saver);
+        out.battery = battery;
+      }
+      if (present(o.pause)) {
+        const p = o.pause;
+        if (!isObj(p)) throw BAD;
+        const hasMs = present(p.remainingMs);
+        const hasUntil = present(p.untilResumed);
+        if (hasMs === hasUntil) throw BAD; // both, or neither
+        if (hasMs) {
+          if (badInts.has("remainingMs") || typeof p.remainingMs !== "number" || !Number.isSafeInteger(p.remainingMs) || p.remainingMs < 1) throw BAD;
+          out.pause = { remainingMs: Math.min(p.remainingMs, PRESENCE_LIMITS.maxPauseMs) };
+        } else {
+          if (p.untilResumed !== true) throw BAD;
+          out.pause = { untilResumed: true };
+        }
+      }
+      return out;
+    }
+    // ring.status
+    if (o.state !== "ringing" && o.state !== "stopped") throw BAD;
+    if (present(o.reason) && typeof o.reason !== "string") throw BAD;
+    const audible = present(o.audible) ? bool(o.audible) : true;
+    if (o.state === "stopped") return typeof o.reason === "string" ? { state: "stopped", reason: o.reason } : { state: "stopped" };
+    return { state: "ringing", audible };
+  } catch (e) {
+    if (e === BAD) return "bad";
+    throw e;
+  }
 }
 
 // ------------------------------------------------------------------ notifications (changelog 56)
@@ -1280,8 +1344,11 @@ class Receiver {
   // silently unless both list "notif")
   ownCaps = new Set<string>();
   peerCaps = new Set<string>();
-  constructor(public role: Role, state: "before_hello" | "open", caps?: { own?: string[]; peer?: string[] }) {
+  // changelog 58: the phone's ring budget is spent (3 starts in the last 60 s, or inside the lock-out): a ring.start is error rate_limited
+  ringBudgetSpent = false;
+  constructor(public role: Role, state: "before_hello" | "open", caps?: { own?: string[]; peer?: string[]; ringBudgetSpent?: boolean }) {
     this.state = state;
+    this.ringBudgetSpent = caps?.ringBudgetSpent ?? false;
     this.ownCaps = new Set(caps?.own ?? []);
     this.peerCaps = new Set(caps?.peer ?? []);
   }
@@ -1334,8 +1401,32 @@ class Receiver {
       return bad(ref, "unsupported_version", 4002);
     const isNotif = type.startsWith("notif.");
     const isMedia = type.startsWith("media.");
+    const isPresence = type === "presence" || type === "ring.status";
+    const isRingCmd = type === "ring.start" || type === "ring.stop";
+    // step 6d (changelog 58): presence and ring.status are dropped silently unless this side's own latest hello and the sender's list "presence"; then the 4 KiB
+    // frame rule (2 KiB for ring.status); then the fields. Neither is acked, de-duplicated or stored.
+    if (isPresence) {
+      if (!(this.ownCaps.has("presence") && this.peerCaps.has("presence"))) return { reply: "none", action: "presence_dropped", close: null };
+      if (fb.bytes.length > (type === "presence" ? MAX_PRESENCE_FRAME : MAX_RING_FRAME)) return bad(ref, "too_large");
+      const r = presenceOf(type, o, badInts);
+      if (r === "bad") return bad(ref);
+      return { reply: "none", action: ACTION[type], close: null, presence: r };
+    }
+    // ring.start and ring.stop are acked, so never dropped: the 2 KiB frame rule, the fields, the duplicate check, then the phone's own answers
+    if (isRingCmd && fb.bytes.length > MAX_RING_FRAME) return bad(ref, "too_large");
     // step 7
     if (!isNotif && !isMedia && !validateFields(type, o, badInts)) return bad(ref);
+    if (isRingCmd) {
+      const seenKey = `${this.device}|${o.id}`;
+      if (this.seen.has(seenKey)) return { reply: "ack", ref: o.id, action: "ignore_duplicate", close: null };
+      // an error answer to a ring.start is not remembered; a ring.stop is always acked, also with the switch off
+      if (type === "ring.start") {
+        if (!this.ownCaps.has("ring")) return bad(ref, "disabled");
+        if (this.ringBudgetSpent) return bad(ref, "rate_limited");
+      }
+      this.seen.add(seenKey);
+      return { reply: "ack", ref: o.id, action: ACTION[type], close: null };
+    }
     // step 6c (changelog 57): a media.* message is dropped silently unless this side's own latest hello and the sender's latest hello list "media"; then the 32 KiB
     // frame rule (48 KiB for a media.image); then the fields. None is acked, de-duplicated or stored.
     if (isMedia) {
@@ -1430,6 +1521,8 @@ function sameOutcome(actual: Outcome, expect: any): boolean {
   if (expect.notif !== undefined && !eq(actual.notif, expect.notif)) return false;
   // a media.* case says what the receiver got after cleaning (expect.media)
   if (expect.media !== undefined && !eq(actual.media, expect.media)) return false;
+  // a presence or ring.status case says what the receiver got after validation (expect.presence)
+  if (expect.presence !== undefined && !eq(actual.presence, expect.presence)) return false;
   return true;
 }
 
@@ -1706,7 +1799,7 @@ function checkResponse(group: string, name: string, expected: any, actual: Reply
     check(g, `${c.name}: to is the other role`, c.to === (c.from === "pc" ? "phone" : "pc"));
   }
   for (const c of d.valid) {
-    const out = new Receiver(c.to, c.state, { own: c.own, peer: c.peer }).receive(c.from, c);
+    const out = new Receiver(c.to, c.state, { own: c.own, peer: c.peer, ringBudgetSpent: c.ringBudgetSpent }).receive(c.from, c);
     check(g, `valid ${c.name}`, sameOutcome(out, c.expect), () => `expected ${j(c.expect)}\n       got      ${j(out)}`);
     check(g, `valid ${c.name}: is not an error reply`, out.reply !== "error");
     if (c.frame && out.reply === "ack") check(g, `valid ${c.name}: the ack carries the frame id`, out.ref === c.frame.id, () => `${out.ref} vs ${c.frame.id}`);
@@ -1727,7 +1820,7 @@ function checkResponse(group: string, name: string, expected: any, actual: Reply
     }
   }
   for (const c of d.invalid) {
-    const out = new Receiver(c.to, c.state, { own: c.own, peer: c.peer }).receive(c.from, c);
+    const out = new Receiver(c.to, c.state, { own: c.own, peer: c.peer, ringBudgetSpent: c.ringBudgetSpent }).receive(c.from, c);
     check(g, `invalid ${c.name}`, sameOutcome(out, c.expect), () => `expected ${j(c.expect)}\n       got      ${j(out)}`);
   }
   for (const s of d.sequences) {
@@ -2692,6 +2785,381 @@ function pickActionsModel(actions: any[], clean: (s: string | null | undefined, 
   for (const n of ["media-cmd-to-non-sharing-source-is-disabled", "media-cmd-stale-sid-is-stale"]) check(g, `cmdResult ${n}`, d.cmdResult.some((c: any) => c.name === n));
   for (const k of ["sid", "clean", "image", "position", "sourcePosition", "pick", "clearDebounce", "throttle", "rate", "androidMap", "toAndroid", "windowsMap", "toSmtc", "volumeLevel", "volumeSet", "sendRule", "viewerRule", "cmdResult"]) check(g, `media.json ${k}[] exists`, Array.isArray(d[k]) && d[k].length > 0);
   console.log(`milestone 2B.3 scope: ${inScope} media cases in messages.json, plus media.json`);
+}
+
+// ---- presence.json (changelog 58)
+// time zones: the offset of an IANA zone at an instant, from Intl (no table of our own), to the second
+function zoneOffsetMs(zone: string, instantMs: number): number {
+  const whole = Math.floor(instantMs / 1000) * 1000;
+  const f = new Intl.DateTimeFormat("en-US", { timeZone: zone, hourCycle: "h23", year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric" });
+  const p: Record<string, number> = {};
+  for (const part of f.formatToParts(new Date(whole))) if (part.type !== "literal") p[part.type] = Number(part.value);
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour % 24, p.minute, p.second) - whole;
+}
+// a wall-clock time of a zone as an instant (08:00 always exists and is never ambiguous in the zones of the vectors)
+function localToInstant(zone: string, y: number, m: number, d: number, hh: number, mm: number): number {
+  const guess = Date.UTC(y, m - 1, d, hh, mm);
+  let t = guess - zoneOffsetMs(zone, guess);
+  t = guess - zoneOffsetMs(zone, t);
+  return t;
+}
+function localParts(zone: string, instantMs: number) {
+  const o = new Date(instantMs + zoneOffsetMs(zone, instantMs));
+  return { y: o.getUTCFullYear(), m: o.getUTCMonth() + 1, d: o.getUTCDate() };
+}
+const pad2 = (n: number) => String(n).padStart(2, "0");
+function isoLocal(zone: string, instantMs: number): string {
+  const off = zoneOffsetMs(zone, instantMs);
+  const o = new Date(instantMs + off);
+  const sign = off < 0 ? "-" : "+";
+  const a = Math.abs(off) / 60000;
+  return `${o.getUTCFullYear()}-${pad2(o.getUTCMonth() + 1)}-${pad2(o.getUTCDate())}T${pad2(o.getUTCHours())}:${pad2(o.getUTCMinutes())}:${pad2(o.getUTCSeconds())}${sign}${pad2(Math.floor(a / 60))}:${pad2(a % 60)}`;
+}
+// "1h" = one hour of elapsed time; "tomorrow" = the next 08:00 of the zone's wall clock that is at least 2 hours away
+function pauseUntilModel(c: { zone: string; now: string; choice: string }): string {
+  const now = Date.parse(c.now);
+  if (c.choice === "1h") return isoLocal(c.zone, now + 3600000);
+  const lp = localParts(c.zone, now);
+  let cand = localToInstant(c.zone, lp.y, lp.m, lp.d, PRESENCE_LIMITS.tomorrowHour, 0);
+  if (cand - now < PRESENCE_LIMITS.tomorrowMinAheadMs) {
+    const next = new Date(Date.UTC(lp.y, lp.m - 1, lp.d + 1));
+    cand = localToInstant(c.zone, next.getUTCFullYear(), next.getUTCMonth() + 1, next.getUTCDate(), PRESENCE_LIMITS.tomorrowHour, 0);
+  }
+  return isoLocal(c.zone, cand);
+}
+// the gate of the pause table (protocol.md): send / drop on the sending side, flows / drop / quiet on the receiving side
+const GATE_AUTO = new Set(["clipboard", "notif.post", "media.state", "media.image", "media.volume", "screenshot"]);
+const GATE_MANUAL = new Set(["text", "link", "offer", "file"]);
+function pauseGateModel(c: { at: string; kind: string; selfPaused: boolean; peerPaused: boolean }): string {
+  if (c.at === "send") {
+    if (GATE_AUTO.has(c.kind)) return c.selfPaused || c.peerPaused ? "drop" : "send";
+    return GATE_MANUAL.has(c.kind) ? "send" : "flows";
+  }
+  // receiving: only the receiver's own pause counts. An auto-sent screenshot is an upload: it is saved, quietly.
+  if (c.kind === "screenshot") return c.selfPaused ? "quiet" : "flows";
+  if (GATE_AUTO.has(c.kind)) return c.selfPaused ? "drop" : "flows";
+  if (GATE_MANUAL.has(c.kind)) return c.selfPaused ? "quiet" : "flows";
+  return "flows";
+}
+function pauseExpiryModel(c: any): boolean {
+  if (c.side === "peer") {
+    if (c.laterPresenceWithoutPauseAt !== undefined && c.laterPresenceWithoutPauseAt <= c.nowAt) return false;
+    if (c.untilResumed === true) return true;
+    return c.nowAt < c.arrivalAt + Math.min(c.remainingMs, PRESENCE_LIMITS.maxPauseMs);
+  }
+  if (c.untilResumed === true) return true;
+  if (c.pausedUntil === undefined) return false;
+  return c.now < c.pausedUntil && c.pausedUntil - c.now <= PRESENCE_LIMITS.maxPauseMs;
+}
+function lowBatteryModel(steps: any[]): number[] {
+  let armed = true;
+  const out: number[] = [];
+  for (const s of steps) {
+    if (s.none) continue;
+    if (s.charging || s.level >= PRESENCE_LIMITS.nudgeRearmAt) armed = true;
+    else if (s.level <= PRESENCE_LIMITS.nudgeAt && armed && !s.paused) {
+      out.push(s.t);
+      armed = false;
+    }
+  }
+  return out;
+}
+function batteryMapModel(c: any): { level: number; charging: boolean } | null {
+  if (c.platform === "android") {
+    if (c.scale <= 0 || c.level < 0) return null;
+    const pct = Math.floor((c.level * 200 + c.scale) / (2 * c.scale)); // to the nearest, halves up
+    return { level: Math.min(100, pct), charging: c.plugged !== 0 };
+  }
+  if (c.BatteryFlag === 255 || (c.BatteryFlag & 128) !== 0 || c.BatteryLifePercent === 255) return null;
+  return { level: Math.min(100, c.BatteryLifePercent), charging: c.ACLineStatus === 1 };
+}
+// the sender of presence (3.4): a snapshot after the hello, a change at once or trailing, the battery at most every 30 s, a pause within 1 s, a one-shot at the expiry
+function presenceSenderModel(events: any[]): any[] {
+  const L = PRESENCE_LIMITS;
+  const out: any[] = [];
+  let battery: any | undefined;
+  let pause: { until?: number; untilResumed?: boolean } | null = null;
+  let connected = false;
+  let last: { battery: any | undefined; pauseKey: string } | null = null;
+  let lastT = -Infinity;
+  let dueBattery: number | null = null;
+  let duePause: number | null = null;
+  let dueExpire: number | null = null;
+  const pauseKey = (p: typeof pause, t: number) => (!p ? "none" : p.untilResumed ? "ur" : p.until! - t >= 1 ? `until:${p.until}` : "none");
+  const pauseWire = (p: typeof pause, t: number) => (!p ? undefined : p.untilResumed ? { untilResumed: true } : p.until! - t >= 1 ? { remainingMs: Math.min(p.until! - t, L.maxPauseMs) } : undefined);
+  const crosses = (a: number, b: number) => L.batteryCrossings.some((x) => a >= x !== b >= x);
+  const significant = (a: any, b: any) => {
+    if (!a && !b) return false;
+    if (!a || !b) return true;
+    return Math.abs(a.level - b.level) >= L.batteryMinStep || crosses(a.level, b.level) || a.charging !== b.charging || (a.saver ?? false) !== (b.saver ?? false);
+  };
+  const send = (t: number) => {
+    const entry: any = { t };
+    if (battery) entry.battery = battery;
+    const pw = pauseWire(pause, t);
+    if (pw) entry.pause = pw;
+    out.push(entry);
+    last = { battery, pauseKey: pauseKey(pause, t) };
+    lastT = t;
+    dueBattery = null;
+    duePause = null;
+  };
+  const advance = (T: number) => {
+    for (;;) {
+      const dues = ([["expire", dueExpire], ["pause", duePause], ["battery", dueBattery]] as [string, number | null][]).filter((x): x is [string, number] => x[1] !== null && x[1] <= T).sort((a, b) => a[1] - b[1]);
+      if (dues.length === 0) return;
+      const [k, d] = dues[0];
+      if (k === "expire") {
+        dueExpire = null;
+        if (connected && pauseKey(pause, d) !== last!.pauseKey) send(d);
+      } else if (k === "pause") {
+        duePause = null;
+        if (connected && pauseKey(pause, d) !== last!.pauseKey) send(d);
+      } else {
+        dueBattery = null;
+        if (connected && significant(last!.battery, battery)) send(d);
+      }
+    }
+  };
+  for (const ev of events) {
+    advance(ev.t);
+    if (ev.op === "connected") {
+      connected = true;
+      send(ev.t);
+    } else if (ev.op === "battery") {
+      battery = ev.none ? undefined : { level: ev.level, charging: ev.charging, ...(ev.saver !== undefined ? { saver: ev.saver } : {}) };
+      if (connected && significant(last!.battery, battery)) {
+        if (ev.t - lastT >= L.batteryEveryMs) send(ev.t);
+        else if (dueBattery === null) dueBattery = lastT + L.batteryEveryMs;
+      }
+    } else if (ev.op === "pause") {
+      pause = ev.until !== undefined && ev.until !== null ? { until: ev.until } : ev.untilResumed ? { untilResumed: true } : null;
+      dueExpire = pause?.until ?? null;
+      if (connected && duePause === null) duePause = ev.t + L.pauseTrailingMs;
+    }
+  }
+  return out;
+}
+// the receiver's bucket for presence: 10, one token back per 3 s; one error answer per 10 s. Counted in 1/3000 of a token so there is no rounding.
+function presenceReceiverModel(events: { t: number }[]): { outcomes: string[]; errorsAt: number[] } {
+  const L = PRESENCE_LIMITS;
+  const cap = L.receiverCapacity * L.receiverRefillMs;
+  let tokens = cap;
+  let last = 0;
+  let lastError: number | null = null;
+  const outcomes: string[] = [];
+  const errorsAt: number[] = [];
+  for (const e of events) {
+    tokens = Math.min(cap, tokens + (e.t - last));
+    last = e.t;
+    const ok = tokens >= L.receiverRefillMs;
+    if (ok) tokens -= L.receiverRefillMs;
+    outcomes.push(ok ? "accepted" : "dropped");
+    if (!ok && (lastError === null || e.t - lastError >= L.receiverErrorSpacingMs)) {
+      errorsAt.push(e.t);
+      lastError = e.t;
+    }
+  }
+  return { outcomes, errorsAt };
+}
+// the phone's ring controller: what it answers and says, in time order
+function ringModel(events: any[]): any[] {
+  const L = PRESENCE_LIMITS;
+  const out: any[] = [];
+  let allow = true;
+  let ringing = false;
+  let contStart = 0;
+  let deadline = 0;
+  let deadlineReason = "timeout";
+  let starts: number[] = [];
+  let lockoutUntil = -Infinity;
+  const stop = (t: number, reason: string) => {
+    ringing = false;
+    out.push([t, "status", "stopped", reason]);
+  };
+  const advance = (T: number) => {
+    if (ringing && deadline <= T) {
+      stop(deadline, deadlineReason);
+      if (deadlineReason === "limit") lockoutUntil = deadline + L.ringLockoutMs;
+    }
+  };
+  for (const ev of events) {
+    advance(ev.t);
+    if (ev.ev === "start") {
+      if (!allow) out.push([ev.t, "error", "disabled"]);
+      else if (ev.t < lockoutUntil) out.push([ev.t, "error", "rate_limited"]);
+      else {
+        starts = starts.filter((s) => ev.t - s < L.ringWindowMs);
+        if (starts.length >= L.ringStartsPerWindow) out.push([ev.t, "error", "rate_limited"]);
+        else {
+          starts.push(ev.t);
+          if (!ringing) {
+            ringing = true;
+            contStart = ev.t;
+          }
+          const timeoutAt = ev.t + L.ringTimeoutMs;
+          const capAt = contStart + L.ringCapMs;
+          if (timeoutAt <= capAt) [deadline, deadlineReason] = [timeoutAt, "timeout"];
+          else [deadline, deadlineReason] = [capAt, "limit"];
+          out.push([ev.t, "ack"]);
+          out.push([ev.t, "status", "ringing", ev.audible ?? true]);
+        }
+      }
+    } else if (ev.ev === "stop") {
+      out.push([ev.t, "ack"]);
+      if (ringing) stop(ev.t, "pc");
+    } else if (ev.ev === "user_stop") {
+      if (ringing) stop(ev.t, "user");
+    } else if (ev.ev === "allow") {
+      allow = ev.value;
+      if (!allow && ringing) stop(ev.t, "user");
+    }
+  }
+  return out;
+}
+// the picker of the phone's screenshot watcher (design 5.6): the first rule that applies decides; the baseline moves only for a paused candidate
+function shotModel(c: any): { send: string | null; reason?: string; baselineAfter: number } {
+  const r = c.row;
+  const keep = c.baselineId;
+  const skip = (reason: string, baselineAfter = keep) => ({ send: null, reason, baselineAfter });
+  if (r.id <= c.baselineId || c.handled.includes(r.id)) return skip("old");
+  if (r.isPending) return skip("pending");
+  if (!/^image\//.test(r.mime) || r.size === 0) return skip("not_image");
+  if (c.now - r.dateAdded > PRESENCE_LIMITS.shotStaleSec) return skip("stale");
+  if (r.relativePath.startsWith("Pictures/Kin/") || r.relativePath.startsWith("Download/Kin/")) return skip("own");
+  let kind: string;
+  if (r.relativePath.toLowerCase().includes("screenshot") || r.ownerPackage === "com.android.systemui") {
+    if (!c.screenshots) return skip("off");
+    kind = "screenshot";
+  } else if (r.relativePath.startsWith("DCIM/Camera")) {
+    if (!c.camera) return skip("off");
+    kind = "camera";
+  } else return skip("other");
+  if (c.paused) return skip("paused", Math.max(c.baselineId, r.id));
+  if (!c.rateOk) return skip("rate");
+  return { send: kind, baselineAfter: keep };
+}
+// what a 0.2.0 PC does with the image of a finished transfer (design 3.7)
+function originModel(c: any) {
+  const origin = c.origin === "screenshot" || c.origin === "camera" ? c.origin : null;
+  if (c.paused) return { toast: "none", clipboard: false, sensitiveFormats: false };
+  if (origin === "screenshot") return { toast: "screenshot", clipboard: c.imagesToClipboard, sensitiveFormats: c.imagesToClipboard };
+  if (origin === "camera") return { toast: "photo", clipboard: false, sensitiveFormats: false };
+  return { toast: "files", clipboard: c.imagesToClipboard, sensitiveFormats: false };
+}
+function featuresModel(c: any): boolean {
+  const o = c.peer === null ? undefined : c.overrides[c.peer]?.[c.feature];
+  if (typeof o === "boolean") return o;
+  return c.defaults[c.feature] === true;
+}
+
+{
+  const g = "presence";
+  const d = load("presence.json");
+  for (const k of ["presence", "pauseUntil", "pauseGate", "pauseExpiry", "lowBattery", "batteryMap", "presenceRate", "ring", "shot", "origin", "features"]) uniqueNames(g + "." + k, d[k]);
+  check(g, "limits", eq(d.limits, PRESENCE_LIMITS), () => j(d.limits));
+  const runs = (outcomes: string[]) => {
+    const out: [string, number][] = [];
+    for (const o of outcomes) {
+      if (out.length > 0 && out[out.length - 1][0] === o) out[out.length - 1][1]++;
+      else out.push([o, 1]);
+    }
+    return out;
+  };
+  for (const c of d.presence) {
+    const out = new Receiver("pc", "open", { own: ["presence"], peer: ["presence"] }).receive("phone", c);
+    const got = out.reply === "error" ? out.code : out.action === "presence" ? "accepted" : "?";
+    check(g, `presence ${c.name}`, got === c.expect && out.reply !== "ack", () => `expected ${c.expect}, model says ${got}`);
+    if (c.expect === "accepted") check(g, `presence ${c.name}: the content`, eq(out.presence, c.content), () => j(out.presence));
+  }
+  check(g, "presence[] has accepted and bad_request cases, and a case for each field", ["accepted", "bad_request"].every((e) => d.presence.some((c: any) => c.expect === e)) && ["battery", "pause", "level", "charging", "saver", "remaining", "resumed", "id"].every((f) => d.presence.some((c: any) => c.name.includes(f))));
+  for (const c of d.pauseUntil) {
+    check(g, `pauseUntil ${c.name}: a known choice`, c.choice === "1h" || c.choice === "tomorrow");
+    const got = pauseUntilModel(c);
+    check(g, `pauseUntil ${c.name}`, got === c.expect, () => `expected ${c.expect}, model says ${got}`);
+    // tomorrow is always 08:00 of the wall clock
+    if (c.choice === "tomorrow") check(g, `pauseUntil ${c.name}: 08:00 local and 2 hours or more away`, /T08:00:00[+-]/.test(c.expect) && Date.parse(c.expect) - Date.parse(c.now) >= PRESENCE_LIMITS.tomorrowMinAheadMs);
+  }
+  for (const z of ["UTC", "Europe/Berlin", "America/New_York", "Asia/Kolkata"]) check(g, `pauseUntil has cases in ${z}`, d.pauseUntil.some((c: any) => c.zone === z));
+  for (const c of d.pauseGate) {
+    const got = pauseGateModel(c);
+    check(g, `pauseGate ${c.name}`, got === c.expected, () => `model says ${got}`);
+    check(g, `pauseGate ${c.name}: a known outcome`, ["send", "drop", "quiet", "flows"].includes(c.expected) && (c.at === "send" || c.at === "receive"));
+  }
+  for (const c of d.pauseExpiry) check(g, `pauseExpiry ${c.name}`, pauseExpiryModel(c) === c.expected, () => String(pauseExpiryModel(c)));
+  for (const c of d.lowBattery) {
+    const got = lowBatteryModel(c.steps);
+    check(g, `lowBattery ${c.name}`, eq(got, c.expect), () => `model says ${j(got)}`);
+    check(g, `lowBattery ${c.name}: steps are in time order`, c.steps.every((s: any, k: number) => k === 0 || c.steps[k - 1].t < s.t));
+  }
+  for (const c of d.batteryMap) {
+    const got = batteryMapModel(c);
+    check(g, `batteryMap ${c.name}`, eq(got, c.expect), () => `model says ${j(got)}`);
+  }
+  check(g, "batteryMap has both platforms, an unknown and a no-battery case", ["android", "windows"].every((p) => d.batteryMap.some((c: any) => c.platform === p)) && d.batteryMap.some((c: any) => c.expect === null && c.BatteryFlag === 128));
+  for (const c of d.presenceRate) {
+    if (c.side === "sender") {
+      check(g, `presenceRate ${c.name}: events are in time order and end with end`, c.events.every((e: any, k: number) => k === 0 || c.events[k - 1].t <= e.t) && c.events[c.events.length - 1].op === "end");
+      const got = presenceSenderModel(c.events);
+      check(g, `presenceRate ${c.name}`, eq(got, c.expect), () => `model says ${j(got)}`);
+      // never two battery-driven sends less than 30 s apart unless a pause send came between (the cases that have none)
+      if (!c.events.some((e: any) => e.op === "pause")) check(g, `presenceRate ${c.name}: sends are at least 30 s apart (after the first)`, got.every((x: any, k: number) => k <= 1 || x.t - got[k - 1].t >= PRESENCE_LIMITS.batteryEveryMs));
+    } else {
+      check(g, `presenceRate ${c.name}: a known side`, c.side === "receiver");
+      const events = c.events.flatMap(([t, n]: [number, number]) => Array.from({ length: n }, () => ({ t })));
+      const r = presenceReceiverModel(events);
+      check(g, `presenceRate ${c.name}`, eq(runs(r.outcomes), c.expect) && eq(r.errorsAt, c.errorsAt), () => `runs ${j(runs(r.outcomes))}, errors ${j(r.errorsAt)}`);
+    }
+  }
+  for (const c of d.ring) {
+    check(g, `ring ${c.name}: events are in time order`, c.events.every((e: any, k: number) => k === 0 || c.events[k - 1].t <= e.t));
+    const got = ringModel(c.events);
+    check(g, `ring ${c.name}`, eq(got, c.expect), () => `model says ${j(got)}`);
+    // a ring.stop is always acked, and the output is in time order
+    check(g, `ring ${c.name}: every stop is acked and the answers are in time order`, c.events.filter((e: any) => e.ev === "stop").every((e: any) => got.some((o: any) => o[0] === e.t && o[1] === "ack")) && got.every((o: any, k: number) => k === 0 || got[k - 1][0] <= o[0]));
+  }
+  for (const c of d.shot) {
+    const got = shotModel(c);
+    check(g, `shot ${c.name}`, eq(got, c.expect.send === null ? { send: null, reason: c.expect.reason, baselineAfter: c.expect.baselineAfter } : { send: c.expect.send, baselineAfter: c.expect.baselineAfter }), () => `model says ${j(got)}`);
+    check(g, `shot ${c.name}: the baseline never goes down`, c.expect.baselineAfter >= c.baselineId);
+  }
+  for (const r of ["old", "pending", "not_image", "stale", "own", "off", "other", "paused", "rate"]) check(g, `shot has a case for ${r}`, d.shot.some((c: any) => c.expect.reason === r));
+  check(g, "shot has a screenshot and a camera case that are sent", ["screenshot", "camera"].every((k) => d.shot.some((c: any) => c.expect.send === k)));
+  for (const c of d.origin) check(g, `origin ${c.name}`, eq(originModel(c), c.expect), () => j(originModel(c)));
+  check(g, "origin: a camera photo never reaches the clipboard", d.origin.filter((c: any) => c.origin === "camera").every((c: any) => c.expect.clipboard === false));
+  check(g, "origin: a paused PC does nothing visible", d.origin.filter((c: any) => c.paused).every((c: any) => c.expect.toast === "none" && c.expect.clipboard === false));
+  for (const c of d.features) check(g, `features ${c.name}`, featuresModel(c) === c.expected, () => String(featuresModel(c)));
+}
+
+{
+  const g = "scope-2b.4";
+  const messages = load("messages.json");
+  const matches = (name: string, p: string) => (p.endsWith("*") ? name.startsWith(p.slice(0, -1)) : name === p);
+  const SEQ = ["presence-not-sent-without-capability", "presence-dropped-when-feature-off-is-silent", "presence-is-not-acked-or-deduplicated", "presence-snapshot-replaces-pause", "presence-forgotten-on-close", "ring-not-sent-without-capability", "ring-capability-follows-the-switch", "ring-start-is-not-resent-after-reconnect", "ring-start-is-acked-once", "ring-status-is-ephemeral", "ring-disabled-error-is-not-remembered"];
+  const SCOPE: [string, any[], string[], number][] = [
+    ["messages.valid", messages.valid, ["presence-*", "ring-*"], 15],
+    ["messages.invalid", messages.invalid, ["presence-*", "ring-*"], 15],
+    ["messages.sequences", messages.sequences, SEQ, 11],
+  ];
+  let inScope = 0;
+  for (const [label, cases, patterns, atLeast] of SCOPE) {
+    for (const p of patterns) check(g, `${label}: "${p}" matches a case`, cases.some((c) => matches(c.name, p)));
+    const hits = cases.filter((c) => patterns.some((p) => matches(c.name, p)));
+    inScope += hits.length;
+    check(g, `${label}: at least ${atLeast} cases in scope`, hits.length >= atLeast, () => String(hits.length));
+  }
+  for (const n of ["presence-minimal", "presence-full", "ring-start-ack", "ring-start-disabled", "ring-start-rate-limited", "ring-stop-idempotent"]) check(g, `messages has ${n}`, [...messages.valid, ...messages.invalid].some((c: any) => c.name === n));
+  // every new type has a valid example; presence and ring.status are never acked, ring.start and ring.stop always are
+  for (const t of ["presence", "ring.start", "ring.stop", "ring.status"]) {
+    const ex = messages.valid.filter((c: any) => c.frame?.type === t && !String(c.expect.action).endsWith("_dropped"));
+    check(g, `${t}: has a valid example`, ex.length > 0);
+    check(g, `${t}: ${t === "ring.start" || t === "ring.stop" ? "is always acked" : "is never acked"}`, ex.every((c: any) => c.expect.reply === (t === "ring.start" || t === "ring.stop" ? "ack" : "none")));
+    check(g, `${t}: has a bad_request or error example`, messages.invalid.some((c: any) => c.name.startsWith(t === "presence" ? "presence-" : "ring-") && (c.frame?.type === t || c.raw?.includes(`"${t}"`) || c.synthesize?.base?.type === t) && c.expect.reply === "error"));
+  }
+  check(g, "every presence dropped case replies with nothing", messages.valid.filter((c: any) => c.expect.action === "presence_dropped").every((c: any) => c.expect.reply === "none" && c.expect.close === null));
+  check(g, "every presence and ring case lists the capabilities of both sides", [...messages.valid, ...messages.invalid].filter((c: any) => c.name.startsWith("presence-") || c.name.startsWith("ring-")).every((c: any) => Array.isArray(c.own) && Array.isArray(c.peer)));
+  check(g, "too_large cases for presence, ring.status and ring.start", ["presence-over-4-KiB-is-too-large", "ring-status-over-2-KiB-is-too-large", "ring-start-over-2-KiB-is-too-large"].every((n) => messages.invalid.some((c: any) => c.name === n && c.expect.code === "too_large")));
+  console.log(`milestone 2B.4 scope: ${inScope} presence and ring cases in messages.json, plus presence.json`);
 }
 
 // ---- fixtures/: DER certificates for the negative tls[] cases (made by fixtures/make-fixtures.ts)
