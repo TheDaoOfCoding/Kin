@@ -1,0 +1,57 @@
+[     0ms pid  45956] start mode="register" full command line=["C:\\Dev\\ecosystem-app\\spikes\\toast-activation\\out\\with space\\toast-spike.exe", "register"]
+[     1ms pid  45956] registered AUMID app.kinrelay.spike.toast + CLSID {D4F1A6B2-7C3E-4B58-9A10-5E6C0B7A21F3} -> C:\Dev\ecosystem-app\spikes\toast-activation\out\with space\toast-spike.exe
+[     0ms pid  39092] start mode="serve" full command line=["C:\\Dev\\ecosystem-app\\spikes\\toast-activation\\out\\with space\\toast-spike.exe", "serve", "120", "2"]
+[     3ms pid  39092] class object registered (REGCLS_MULTIPLEUSE); app is RUNNING
+[     8ms pid  39092] notifier.Setting() = Ok(NotificationSetting(0))
+[    14ms pid  39092] CONTROL show under unregistered AUMID -> Ok(()); setting=Ok(NotificationSetting(0))
+[    23ms pid  39092] EVENT Dismissed tag=ctl (control, unregistered AUMID) reason=TimedOut
+[   818ms pid  39092] HISTORY[control] app.kinrelay.spike.toast.unregistered: 1 toast(s): spike-phone/ctl body="control, unregistered AUMID" input=false
+[  7326ms pid  39092] EVENT Dismissed tag=ctl2 (control popup, unregistered AUMID) reason=TimedOut
+[  7329ms pid  39092] CONTROL popup under UNREGISTERED AUMID: Dismissed after Some(6.509646)s -> ["control popup, unregistered AUMID:TimedOut"]
+[  7337ms pid  39092] EVENT Dismissed tag=t1 (v1 (input + buttons)) reason=TimedOut
+[  8135ms pid  39092] HISTORY[after show t1] app.kinrelay.spike.toast: 1 toast(s): spike-phone/t1 body="v1 (input + buttons)" input=true
+[  8142ms pid  39092] EVENT Dismissed tag=t1 (v2 (updated in place)) reason=TimedOut
+[  9642ms pid  39092] HISTORY[after update t1] app.kinrelay.spike.toast: 1 toast(s): spike-phone/t1 body="v2 (updated in place)" input=true
+[  9642ms pid  39092] UPDATE: 1 toast with tag t1 after two Show() calls (1 = replaced, 2 = duplicated); old object's Dismissed events: ["v1 (input + buttons):TimedOut", "v2 (updated in place):TimedOut"]
+[  9649ms pid  39092] EVENT Dismissed tag=t5 (expires after 15 s) reason=TimedOut
+[  9652ms pid  39092] EVENT Dismissed tag=t3 (will be hidden by the app) reason=TimedOut
+[ 10248ms pid  39092] EVENT Dismissed tag=t3 (will be hidden by the app) reason=ApplicationHidden
+[ 11753ms pid  39092] HIDE: after notifier.Hide(t3): in history=false; Dismissed=["will be hidden by the app:TimedOut", "will be hidden by the app:ApplicationHidden"]
+[ 11761ms pid  39092] EVENT Dismissed tag=t4 (will be removed from history) reason=TimedOut
+[ 13864ms pid  39092] REMOVE: after RemoveGroupedTagWithId(t4): in history=false; Dismissed=["will be removed from history:TimedOut"]
+[ 15669ms pid  39092] POPUP REPLACE: events of the old popup object right after replacing it: []
+[ 24228ms pid  39092] EXPIRY: t5 (ExpirationTime=+15s) gone from history after 14.6s
+[ 37225ms pid  39092] EVENT Dismissed tag=t2 (popup v2 replaced while visible) reason=TimedOut
+[ 37446ms pid  39092] POPUP: v2 Dismissed after Some(22.078901)s; all events for tag t2 -> ["popup v2 replaced while visible:TimedOut"]
+[ 37952ms pid  39092] HISTORY[after popup timed out] app.kinrelay.spike.toast: 2 toast(s): spike-phone/t2 body="popup v2 replaced while visible" input=true | spike-phone/t1 body="v2 (updated in place)" input=true
+[ 37956ms pid  39092] HISTORY[end of scenario] app.kinrelay.spike.toast: 2 toast(s): spike-phone/t2 body="popup v2 replaced while visible" input=true | spike-phone/t1 body="v2 (updated in place)" input=true
+[ 37957ms pid  39092] SCENARIO_DONE Ok(())
+[     0ms pid  33460] start mode="client" full command line=["C:\\Dev\\ecosystem-app\\spikes\\toast-activation\\out\\with space\\toast-spike.exe", "client", "kin=1&n=t1&a=reply", "reply=hello from the test client"]
+[     6ms pid  33460] CLIENT CoCreateInstance ok in 5 ms
+[ 38276ms pid  39092] ACTIVATE aumid="app.kinrelay.spike.toast" args="kin=1&n=t1&a=reply" count=1 input[reply]="hello from the test client"
+[     7ms pid  33460] CLIENT Activate -> Ok(()) (total 6 ms)
+[     0ms pid  44920] start mode="client" full command line=["C:\\Dev\\ecosystem-app\\spikes\\toast-activation\\out\\with space\\toast-spike.exe", "client", "kin=1&n=t1&a=copy"]
+[     6ms pid  44920] CLIENT CoCreateInstance ok in 5 ms
+[ 38294ms pid  39092] ACTIVATE aumid="app.kinrelay.spike.toast" args="kin=1&n=t1&a=copy" count=0
+[     6ms pid  44920] CLIENT Activate -> Ok(()) (total 6 ms)
+[ 38958ms pid  39092] serve ending, activations received=2
+[     0ms pid  21144] start mode="history" full command line=["C:\\Dev\\ecosystem-app\\spikes\\toast-activation\\out\\with space\\toast-spike.exe", "history"]
+[    14ms pid  21144] HISTORY[fresh process] app.kinrelay.spike.toast: 2 toast(s): spike-phone/t2 body="popup v2 replaced while visible" input=true | spike-phone/t1 body="v2 (updated in place)" input=true
+[     0ms pid  40316] start mode="remove" full command line=["C:\\Dev\\ecosystem-app\\spikes\\toast-activation\\out\\with space\\toast-spike.exe", "remove", "t1"]
+[    18ms pid  40316] HISTORY[after RemoveGroupedTagWithId(t1) from a fresh process] app.kinrelay.spike.toast: 1 toast(s): spike-phone/t2 body="popup v2 replaced while visible" input=true
+[     0ms pid  29808] start mode="client" full command line=["C:\\Dev\\ecosystem-app\\spikes\\toast-activation\\out\\with space\\toast-spike.exe", "client", "kin=1&n=t2&a=reply", "reply=hello cold start"]
+[     0ms pid  29208] start mode="--toast-activated" full command line=["C:\\Dev\\ecosystem-app\\spikes\\toast-activation\\out\\with space\\toast-spike.exe", "--toast-activated", "-Embedding"]
+[     4ms pid  29208] COM-LAUNCHED: class object registered, waiting for the call
+[   429ms pid  29808] CLIENT CoCreateInstance ok in 428 ms
+[     8ms pid  29208] ACTIVATE aumid="app.kinrelay.spike.toast" args="kin=1&n=t2&a=reply" count=1 input[reply]="hello cold start"
+[   430ms pid  29808] CLIENT Activate -> Ok(()) (total 429 ms)
+[  1255ms pid  29208] COM-LAUNCHED process ending, activations received=1
+[     0ms pid  38340] start mode="clear" full command line=["C:\\Dev\\ecosystem-app\\spikes\\toast-activation\\out\\with space\\toast-spike.exe", "clear"]
+[    12ms pid  38340] HISTORY[after clear] app.kinrelay.spike.toast: 0 toast(s): 
+[     0ms pid  39096] start mode="unregister" full command line=["C:\\Dev\\ecosystem-app\\spikes\\toast-activation\\out\\with space\\toast-spike.exe", "unregister"]
+[     1ms pid  39096] removed HKCU\Software\Classes\CLSID\{D4F1A6B2-7C3E-4B58-9A10-5E6C0B7A21F3}
+[     1ms pid  39096] removed HKCU\Software\Classes\AppUserModelId\app.kinrelay.spike.toast
+[     2ms pid  39096] removed HKCU\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\app.kinrelay.spike.toast
+[     2ms pid  39096] removed HKCU\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\app.kinrelay.spike.toast.unregistered
+[     2ms pid  39096] removed HKCU\Software\Microsoft\Windows\CurrentVersion\PushNotifications\Backup\app.kinrelay.spike.toast
+[     2ms pid  39096] removed HKCU\Software\Microsoft\Windows\CurrentVersion\PushNotifications\Backup\app.kinrelay.spike.toast.unregistered

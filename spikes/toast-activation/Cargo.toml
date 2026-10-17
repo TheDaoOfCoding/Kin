@@ -1,0 +1,23 @@
+[package]
+name = "toast-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Spike S1 of 2B.2: toasts + COM activation for an unpackaged Win32 app (throwaway)"
+
+# Own project, own target dir: never part of another workspace.
+[workspace]
+
+[dependencies]
+windows = { version = "=0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Notifications",
+    "Win32_UI_Shell",
+    "UI_Notifications",
+    "Data_Xml_Dom",
+    "Foundation",
+    "Foundation_Collections",
+] }
+windows-core = "=0.62.2"  # the `implement` macro expands to paths in this crate
+windows-registry = "0.6.1"
