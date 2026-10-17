@@ -100,6 +100,8 @@ class MirrorSender(
     private val log: KinLog = KinLog.None,
     private val newId: () -> String = MessageIds::newId,
     val stats: MirrorStats = MirrorStats(),
+    /** This device or the PC is paused (2B.4, design 3.5): a new `notif.post` goes nowhere meanwhile (counted as `paused`). `notif.remove`, `notif.sync` and `notif.status` still flow: cleanup is not content. */
+    private val postsBlocked: () -> Boolean = { false },
 ) {
     private class NidState(var lastSentAt: Long = NEVER, var lastHash: String? = null, var pending: PostRequest? = null, var timer: Job? = null)
 
@@ -138,6 +140,10 @@ class MirrorSender(
     fun post(request: PostRequest): PostResult = synchronized(lock) {
         val c = usable() ?: run {
             stats.drop(OFFLINE)
+            return PostResult.DROPPED_OFFLINE
+        }
+        if (postsBlocked()) {
+            stats.drop(PAUSED)
             return PostResult.DROPPED_OFFLINE
         }
         val nid = request.post.nid
@@ -325,6 +331,7 @@ class MirrorSender(
         const val STATE_LIMIT = 500
         const val OFFLINE = "offline"
         const val RATE = "rate"
+        const val PAUSED = "paused"
         private const val NEVER = Long.MIN_VALUE
     }
 }

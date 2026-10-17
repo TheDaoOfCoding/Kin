@@ -23,6 +23,9 @@ val signingAlias = signingValue("KIN_KEY_ALIAS", "keyAlias")
 val signingKeyPassword = signingValue("KIN_KEY_PASSWORD", "keyPassword") ?: signingStorePassword
 // Opt-in ABIs for the smoke build type (see buildTypes): -PkinSmokeAbis=x86_64 (comma separated).
 val kinSmokeAbis = (findProperty("kinSmokeAbis") as String?)?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
+// Auto-send screenshots (2B.4, risk R18): on by default. If Google Play refuses the photo permission, a Play build is made with `-PkinAutoSendShots=false`: the switch and the watcher are gone
+// (BuildConfig.AUTO_SEND_SHOTS) and the manifest overlay `src/noshots` removes READ_MEDIA_IMAGES and READ_EXTERNAL_STORAGE. The sideload/GitHub build keeps the feature. One codebase.
+val kinAutoSendShots = (findProperty("kinAutoSendShots") as String?)?.toBooleanStrictOrNull() ?: true
 val releaseSigningReady = signingStore != null && signingStore.isFile && signingStorePassword != null && signingAlias != null && signingKeyPassword != null
 
 android {
@@ -37,6 +40,7 @@ android {
         targetSdk = 37
         versionCode = 2
         versionName = "0.1.1"
+        buildConfigField("boolean", "AUTO_SEND_SHOTS", kinAutoSendShots.toString())
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -92,6 +96,10 @@ android {
         buildConfig = true
     }
     sourceSets {
+        if (!kinAutoSendShots) {
+            getByName("debug").manifest.srcFile("src/noshots/AndroidManifest.xml")
+            getByName("release").manifest.srcFile("src/noshots/AndroidManifest.xml")
+        }
         // The shared protocol vectors are loaded by the unit tests as classpath resources.
         getByName("test").resources.directories.add("../../protocol")
         // The instrumented link-display test runs the same vectors on android.icu (a device or an emulator), as assets of the test APK.

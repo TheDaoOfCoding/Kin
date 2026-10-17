@@ -54,7 +54,7 @@ class MediaHub(private val graph: AppGraph) {
 
     val store = MediaPolicyStore(context)
     val stats = MediaStats()
-    val sender = MediaSender(graph.scope, clock, link = { graph.link.runtime?.currentSession }, log = log, stats = stats)
+    val sender = MediaSender(graph.scope, clock, link = { graph.link.runtime?.currentSession }, log = log, stats = stats, peerPaused = { graph.presence.peerPaused() })
 
     @Volatile private var policy = MediaPolicy()
 
@@ -138,11 +138,12 @@ class MediaHub(private val graph: AppGraph) {
                 val before = last
                 last = now
                 policy = now
-                sender.setOwnShare(now.share)
+                // This device's Pause (2B.4) acts as both switches being off: the source sends nothing and one `media.clear`, the viewer removes what it shows and drops the rest.
+                sender.setOwnShare(now.share && !paused())
                 if (before != null) {
                     if (now.share != before.share) log.i("media", "media: share ${if (now.share) "on" else "off"}")
                     if (now.show != before.show) log.i("media", "media: show ${if (now.show) "on" else "off"}")
-                    if (!now.show) viewer.forgetAll()
+                    if (!now.show || paused()) viewer.forgetAll()
                     // A change of the lock-screen or volume-key choice redraws what is shown.
                     if (now.show && (now.showOnLockScreen != before.showOnLockScreen || now.useVolumeKeys != before.useVolumeKeys)) viewer.render(now)
                 }
@@ -154,9 +155,31 @@ class MediaHub(private val graph: AppGraph) {
         graph.scope.launch {
             graph.link.state.collect { if (it !is LinkState.Connected) onLinkClosed() }
         }
+        // Pause (2B.4): nothing is started or stopped by it, but the effective switches change, so the source says `media.clear` once and the viewer lets go.
+        graph.scope.launch {
+            graph.pause.changes.collect {
+                val on = paused()
+                sender.setOwnShare(policy.share && !on)
+                if (on) viewer.forgetAll()
+                reevaluate()
+                sender.statusChanged(status())
+                publish()
+            }
+        }
     }
 
-    fun status(): MediaStatus = MediaStatus(policy.show, policy.share, if (accessGranted()) "granted" else "missing")
+    private fun paused(): Boolean = graph.pause.paused()
+
+    /** The PC's pause ended (it said so, or its end passed): what was held for it goes out. */
+    fun onPeerPauseEnded() {
+        sender.peerPauseEnded()
+    }
+
+    /** What `media.status` says: while this device is paused both are off (the PC stops pushing and drops what it holds for us). */
+    fun status(): MediaStatus {
+        val on = paused()
+        return MediaStatus(policy.show && !on, policy.share && !on, if (accessGranted()) "granted" else "missing")
+    }
 
     fun accessGranted(): Boolean = graph.mirror.accessGranted()
 
@@ -167,7 +190,7 @@ class MediaHub(private val graph: AppGraph) {
     @Synchronized
     fun reevaluate() {
         val access = accessGranted()
-        val want = policy.share && access && sender.isOpen()
+        val want = policy.share && !paused() && access && sender.isOpen()
         // A reader that stops (access revoked while sharing, the PC stopped showing) also clears what the PC shows of this phone: no stale card is left there.
         if (sourceSwitch.apply(want) == SourceSwitch.Result.START_FAILED) sender.statusChanged(status())
         publish()
@@ -232,6 +255,11 @@ class MediaHub(private val graph: AppGraph) {
     }
 
     private fun onViewer(message: MediaMsg) {
+        if (paused()) {
+            // The receiver gates too (2B.4): a race, or a peer that ignores our status, still changes nothing on screen.
+            stats.drop(MediaStats.PAUSED)
+            return
+        }
         if (!MediaGate.viewerAccepts(typeOf(message), policy.show)) {
             // A race (the PC didn't see our `show: false` yet): dropped silently, counted, never an error.
             stats.drop(MediaStats.VIEWER_OFF)

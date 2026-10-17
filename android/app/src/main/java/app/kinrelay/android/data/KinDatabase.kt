@@ -18,7 +18,7 @@ import androidx.sqlite.execSQL
  */
 @Database(
     entities = [DeviceEntity::class, SeenMessageEntity::class, TransferEntity::class, TransferFileEntity::class, TextItemEntity::class],
-    version = 5,
+    version = 6,
     exportSchema = true,
 )
 abstract class KinDatabase : RoomDatabase() {
@@ -112,10 +112,22 @@ abstract class KinDatabase : RoomDatabase() {
             "ALTER TABLE `texts` ADD COLUMN `title` TEXT",
         )
 
+        /** 2B.4 (auto-sent screenshots): an upload can carry an `origin` (`screenshot`, `camera`). Null for every row that exists. Nothing is dropped. */
+        val MIGRATION_5_6 = object : Migration(5, 6) {
+            override suspend fun migrate(connection: SQLiteConnection) {
+                MIGRATION_5_6_STATEMENTS.forEach { connection.execSQL(it) }
+            }
+        }
+
+        /** The statements of [MIGRATION_5_6], in order (a test runs them through a real SQLite). */
+        val MIGRATION_5_6_STATEMENTS = listOf(
+            "ALTER TABLE `transfers` ADD COLUMN `origin` TEXT",
+        )
+
         fun create(context: Context): KinDatabase =
             Room.databaseBuilder<KinDatabase>(context.applicationContext, "kin.db")
                 .setDriver(AndroidSQLiteDriver())
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
                 .build()
     }
 }

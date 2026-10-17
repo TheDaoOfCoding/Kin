@@ -4,6 +4,8 @@ import app.kinrelay.android.media.MediaInbound
 import app.kinrelay.android.media.MediaMsg
 import app.kinrelay.android.media.MediaWire
 import app.kinrelay.android.notifmirror.NotifWire
+import app.kinrelay.android.presence.PresenceSnapshot
+import app.kinrelay.android.presence.PresenceWire
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -70,6 +72,24 @@ sealed class Action(val category: String) {
      */
     class MediaDropped(val notListed: Boolean) : Action("media_dropped")
 
+    /** A valid `presence` (2B.4), **ephemeral**: no ack, not in the de-duplication memory, no reply either way. It replaces the peer's previous snapshot on this connection. */
+    class Presence(val snapshot: PresenceSnapshot) : Action("presence")
+
+    /** A `presence` dropped silently (counted): a side's latest `hello` doesn't list `presence`. Never an `error`. */
+    data object PresenceDropped : Action("presence_dropped")
+
+    /**
+     * A valid, new `ring.start` (2B.4): start ringing (or restart the 30 s), then answer `ack`, or `error` (`disabled`, `rate_limited`). Acked, de-duplicated, never queued. Like `notif.action` the
+     * answer comes **after** the phone did (or refused) the thing: the caller sends it and records it with [MessageReceiver.recordResponse].
+     */
+    class RingStart(val id: String) : Action("ring_start")
+
+    /** A valid, new `ring.stop`: stop ringing, always answered `ack`, and `ring.status stopped` only if something was ringing. */
+    class RingStop(val id: String) : Action("ring_stop")
+
+    /** A valid `ring.status` that **the PC** receives from the phone (`ReceiverRole.PC` only, for the shared vectors). Ephemeral. */
+    class RingStatusReceived(val state: String, val reason: String?, val audible: Boolean) : Action("ring_status")
+
     /** A valid `offer`, acked: download the files. */
     class StartDownload(val offer: Offer) : Action("start_download")
 
@@ -132,12 +152,14 @@ class MessageReceiver(
      * comes later" (the app fires the action first and answers after it: [Action.NotifAction]). Either way the answer is the ID's one response.
      */
     private val notifAction: (NotifWire.ActionRequest) -> String? = { Frames.ack(it.id) },
+    /** What a valid, new `ring.start` or `ring.stop` (by type and ID) is answered with **now**: the `ack` by default (the shared vectors), or null for "the answer comes later" ([Action.RingStart]). */
+    private val ringAnswer: (type: String, id: String) -> String? = { _, id -> Frames.ack(id) },
 ) {
     var peer: Hello? = null
         private set
 
     /** The capabilities of this side's own latest `hello` (protocol.md, validation step 6b): the phone always lists `notif`. The tests set it for the vectors. */
-    var ownCapabilities: Set<String> = setOf(LinkWire.CAPABILITY_LINK, NotifWire.CAPABILITY, MediaWire.CAPABILITY)
+    @Volatile var ownCapabilities: Set<String> = setOf(LinkWire.CAPABILITY_LINK, NotifWire.CAPABILITY, MediaWire.CAPABILITY, PresenceWire.CAPABILITY)
 
     val helloAccepted: Boolean get() = peer != null
 
@@ -145,8 +167,10 @@ class MessageReceiver(
         addAll(listOf("hello", "ack", "error", "ping", "unpair", "text", "link", "cancel"))
         // 2B.3: both sides send and receive every `media.*` type (each is the source of one direction and the viewer of the other).
         addAll(MediaWire.TYPES)
-        if (role == ReceiverRole.PHONE) addAll(listOf("clipboard", "offer", NotifWire.DISMISS, NotifWire.ACTION))
-        else addAll(listOf("complete", NotifWire.STATUS, NotifWire.ICON, NotifWire.POST, NotifWire.REMOVE, NotifWire.SYNC))
+        // 2B.4: both sides send and receive `presence`; only the phone receives `ring.start`/`ring.stop`, only the PC receives `ring.status`.
+        add(PresenceWire.PRESENCE)
+        if (role == ReceiverRole.PHONE) addAll(listOf("clipboard", "offer", NotifWire.DISMISS, NotifWire.ACTION, PresenceWire.RING_START, PresenceWire.RING_STOP))
+        else addAll(listOf("complete", NotifWire.STATUS, NotifWire.ICON, NotifWire.POST, NotifWire.REMOVE, NotifWire.SYNC, PresenceWire.RING_STATUS))
     }
 
     fun onBinary(): Outcome = Outcome(emptyList(), 1003, Action.CloseOnly)
@@ -189,6 +213,22 @@ class MessageReceiver(
             val limit = if (type == MediaWire.IMAGE) MediaWire.IMAGE_FRAME_BYTES else MediaWire.STATE_FRAME_BYTES
             if (Utf8.size(text) > limit) return rejected(ErrorCodes.TOO_LARGE, "A media message is at most ${limit / 1024} KiB.", ref)
             return onMedia(type, frame, ref)
+        }
+
+        // 6b (2B.4). `presence` is dropped silently when either side's latest `hello` doesn't list `presence`; then the 4 KiB limit; then the fields. `ring.*` is different: it is acked, so it is never
+        // dropped for a missing capability: `ring.start` that reaches a phone whose switch is off in a race is answered `error disabled`; the 2 KiB limit applies.
+        if (type == PresenceWire.PRESENCE) {
+            if (PresenceWire.CAPABILITY !in ownCapabilities || peer?.understandsPresence != true) return Outcome(emptyList(), null, Action.PresenceDropped)
+            if (Utf8.size(text) > PresenceWire.FRAME_BYTES) return rejected(ErrorCodes.TOO_LARGE, "A presence message is at most 4 KiB.", ref)
+            return onPresence(frame, ref)
+        }
+        if (type.startsWith("ring.")) {
+            // `ring.status` follows the capability rule of `presence` (the sender must list it); `ring.start` and `ring.stop` never do (they are acked).
+            if (type == PresenceWire.RING_STATUS && (PresenceWire.CAPABILITY !in ownCapabilities || peer?.understandsPresence != true)) {
+                return Outcome(emptyList(), null, Action.PresenceDropped)
+            }
+            if (Utf8.size(text) > PresenceWire.RING_FRAME_BYTES) return rejected(ErrorCodes.TOO_LARGE, "A ring message is at most 2 KiB.", ref)
+            return onRing(type, frame, ref)
         }
 
         return when (type) {
@@ -339,13 +379,63 @@ class MessageReceiver(
         }
     }
 
+    /** `presence`: ephemeral (no ack, no de-duplication, a rejected one is not remembered either). */
+    private fun onPresence(frame: JsonObject, ref: String?): Outcome {
+        if (ref == null) return rejected(ErrorCodes.BAD_REQUEST, "A presence message needs an id.", ref)
+        return when (val parsed = PresenceWire.parse(frame)) {
+            is PresenceWire.Parsed.Bad -> rejected(ErrorCodes.BAD_REQUEST, parsed.message, ref)
+            is PresenceWire.Parsed.Ok -> Outcome(emptyList(), null, Action.Presence(parsed.snapshot))
+        }
+    }
+
+    /**
+     * `ring.start` and `ring.stop` (acked, de-duplicated: a repeated ID gets the stored answer and acts no second time); `ring.status` for the PC role (ephemeral). The answer to a new `ring.start` or
+     * `ring.stop` is [ringAnswer]'s: null means the caller answers after it acted ([Action.RingStart], [Action.RingStop]).
+     */
+    private fun onRing(type: String, frame: JsonObject, ref: String?): Outcome {
+        if (ref == null) return rejected(ErrorCodes.BAD_REQUEST, "A ring message needs an id.", ref)
+        if (type == PresenceWire.RING_STATUS) {
+            val state = Fields.string(frame["state"])?.takeIf { it == PresenceWire.STATE_RINGING || it == PresenceWire.STATE_STOPPED }
+            val rawReason = Fields.present(frame["reason"])
+            val reason = if (rawReason == null) "" else Fields.string(rawReason)
+            val rawAudible = Fields.present(frame["audible"])
+            val audible = if (rawAudible == null) true else Fields.boolean(rawAudible)
+            if (state == null || reason == null || audible == null) {
+                return rejected(ErrorCodes.BAD_REQUEST, "ring.status needs a state of ringing or stopped (reason a string and audible a boolean, if present).", ref)
+            }
+            return Outcome(emptyList(), null, Action.RingStatusReceived(state, reason.ifEmpty { null }, audible))
+        }
+        dedup.lookup(ref)?.let { return Outcome(listOf(it), null, Action.IgnoreDuplicate) }
+        // The phone's own latest `hello` doesn't list `ring` (the switch went off in a race): `ring.start` is answered `disabled` with `ref` and the ID is **not** remembered, so a repeat
+        // after the switch is on again rings. A `ring.stop` is always acked: stopping is never refused.
+        if (type == PresenceWire.RING_START && PresenceWire.RING_CAPABILITY !in ownCapabilities) {
+            return Outcome(listOf(Frames.error("disabled", "Ringing is turned off on this phone.", ref)), null, Action.Rejected)
+        }
+        val action = if (type == PresenceWire.RING_START) Action.RingStart(ref) else Action.RingStop(ref)
+        val answer = ringAnswer(type, ref) ?: return Outcome(emptyList(), null, action)
+        // Only an ack is remembered: an `error` (`disabled`, `rate_limited`) is not, because the PC never re-sends and a repeat later must be judged afresh.
+        if (isAck(answer)) dedup.record(ref, answer)
+        return Outcome(listOf(answer), null, action)
+    }
+
+    /** True for the frame [Frames.ack] writes. */
+    private fun isAck(frame: String): Boolean = frame.startsWith("{\"type\":\"ack\"")
+
     private companion object {
         const val NOTIF_FRAME_BYTES = 32 * 1024
         const val NOTIF_ICON_FRAME_BYTES = 48 * 1024
     }
 
-    /** Remembers the answer that was sent for [id] (the `notif.action` answer comes after the action fired, so it is recorded here, not by the receiver itself). */
+    /**
+     * Remembers the answer that was sent for [id] (the `notif.action` answer comes after the action fired, so it is recorded here, not by the receiver itself). An `error` answer to a
+     * `ring.start` is **not** remembered ([answerRing] of the session passes only acks here).
+     */
     fun recordResponse(id: String, response: String) = dedup.record(id, response)
+
+    /** Remembers [response] for [id] only when it is an `ack` (a `ring.start` answered `disabled` or `rate_limited` leaves no trace). */
+    fun recordAckOnly(id: String, response: String) {
+        if (isAck(response)) dedup.record(id, response)
+    }
 
     private fun onClipboard(frame: JsonObject, ref: String?): Outcome {
         val text = Fields.nonEmptyString(frame["text"])

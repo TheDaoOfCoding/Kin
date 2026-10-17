@@ -11,7 +11,10 @@ import app.kinrelay.android.AppGraph
 import app.kinrelay.android.Permissions
 import app.kinrelay.android.clipboard.AndroidClipboard
 import app.kinrelay.android.data.DeviceEntity
+import app.kinrelay.android.features.FeatureIds
 import app.kinrelay.android.identity.DeviceIds
+import app.kinrelay.android.presence.PresenceSnapshot
+import app.kinrelay.android.protocol.Frames
 import app.kinrelay.android.media.MediaMsg
 import app.kinrelay.android.notifmirror.NotifWire
 import app.kinrelay.android.pairing.PairingAddress
@@ -51,6 +54,8 @@ class LinkRuntime(
         AndroidClipboard(context), notifications, graph.clipboardGuard, graph.log,
         copyAutomatically = { graph.settings.copyReceivedTextAutomatically() },
         lockScreenLinks = { graph.settings.showLinkPreviewsOnLockScreen() },
+        paused = { graph.pause.paused() },
+        onQuiet = { graph.pause.noteQuietArrival() },
     )
     private val lock = Mutex()
     private val wifi = WifiTracker<Network>()
@@ -168,7 +173,8 @@ class LinkRuntime(
             peerDeviceId = device.deviceId,
             socketFactory = newNetwork.socketFactory,
             discovery = mdns::discover,
-            local = LocalHello(graph.deviceName(), "android", graph.deviceInfo.appVersion),
+            // `ring` is listed only while "Let my PC ring this phone" is on (2B.4); a later change goes out as a new `hello` on the open connection.
+            local = LocalHello(graph.deviceName(), "android", graph.deviceInfo.appVersion, Frames.withRing(graph.features.enabled(FeatureIds.RING_ALLOW, device.deviceId))),
             dedup = graph.dedup(),
             scope = scope,
             clock = clock,
@@ -250,7 +256,17 @@ class LinkRuntime(
         override fun onHelloAccepted(connection: LinkConnection) {
             graph.mirror.onLinkReady(connection)
             graph.media.onLinkReady(connection)
+            graph.presence.onHelloAccepted(connection)
         }
+
+        // 2B.4: presence (the PC's pause and laptop battery) and ring my phone.
+        override fun onPresence(snapshot: PresenceSnapshot) = graph.presence.onPresence(snapshot)
+
+        override fun onPresenceDropped() = graph.presence.onDropped()
+
+        override suspend fun onRingStart(id: String, reply: (String) -> Unit) = graph.ring.onStartFromPc(id, reply)
+
+        override suspend fun onRingStop(id: String, reply: (String) -> Unit) = graph.ring.onStopFromPc(id, reply)
 
         override fun onNotifDismiss(nid: String) = graph.mirror.onDismiss(nid)
 

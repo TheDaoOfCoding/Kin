@@ -54,6 +54,12 @@ fun HomeScreen(
     mirrorCard: @Composable () -> Unit = {},
     /** The "Media" row (2B.3): empty while both directions are off. */
     mediaCard: @Composable () -> Unit = {},
+    /** The PC's status under its name (2B.4): a laptop's battery and its pause. */
+    statusLine: @Composable () -> Unit = {},
+    /** The Pause card (2B.4). */
+    pauseCard: @Composable () -> Unit = {},
+    /** "Needs access to all photos" (2B.4): only while auto-send is on and the access is missing. */
+    shotsCard: @Composable () -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
     var pinging by remember { mutableStateOf(false) }
@@ -79,11 +85,14 @@ fun HomeScreen(
             Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(pc.name, style = MaterialTheme.typography.titleLarge)
                 Text(UiText.status(state), style = MaterialTheme.typography.bodyLarge)
+                statusLine()
                 val pcShort = DeviceIds.shortIdOfDeviceId(pc.deviceId)?.let(DeviceIds::display) ?: "?"
                 Text("PC ID: $pcShort", style = MaterialTheme.typography.bodySmall)
                 Text("This phone: ${phoneShortId?.let(DeviceIds::display) ?: "…"}", style = MaterialTheme.typography.bodySmall)
             }
         }
+        pauseCard()
+        shotsCard()
         mirrorCard()
         mediaCard()
         if (identityProblem != null) IdentityProblemCard(identityProblem)
@@ -103,17 +112,17 @@ fun HomeScreen(
             TextButton(onClick = onSeeHistory) { Text("See all history") }
         }
         OutlinedButton(onClick = { confirmUnpair = true }, modifier = Modifier.fillMaxWidth()) {
-            Text(if (state is LinkState.PairAgain) "Remove this PC" else "Unpair")
+            Text(if (state is LinkState.PairAgain) "Remove this PC" else "Unlink")
         }
     }
     if (confirmUnpair) {
         AlertDialog(
             onDismissRequest = { confirmUnpair = false },
-            title = { Text(if (state is LinkState.PairAgain) "Remove ${pc.name}?" else "Unpair from ${pc.name}?") },
-            text = { Text("Text and the clipboard stop syncing until you pair again. ${pc.name} is told, if it's connected.") },
+            title = { Text(if (state is LinkState.PairAgain) "Remove ${pc.name}?" else "Unlink from ${pc.name}?") },
+            text = { Text(UiText.unlinkText(pc.name)) },
             confirmButton = {
                 TextButton(onClick = { confirmUnpair = false; scope.launch { onUnpair() } }) {
-                    Text(if (state is LinkState.PairAgain) "Remove" else "Unpair")
+                    Text(if (state is LinkState.PairAgain) "Remove" else "Unlink")
                 }
             },
             dismissButton = { TextButton(onClick = { confirmUnpair = false }) { Text("Cancel") } },

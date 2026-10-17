@@ -32,6 +32,8 @@ class MediaSender(
     private val log: KinLog = KinLog.None,
     private val newId: () -> String = MessageIds::newId,
     val stats: MediaStats = MediaStats(),
+    /** The peer says it is paused (2B.4, design 3.5): an automatic push goes nowhere meanwhile (counted as `paused`). This device's own pause is `setOwnShare(false)`. */
+    private val peerPaused: () -> Boolean = { false },
 ) {
     private class Latest(val snapshot: MediaSnapshot, val images: Map<String, MediaImageData>)
 
@@ -93,6 +95,10 @@ class MediaSender(
             stats.drop(MediaStats.OFFLINE)
             return null
         }
+        if (kind != PushKind.CLEAR && peerPaused()) {
+            stats.drop(MediaStats.PAUSED)
+            return null
+        }
         if (!MediaGate.mayPush(kind, ownShare, c.peerUnderstandsMedia, mutablePeerStatus.value, justTurnedOff)) {
             stats.drop(if (!ownShare && !justTurnedOff) MediaStats.SHARE_OFF else MediaStats.PEER_OFF)
             return null
@@ -104,6 +110,13 @@ class MediaSender(
     fun isOpen(): Boolean = synchronized(lock) {
         val c = usable() ?: return false
         MediaGate.mayPush(PushKind.STATE, ownShare, c.peerUnderstandsMedia, mutablePeerStatus.value)
+    }
+
+    /** The peer's pause ended (it said so, or its end passed): the session that was held for it goes out now. */
+    fun peerPauseEnded() {
+        synchronized(lock) {
+            if (!peerPaused()) resendLatest()
+        }
     }
 
     /** Whether the connection is ready and the peer lists `media` (the status can go). */

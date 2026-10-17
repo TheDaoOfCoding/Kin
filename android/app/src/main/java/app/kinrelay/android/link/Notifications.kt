@@ -26,6 +26,7 @@ import app.kinrelay.android.notify.NotificationChannels
 import app.kinrelay.android.notify.NotificationLedger
 import app.kinrelay.android.notify.TextArrivals
 import app.kinrelay.android.notify.TrailingThrottle
+import app.kinrelay.android.pause.PauseReceiver
 import app.kinrelay.android.transfer.TransferActionReceiver
 
 /**
@@ -37,7 +38,11 @@ import app.kinrelay.android.transfer.TransferActionReceiver
  * Send problems keep at most [MAX_PROBLEMS] notifications ([NotificationLedger]), each under its own ID, on the arrivals channel (default
  * importance), because a "not sent" notice that makes no sound is a notice nobody sees.
  */
-class Notifications(context: Context) : Alerts {
+class Notifications(
+    context: Context,
+    /** This phone is paused (2B.4): the persistent notification's second action says "Resume" instead of "Pause 1 h". */
+    private val paused: () -> Boolean = { false },
+) : Alerts {
     private val context = context.applicationContext
     private val manager = this.context.getSystemService(NotificationManager::class.java)
     private val main = Handler(Looper.getMainLooper())
@@ -68,7 +73,14 @@ class Notifications(context: Context) : Alerts {
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setContentIntent(openApp())
             .addAction(R.drawable.ic_stat_kin, "Send clipboard", sendClipboard())
+            // The second (and last) action (2B.4): pause for an hour, or resume while paused.
+            .addAction(R.drawable.ic_stat_kin, if (paused()) "Resume" else "Pause 1 h", togglePause())
             .build()
+
+    private fun togglePause(): PendingIntent = PendingIntent.getBroadcast(
+        context, 4, Intent(context, PauseReceiver::class.java).setAction(PauseReceiver.ACTION_TOGGLE),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+    )
 
     fun updateLink(text: String) {
         if (canPost()) manager.notify(LINK_ID, link(text))

@@ -218,6 +218,8 @@ fun KinRoot(
                     onUnpair = { graph.link.unpair(context) },
                     mirrorCard = { MirrorSettingsCard(graph, context, permissions, onOpenSetup = { screen = MIRROR_SETUP }, onOpenApps = { screen = MIRROR_APPS }) },
                     mediaCard = { MediaSettingsCard(graph, context, permissions) },
+                    presenceCard = { PresenceSettingsCard(graph, context) },
+                    shotsCard = { ShotsSettingsCard(graph, context, permissions) },
                 )
                 else -> HomeScreen(
                     pc = pc,
@@ -236,6 +238,9 @@ fun KinRoot(
                     onOpenItem = ::open, onRetryItem = { graph.retryItem(it) }, onCancelItem = { graph.cancelItem(it) },
                     mirrorCard = { MirrorHomeCard(graph, permissions, onOpenSetup = { screen = MIRROR_SETUP }) },
                     mediaCard = { MediaHomeCard(graph, permissions) },
+                    statusLine = { PcStatusLine(graph, context) },
+                    pauseCard = { PauseCard(graph, context) },
+                    shotsCard = { ShotsHomeCard(graph, context, permissions) },
                 )
             }
         }

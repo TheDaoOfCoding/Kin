@@ -28,6 +28,19 @@ object DebugHooks {
      */
     fun refuseNewNames(context: android.content.Context): Boolean = java.io.File(context.filesDir, "debug-refuse-names").exists()
 
+    /**
+     * `RING_SILENT` (2B.4 design 5.4): with the file `files/debug-ring-silent` present a ring starts no `MediaPlayer` and no `Vibrator`, **and does not touch the `STREAM_ALARM` volume** (so a test
+     * on a phone or a windowed emulator is never audible). The state machine, the notification and the messages are the real ones. `RING_SET --ez silent true|false` makes the file.
+     */
+    fun ringSilent(context: android.content.Context): Boolean = java.io.File(context.filesDir, "debug-ring-silent").exists()
+
+    /**
+     * `SHOTS_INSERT --ei ageSec N` (2B.4): MediaProvider sets `DATE_ADDED` itself, so an "old" screenshot is made by moving the picker's clock forward by N seconds for a moment (the file
+     * `files/debug-shots-offset`, removed by the command a few seconds later).
+     */
+    fun shotsClockOffsetSeconds(context: android.content.Context): Long =
+        java.io.File(context.filesDir, "debug-shots-offset").takeIf { it.exists() }?.readText()?.trim()?.toLongOrNull() ?: 0L
+
     /** The debug-only "Mirror test" section of the Debug screen (design 4.14): buttons that post test notifications from Kin itself. */
     @androidx.compose.runtime.Composable
     fun MirrorTest(graph: AppGraph, context: android.content.Context) = app.kinrelay.android.debug.MirrorTestSection(graph, context)

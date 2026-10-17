@@ -4,6 +4,7 @@ import app.kinrelay.android.log.KinLog
 import app.kinrelay.android.media.MediaMsg
 import app.kinrelay.android.notifmirror.NotifWire
 import app.kinrelay.android.pairing.PairingAddress
+import app.kinrelay.android.presence.PresenceSnapshot
 import app.kinrelay.android.protocol.CloseAction
 import app.kinrelay.android.protocol.CloseRules
 import app.kinrelay.android.protocol.Frames
@@ -78,6 +79,18 @@ interface LinkHost {
 
     /** A `media.*` message was dropped silently (counted): [notListed] when a side's `hello` doesn't list `media`, else an image that failed its checks. */
     fun onMediaDropped(notListed: Boolean) = Unit
+
+    /** A valid `presence` from the PC (2B.4; ephemeral: no ack). Called from the socket's thread in arrival order: don't block. */
+    fun onPresence(snapshot: PresenceSnapshot) = Unit
+
+    /** A `presence` was dropped silently (counted): a side's `hello` doesn't list `presence`. */
+    fun onPresenceDropped() = Unit
+
+    /** A valid, new `ring.start` (2B.4): call [reply] once with the answer frame. */
+    suspend fun onRingStart(id: String, reply: (String) -> Unit) = reply(Frames.error("disabled", "Ringing isn't available.", id))
+
+    /** A valid, new `ring.stop`: [reply] is always an `ack`. */
+    suspend fun onRingStop(id: String, reply: (String) -> Unit) = reply(Frames.ack(id))
 }
 
 /**
@@ -191,6 +204,14 @@ class LinkLoop(
                 override fun onMedia(message: MediaMsg) = host.onMedia(message)
 
                 override fun onMediaDropped(notListed: Boolean) = host.onMediaDropped(notListed)
+
+                override fun onPresence(snapshot: PresenceSnapshot) = host.onPresence(snapshot)
+
+                override fun onPresenceDropped() = host.onPresenceDropped()
+
+                override suspend fun onRingStart(id: String, reply: (String) -> Unit) = host.onRingStart(id, reply)
+
+                override suspend fun onRingStop(id: String, reply: (String) -> Unit) = host.onRingStop(id, reply)
 
                 override fun onPingReceived(fromName: String) = host.onPingReceived(fromName)
 

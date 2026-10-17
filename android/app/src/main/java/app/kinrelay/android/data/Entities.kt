@@ -90,6 +90,11 @@ data class TransferEntity(
      */
     val owed: String? = null,
     val owedId: String? = null,
+    /**
+     * Uploads (2B.4): `screenshot` or `camera` for an image the phone sent by itself (auto-send), null for everything the user sent. It goes in `POST /v1/transfers` as `origin` (on resumes too: the PC
+     * keeps the first value), so the PC words its toast and keeps a screenshot out of its clipboard history. An auto-sent image is never queued.
+     */
+    val origin: String? = null,
 )
 
 /**

@@ -49,9 +49,11 @@ class TransferHttp(private val endpoint: HttpEndpoint) {
         HttpUrl.Builder().scheme("https").host(endpoint.address.host).port(endpoint.address.port)
 
     /** `POST /v1/transfers`: every file's offset, by file ID. */
-    suspend fun createTransfer(id: String, files: List<UploadFileSpec>): ApiResult<Map<String, Long>> {
+    suspend fun createTransfer(id: String, files: List<UploadFileSpec>, origin: String? = null): ApiResult<Map<String, Long>> {
         val json = buildJsonObject {
             put("id", id)
+            // 2B.4: `screenshot` or `camera` for an image the phone sent by itself; an old PC ignores the unknown field. Left out for everything else.
+            if (origin != null) put("origin", origin)
             put("files", JsonArray(files.map { f ->
                 buildJsonObject { put("fileId", f.fileId); put("name", f.name); put("size", f.size); put("mime", f.mime) }
             }))

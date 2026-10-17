@@ -6,6 +6,8 @@ import app.kinrelay.android.media.MediaMsg
 import app.kinrelay.android.notifmirror.MirrorLink
 import app.kinrelay.android.notifmirror.NotifWire
 import app.kinrelay.android.pairing.PairingAddress
+import app.kinrelay.android.presence.PresenceLink
+import app.kinrelay.android.presence.PresenceSnapshot
 import app.kinrelay.android.protocol.Action
 import app.kinrelay.android.protocol.CloseRules
 import app.kinrelay.android.protocol.DedupMemory
@@ -62,8 +64,17 @@ sealed interface AckResult {
 class HttpEndpoint(val client: OkHttpClient, val address: PairingAddress)
 
 /** One connection to the PC, as the reconnect loop and the UI see it. */
-interface LinkConnection : MirrorLink, MediaLink {
+interface LinkConnection : MirrorLink, MediaLink, PresenceLink {
     override val isReady: Boolean
+
+    /** The PC's latest accepted `hello` on this connection lists `presence` (2B.4): `presence` may go to it. Checked per message by [app.kinrelay.android.presence.PresenceSender]. */
+    override val peerListsPresence: Boolean get() = false
+
+    /**
+     * Tells the PC the phone's capabilities changed (2B.4: `ring` is listed only while "Let my PC ring this phone" is on): a new `hello` goes on the open connection and the receiver's own
+     * list changes with it (protocol.md allows a later `hello`). A connection that is not ready ignores it (the next `hello` carries the new list).
+     */
+    fun updateCapabilities(capabilities: List<String>) = Unit
 
     /** The PC's latest accepted `hello` on this connection lists `media` (2B.3): `media.*` messages may go to it. Checked per message by [app.kinrelay.android.media.MediaSender]. */
     override val peerUnderstandsMedia: Boolean get() = false
@@ -149,6 +160,21 @@ interface SessionListener {
     /** A `media.*` message was dropped silently (a side's `hello` didn't list `media`, or an image that failed its checks): counted by the app. */
     fun onMediaDropped(notListed: Boolean) = Unit
 
+    /** A valid `presence` from the PC (2B.4). Ephemeral: no ack. It replaces the PC's previous snapshot on this connection. Called in arrival order from the socket's thread: don't block. */
+    fun onPresence(snapshot: PresenceSnapshot) = Unit
+
+    /** A `presence` was dropped silently (a side's `hello` didn't list `presence`): counted by the app. */
+    fun onPresenceDropped() = Unit
+
+    /**
+     * A valid, new `ring.start` (2B.4): start ringing (or restart the 30 s) and call [reply] **once** with the frame to answer with (`ack`, or an `error` with the request's `ref`); the
+     * session sends it and remembers it for the de-duplication. A `ring.status` follows after the `ack`. Runs on a coroutine of the session's scope.
+     */
+    suspend fun onRingStart(id: String, reply: (String) -> Unit) = reply(Frames.error("disabled", "Ringing isn't available.", id))
+
+    /** A valid, new `ring.stop`: stop ringing; [reply] is always an `ack`. */
+    suspend fun onRingStop(id: String, reply: (String) -> Unit) = reply(Frames.ack(id))
+
     /**
      * A valid, new `offer`, before it is acked: null accepts it, an error code (`disk_full`) answers with an `error` instead of the
      * ack. Runs on the socket's thread: keep it cheap.
@@ -172,7 +198,7 @@ interface SessionListener {
 }
 
 /** The phone's own name, sent in its `hello`. */
-data class LocalHello(val name: String, val platform: String, val appVersion: String)
+data class LocalHello(val name: String, val platform: String, val appVersion: String, val capabilities: List<String> = Frames.LOCAL_CAPABILITIES)
 
 /**
  * One WebSocket to the PC at `/v1/ws`: `hello` exchange, the validation rules of
@@ -194,7 +220,9 @@ class LinkSession(
     private val reachable: suspend (PairingAddress, Long) -> Boolean = { _, _ -> true },
 ) : LinkConnection {
     // A `notif.action` is answered after the action fired, not by the receiver (`notifAction` returns null: "later", see the NotifAction branch of [handle]).
-    private val receiver = MessageReceiver(dedup, ReceiverRole.PHONE, listener::acceptOffer, listener::offerHistory, notifAction = { null })
+    // A `ring.start` / `ring.stop` is answered the same way, after the ring started or stopped (`ringAnswer` returns null: see [answerRing]).
+    private val receiver = MessageReceiver(dedup, ReceiverRole.PHONE, listener::acceptOffer, listener::offerHistory, notifAction = { null }, ringAnswer = { _, _ -> null })
+        .also { it.ownCapabilities = local.capabilities.toSet() }
     private val ended = CompletableDeferred<SessionEnd>()
     private val pending = ConcurrentHashMap<String, CompletableDeferred<Action>>()
     private val actionsInProgress: MutableSet<String> = ConcurrentHashMap.newKeySet()
@@ -215,6 +243,15 @@ class LinkSession(
     override val peerUnderstandsNotif: Boolean get() = receiver.peer?.understandsNotif == true
 
     override val peerUnderstandsMedia: Boolean get() = receiver.peer?.understandsMedia == true
+
+    override val peerListsPresence: Boolean get() = receiver.peer?.understandsPresence == true
+
+    override fun updateCapabilities(capabilities: List<String>) {
+        // Nothing changed (the switch's first value after a connection that already said it): no new `hello`.
+        if (receiver.ownCapabilities == capabilities.toSet()) return
+        receiver.ownCapabilities = capabilities.toSet()
+        if (isReady) send(Frames.hello(MessageIds.newId(), Frames.sanitize(local.name), local.platform, local.appVersion, capabilities))
+    }
 
     override val peerName: String? get() = receiver.peer?.name
 
@@ -367,6 +404,11 @@ class LinkSession(
             Action.NotifIgnored, is Action.NotifReceived -> Unit
             is Action.Media -> listener.onMedia(action.message)
             is Action.MediaDropped -> listener.onMediaDropped(action.notListed)
+            is Action.Presence -> listener.onPresence(action.snapshot)
+            Action.PresenceDropped -> listener.onPresenceDropped()
+            is Action.RingStart -> answerRing(action.id) { reply -> listener.onRingStart(action.id, reply) }
+            is Action.RingStop -> answerRing(action.id) { reply -> listener.onRingStop(action.id, reply) }
+            is Action.RingStatusReceived -> Unit
             is Action.StartDownload -> listener.onOfferReceived(receiver.peer?.name ?: "PC", action.offer)
             is Action.RepeatOffer -> listener.onOfferRepeated(receiver.peer?.name ?: "PC", action.offer)
             is Action.CancelTransfer -> listener.onCancelReceived(action.transferId, action.reason)
@@ -381,11 +423,33 @@ class LinkSession(
         outcome.close?.let { closeOurs(it, "protocol") }
     }
 
+    /**
+     * `ring.start` and `ring.stop`: the answer is the one response of this ID (a repeat gets it again and nothing runs twice). A repeat whose first run is still going has no recorded answer yet: it is
+     * ignored here. The listener calls the `reply` it is given once; it is sent and remembered at that moment, so the `ack` goes out before the `ring.status` that follows it.
+     */
+    private fun answerRing(id: String, run: suspend ((String) -> Unit) -> Unit) {
+        if (!actionsInProgress.add(id)) return
+        scope.launch {
+            try {
+                var answered = false
+                run { frame ->
+                    if (!answered) {
+                        answered = true
+                        receiver.recordAckOnly(id, frame)
+                        send(frame)
+                    }
+                }
+            } finally {
+                actionsInProgress.remove(id)
+            }
+        }
+    }
+
     private inner class SocketListener : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
             openedAt = clock.elapsedMillis()
             log.i("link", "websocket open to $address")
-            send(Frames.hello(MessageIds.newId(), Frames.sanitize(local.name), local.platform, local.appVersion))
+            send(Frames.hello(MessageIds.newId(), Frames.sanitize(local.name), local.platform, local.appVersion, local.capabilities))
             helloTimeout = scope.launch {
                 delay(helloTimeoutMillis + 1)
                 CloseRules.helloTimeoutClose(receiver.helloAccepted, clock.elapsedMillis() - openedAt, helloTimeoutMillis)?.let {

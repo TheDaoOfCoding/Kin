@@ -13,6 +13,9 @@ object NotificationChannels {
     const val ARRIVALS = "arrivals"
     const val TRANSFERS = "transfers"
 
+    /** "Ring my phone" (2B.4): the Stop notification. High importance, but **no sound and no vibration of its own**: the ring player does both (on the alarm stream). Created once. */
+    const val RING = "kin_ring"
+
     private val OBSOLETE = listOf("pings", "text", "problems", "transfer_results")
 
     fun ensure(context: Context) {
@@ -31,8 +34,17 @@ object NotificationChannels {
         )
         manager.createNotificationChannel(
             NotificationChannel(TRANSFERS, "File transfers", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "Progress of files going to or coming from your PC, and whether what you sent arrived"
+                description = "Progress of files going to or coming from your PC, whether what you sent arrived, and the 5-second hold of a screenshot Kin sends by itself"
                 setShowBadge(false)
+            }
+        )
+        manager.createNotificationChannel(
+            NotificationChannel(RING, "Ring my phone", NotificationManager.IMPORTANCE_HIGH).apply {
+                description = "The Stop button while your PC rings this phone. The ring itself plays on the alarm volume."
+                setSound(null, null)
+                enableVibration(false)
+                setShowBadge(false)
+                lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
             }
         )
     }

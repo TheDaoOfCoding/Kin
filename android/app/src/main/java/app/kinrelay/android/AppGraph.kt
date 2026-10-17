@@ -7,6 +7,7 @@ import android.provider.Settings
 import android.webkit.MimeTypeMap
 import app.kinrelay.android.clipboard.ClipboardGuard
 import app.kinrelay.android.data.DeviceEntity
+import app.kinrelay.android.data.Durable
 import app.kinrelay.android.data.KinDatabase
 import app.kinrelay.android.data.KinSettings
 import app.kinrelay.android.data.SeenMessageEntity
@@ -34,7 +35,18 @@ import app.kinrelay.android.link.TextFileSender
 import app.kinrelay.android.log.FileLog
 import app.kinrelay.android.log.LogFingerprint
 import app.kinrelay.android.log.LogKeyStore
+import app.kinrelay.android.features.FeatureIds
+import app.kinrelay.android.features.FeatureOverrideStore
+import app.kinrelay.android.features.Features
 import app.kinrelay.android.notifmirror.MirrorController
+import app.kinrelay.android.pause.PauseController
+import app.kinrelay.android.pause.PauseStore
+import app.kinrelay.android.presence.CoroutineTimers
+import app.kinrelay.android.presence.PresenceHub
+import app.kinrelay.android.presence.PresenceStore
+import app.kinrelay.android.ring.RingController
+import app.kinrelay.android.shots.ShotController
+import app.kinrelay.android.shots.ShotsStore
 import app.kinrelay.android.pairing.DeviceInfo
 import app.kinrelay.android.pairing.PairingController
 import app.kinrelay.android.protocol.DedupMemory
@@ -58,6 +70,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import java.io.File
 
@@ -87,8 +101,45 @@ class AppGraph(private val context: Context) {
     val pairing = PairingController(this)
     val link = LinkController(this)
 
+    /** This device's Pause (2B.4): one persisted state, a master gate read at each entry of an automatic feature. Wall-clock, nothing to start or stop. */
+    val pause: PauseController by lazy { PauseController(PauseStore(appContext), CoroutineTimers(scope), log) }
+
+    val presenceStore: PresenceStore by lazy { PresenceStore(appContext) }
+
+    val shotsStore: ShotsStore by lazy { ShotsStore(appContext) }
+
+    /**
+     * The per-feature settings resolver (2B.4, design section 4): each feature's default (today's flat key) and an optional override per peer device. Every new switch (presence, ring, screenshots) is
+     * read only through this.
+     */
+    val features: Features by lazy {
+        Features(FeatureOverrideStore(appContext)) { id ->
+            when (id) {
+                FeatureIds.PRESENCE_SHARE -> presenceStore.share
+                FeatureIds.PRESENCE_SHOW -> presenceStore.show
+                FeatureIds.RING_ALLOW -> presenceStore.ringAllow
+                FeatureIds.SHOTS_SCREENSHOTS -> shotsStore.screenshots
+                FeatureIds.SHOTS_CAMERA -> shotsStore.camera
+                FeatureIds.NOTIF_SHARE -> mirror.store.policy.map { it.enabled }
+                FeatureIds.MEDIA_SHARE -> media.store.policy.map { it.share }
+                FeatureIds.MEDIA_SHOW -> media.store.policy.map { it.show }
+                FeatureIds.TEXT_AUTO_COPY -> settings.stats.map { it.copyReceivedTextAutomatically }
+                else -> flowOf(false)
+            }
+        }
+    }
+
+    /** Battery and pause, both ways (2B.4). Reacts only; starts nothing by itself. */
+    val presence: PresenceHub by lazy { PresenceHub(this) }
+
+    /** Ring my phone (2B.4). Lives in the process the link service holds; starts nothing by itself. */
+    val ring: RingController by lazy { RingController(this) }
+
+    /** Auto-send screenshots and camera photos (2B.4), opt-in. Registers an observer only while it can send; no polling. */
+    val shots: ShotController by lazy { ShotController(this) }
+
     /** Notifications and toasts; also the [app.kinrelay.android.link.Alerts] the sender and the receiver use. */
-    val notifications: Notifications by lazy { Notifications(appContext) }
+    val notifications: Notifications by lazy { Notifications(appContext, paused = { pause.pausedIfLoaded() }) }
 
     /** Notification mirroring, phone to PC (2B.2): the user's choices, the sender and the listener's engine. Reacts only; starts nothing by itself. */
     val mirror: MirrorController by lazy { MirrorController(this) }
@@ -108,7 +159,7 @@ class AppGraph(private val context: Context) {
             link = link,
             sources = sources,
             sink = MediaStoreSink(appContext),
-            notifier = TransferNotifications(appContext),
+            notifier = TransferNotifications(appContext, quiet = { pause.paused() }, onQuiet = { pause.noteQuietArrival() }),
             wake = wake,
             log = log,
             newId = MessageIds::newId,
@@ -193,10 +244,20 @@ class AppGraph(private val context: Context) {
     /** The name sent in `hello`: the one the user chose in Settings, or the system's. */
     suspend fun deviceName(): String = settings.deviceName() ?: deviceInfo.name
 
-    /** A PC is gone (unpaired from either side, or replaced): what is unfinished with it ends, and nothing queued for it can go to another PC. */
+    /**
+     * A PC is gone (unpaired from either side, or replaced): what is unfinished with it ends, and nothing queued for it can go to another PC. Since 2B.4 it also forgets everything that was
+     * about that PC (design 5.7): the removal is **durable** first (a power cut can't bring it back), then the transfers end, the feature overrides of the peer are deleted, the pause is cleared
+     * (it was the last peer), the screenshot baseline and holds go, and a ring in progress stops with the alarm volume put back.
+     */
     suspend fun peerGone(deviceId: String) {
+        Durable.flush(database, log)
         transfers.onUnpaired(deviceId)
         textOutbox.onUnpaired(deviceId)
+        runCatching { features.forgetPeer(deviceId) }
+        runCatching { pause.onLastPeerUnlinked() }
+        runCatching { shots.onUnlink() }
+        runCatching { ring.onUnlink() }
+        presence.onClosed()
     }
 
     private val dedupLoad = CompletableDeferred<DedupMemory>()
@@ -232,6 +293,13 @@ class AppGraph(private val context: Context) {
         mirror.start()
         // Follows the user's media choices and the link, and takes the PC's media messages in order (it starts nothing else by itself).
         media.start()
+        // 2B.4: the stored pause is read first (a gate asked in the first milliseconds waits for it), then battery and pause to the PC, ring, and screenshots follow their switches and the link.
+        scope.launch(Dispatchers.IO) { runCatching { pause.load() } }
+        presence.start()
+        ring.start()
+        // A crash in the middle of a ring must not leave the alarm volume at maximum, with or without a paired PC (the service start does the same, but only with one): put it back now.
+        scope.launch(Dispatchers.IO) { runCatching { ring.restoreAtStart() } }
+        shots.start()
         // The paired PC shows up in the share sheet's top row (the direct-share shortcut) and goes away when it is unpaired.
         scope.launch {
             database.devices().observeAll().collect { ShareShortcuts.sync(appContext, it.firstOrNull(), log) }

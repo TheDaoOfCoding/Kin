@@ -20,6 +20,14 @@ object DebugHooks {
     @Suppress("UNUSED_PARAMETER")
     fun MirrorTest(graph: AppGraph, context: android.content.Context) = Unit
 
+    /** Always false: a ring always plays the real alarm and touches the real alarm volume. */
+    @Suppress("UNUSED_PARAMETER")
+    fun ringSilent(context: android.content.Context): Boolean = false
+
+    /** Always 0: the screenshot picker judges "taken a moment ago" by the real clock. */
+    @Suppress("UNUSED_PARAMETER")
+    fun shotsClockOffsetSeconds(context: android.content.Context): Long = 0L
+
     /** Always the phone's real maker. */
     @Suppress("UNUSED_PARAMETER")
     fun manufacturer(context: android.content.Context): String = android.os.Build.MANUFACTURER

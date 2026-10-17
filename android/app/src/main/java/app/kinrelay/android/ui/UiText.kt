@@ -17,6 +17,14 @@ object UiText {
         LinkState.PermissionNeeded -> "Nearby devices permission needed"
     }
 
+    /**
+     * The confirmation of "Unlink" (2B.4), under the title "Unlink from <PC>?": what happens, in the same words on Home and in Settings. [pcName] is told if connected (the PC removes the phone
+     * at once); if it is away it finds out the next time it connects.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    fun unlinkText(pcName: String): String =
+        "This phone and the PC stop working together right away: no sending, notifications or ringing. Your history stays on this phone. You can pair again with a new code."
+
     /** Why a send found no connection, for the "PC not reachable" notification. */
     fun unreachable(state: LinkState): String = when (state) {
         LinkState.NotOnWifi -> "This phone isn't on Wi-Fi."

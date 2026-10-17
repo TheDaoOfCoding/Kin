@@ -32,7 +32,15 @@ object Permissions {
         localNetworkExists = Build.VERSION.SDK_INT >= ANDROID_17,
         batteryUnrestricted = app.kinrelay.android.setup.SetupActions.batteryOptimisationIgnored(context),
         notificationAccess = notificationAccessGranted(context),
+        photos = photosGranted(context),
     )
+
+    /**
+     * Android lets Kin read **all** photos (2B.4 auto-send): `READ_MEDIA_IMAGES` on Android 13+, `READ_EXTERNAL_STORAGE` on 10 to 12. Read each time, **never stored**: on Android 14+ "Select photos" gives
+     * a grant for one session only, which does not work for a background watcher, so the answer must be the system's at the moment of use. Kin does not declare `READ_MEDIA_VISUAL_USER_SELECTED`.
+     */
+    fun photosGranted(context: Context): Boolean =
+        granted(context, if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES else Manifest.permission.READ_EXTERNAL_STORAGE)
 
     /** "Notification access" (2B.2): a special access the user gives in the system settings, not a runtime permission. Read again each time the app comes back. */
     fun notificationAccessGranted(context: Context): Boolean = try {
@@ -55,4 +63,6 @@ data class PermissionSnapshot(
     val batteryUnrestricted: Boolean = false,
     /** The user gave Kin notification access (2B.2 mirroring). */
     val notificationAccess: Boolean = false,
+    /** Android lets Kin read all photos right now (2B.4 auto-send). Never stored. */
+    val photos: Boolean = false,
 )

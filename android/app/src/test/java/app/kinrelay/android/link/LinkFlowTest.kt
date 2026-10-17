@@ -281,7 +281,9 @@ class LinkFlowTest {
 
     @Test
     fun theAppSaysItUnderstandsLinksInItsHello() {
-        assertTrue(app.kinrelay.android.protocol.Frames.hello("h", "Pixel", "android", "0.1.1").contains("\"capabilities\":[\"link\",\"notif\",\"media\"]"))
+        assertTrue(app.kinrelay.android.protocol.Frames.hello("h", "Pixel", "android", "0.1.1").contains("\"capabilities\":[\"link\",\"notif\",\"media\",\"presence\"]"))
+        // `ring` is listed only while "Let my PC ring this phone" is on (2B.4).
+        assertTrue(app.kinrelay.android.protocol.Frames.hello("h", "Pixel", "android", "0.1.1", app.kinrelay.android.protocol.Frames.withRing(true)).contains("\"media\",\"presence\",\"ring\"]"))
         assertEquals(1, PROTOCOL_VERSION)
     }
 }

@@ -27,7 +27,16 @@ import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 
 /** A file the user shared: a content URI and what the share said about it. */
-data class ShareSource(val uri: String, val nameHint: String? = null, val mimeHint: String? = null)
+data class ShareSource(
+    val uri: String,
+    val nameHint: String? = null,
+    val mimeHint: String? = null,
+    /**
+     * An auto-sent image (2B.4) is stored, and sent, under a generic name that is this text plus the file's extension ("Screenshot 2026-10-17 14.32.05.png"), never its real name (the real name of a
+     * screenshot says which app it came from: design 5.8).
+     */
+    val genericStem: String? = null,
+)
 
 /**
  * Owns the transfers: it creates them (a share, a `.txt` for long text, an `offer`), runs them one at a time per direction on the
@@ -63,7 +72,7 @@ class TransferEngine(
      * Creates an upload for [sources] and starts it. Returns the transfer ID, or null when nothing could be sent (no paired PC,
      * no readable file, too many files). The user is told in the null cases.
      */
-    suspend fun enqueueUpload(sources: List<ShareSource>): String? {
+    suspend fun enqueueUpload(sources: List<ShareSource>, origin: String? = null): String? {
         val peer = d.link.peer() ?: run {
             d.notifier.message("Pair a PC first.")
             return null
@@ -91,15 +100,16 @@ class TransferEngine(
                 d.log.w("transfer", "share: a file can't be read and was skipped (${source.uri.substringBefore(':')})")
                 continue
             }
-            val name = (info.displayName ?: source.nameHint)?.takeIf { it.isNotBlank() } ?: fallbackName(source.uri)
+            val realName = (info.displayName ?: source.nameHint)?.takeIf { it.isNotBlank() }
             val mime = (info.mime ?: source.mimeHint)?.takeIf { it.isNotBlank() && !it.contains('*') } ?: MediaKinds.DEFAULT_MIME
+            val name = source.genericStem?.let { it + genericExtension(realName, mime) } ?: realName ?: fallbackName(source.uri)
             files += TransferFileEntity(id, fileId, files.size, name, null, mime, info.size, 0, uri, info.modifiedMillis, finished = false)
         }
         if (files.isEmpty()) {
             d.notifier.message("Kin couldn't read what you shared.")
             return null
         }
-        createUpload(id, peer, files)
+        createUpload(id, peer, files, origin)
         return id
     }
 
@@ -118,10 +128,10 @@ class TransferEngine(
     }
 
     /** Stored as `queued` first, then tried at once. With no connection it stays queued and goes out when the link is up again. */
-    private suspend fun createUpload(id: String, peer: PeerInfo, files: List<TransferFileEntity>) {
+    private suspend fun createUpload(id: String, peer: PeerInfo, files: List<TransferFileEntity>, origin: String? = null) {
         val transfer = TransferEntity(
             id, TransferDirection.UP, peer.deviceId, peer.name, TransferKind.FILE, TransferStatus.QUEUED,
-            d.nowMillis(), null, files.sumOf { it.size }, null, null, completeAcked = false,
+            d.nowMillis(), null, files.sumOf { it.size }, null, null, completeAcked = false, origin = origin,
         )
         d.store.create(transfer, files)
         d.log.i("transfer", "upload $id created: ${files.size} files, ${transfer.totalBytes} bytes")
@@ -130,6 +140,20 @@ class TransferEngine(
     }
 
     private fun fallbackName(uri: String): String = uri.substringBefore('?').substringAfterLast('/').ifBlank { "file" }
+
+    /** The extension (with its dot) of the real name, else one from the MIME type, else none: all that is kept of a real name when a generic one is used. */
+    private fun genericExtension(realName: String?, mime: String): String {
+        val own = realName?.substringAfterLast('.', "")?.takeIf { it.length in 1..5 && it.all { c -> c.isLetterOrDigit() } }
+        val ext = own ?: when (mime.lowercase()) {
+            "image/png" -> "png"
+            "image/jpeg" -> "jpg"
+            "image/webp" -> "webp"
+            "image/gif" -> "gif"
+            "image/heic" -> "heic"
+            else -> null
+        }
+        return if (ext == null) "" else ".${ext.lowercase()}"
+    }
 
     private fun launchUpload(id: String, userRetry: Boolean = false, sourcesJustChecked: Boolean = false) = launch(id, uploadLock) {
         UploadRunner(d, timings, httpFor, onRenamed = { old, new -> rename(old, new) }, userRetry = userRetry, sourcesJustChecked = sourcesJustChecked).run(id)
@@ -375,7 +399,44 @@ class TransferEngine(
 
     /** The queued uploads, oldest first (the queue flush merges them with the queued texts by creation time). */
     suspend fun queuedUploads(): List<TransferEntity> =
-        d.store.unfinished().filter { it.direction == TransferDirection.UP && it.status == TransferStatus.QUEUED }
+        d.store.unfinished().filter { it.direction == TransferDirection.UP && it.status == TransferStatus.QUEUED && it.origin == null }
+
+    /**
+     * Auto-sent images (2B.4) are **never queued and never resumed later**: one that is still unfinished when a connection comes up and that nothing is running (`queued`: the process died between
+     * its creation and the first `POST`, or no connection came; `active`: the connection or the process was lost mid-upload) is ended as "not sent" instead of going out hours later and landing on
+     * the PC clipboard. (The PC drops what it received of it after its 24 hours without progress.)
+     */
+    suspend fun endAutoSentUnfinished() {
+        val now = d.nowMillis()
+        for (transfer in d.store.unfinished()) {
+            if (transfer.direction != TransferDirection.UP || transfer.origin == null) continue
+            if (transfer.status != TransferStatus.QUEUED && transfer.status != TransferStatus.ACTIVE) continue
+            if (jobs[transfer.id]?.isActive == true) continue
+            if (d.store.setStatus(transfer.id, TransferStatus.FAILED, "offline", "Not sent: the PC was away. Screenshots are never queued or resumed.", now)) {
+                d.sources.deleteCache(transfer.localId)
+                d.notifier.clear(transfer.id)
+            }
+        }
+    }
+
+    /**
+     * Auto-send (2B.4): sends [sources] with [origin] and waits for the PC's answer to the first `POST` (up to [waitMillis]). Returns true if the PC took it (the bytes follow on their own coroutine),
+     * false if it didn't answer in time or the transfer could not be made: the transfer is then cancelled, never queued. The caller has checked that a ready connection exists.
+     */
+    suspend fun sendNow(sources: List<ShareSource>, origin: String, waitMillis: Long): Boolean {
+        val id = enqueueUpload(sources, origin) ?: return false
+        val deadline = System.nanoTime() + waitMillis * 1_000_000
+        while (true) {
+            val transfer = d.store.transfer(id)
+            if (transfer == null) return false
+            if (transfer.started || transfer.status == TransferStatus.DONE) return true
+            if (TransferStatus.isFinished(transfer.status)) return false
+            if (System.nanoTime() >= deadline) break
+            delay(START_POLL_MILLIS)
+        }
+        cancel(id)
+        return false
+    }
 
     /** The queue flush starts a queued upload. Automatic: a `404` to its `POST` fails it, it never goes out under a new ID. */
     fun startQueuedUpload(id: String) = launchUpload(id)
@@ -416,6 +477,7 @@ class TransferEngine(
      */
     suspend fun onLinkReady(fromPeerDeviceId: String, connection: LinkConnection? = null) {
         dropTransfersOfOtherPcs()
+        endAutoSentUnfinished()
         val link = connection ?: d.link.connection(0, false, fromPeerDeviceId)
         if (link != null && link.peerDeviceId == fromPeerDeviceId) owedMessages.resendAll(link)
         for (transfer in d.store.unfinished()) {
@@ -563,6 +625,7 @@ class TransferEngine(
         private const val RESERVATION_MILLIS = 60_000L
 
         private const val DELETE_ATTEMPTS = 3
+        private const val START_POLL_MILLIS = 150L
 
         /** The name of the `.txt` file a long text becomes, without characters a name can't have. */
         fun textFileName(nowMillis: Long): String {

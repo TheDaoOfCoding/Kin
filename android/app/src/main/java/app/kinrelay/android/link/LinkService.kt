@@ -6,12 +6,19 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.Uri
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import app.kinrelay.android.data.KinSettings
 import app.kinrelay.android.graph
+import app.kinrelay.android.notify.TrailingThrottle
+import app.kinrelay.android.pause.PauseSupport
+import app.kinrelay.android.presence.PeerPauseText
+import app.kinrelay.android.presence.PresenceText
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -26,6 +33,7 @@ import kotlinx.coroutines.withContext
  */
 class LinkService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var runtime: LinkRuntime? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -61,13 +69,51 @@ class LinkService : Service() {
                 stopSelf()
                 return@launch
             }
+            // A crash in the middle of a ring must not leave the alarm volume at maximum: put it back before anything else (2B.4, design 5.4).
+            graph.ring.restoreAtStart()
             val linkRuntime = LinkRuntime(this@LinkService, graph, scope, notifications, onStopRequested = { stopSelf() })
             runtime = linkRuntime
             graph.link.runtime = linkRuntime
             linkRuntime.start()
-            combine(linkRuntime.state, graph.database.devices().observeAll()) { state, devices ->
-                describe(state, devices.firstOrNull()?.name ?: device.name)
-            }.collect { notifications.updateLink(it) }
+            graph.shots.reevaluate()
+            // The persistent notification (2B.4): what the PC says about itself (its pause, a laptop's battery) and this phone's own pause. A **battery-only** change is posted at most once
+            // per 30 s (the trailing throttle); a change of state or of a pause is posted at once.
+            var latest = ""
+            var lastFull: String? = null
+            var lastStructural: String? = null
+            val throttle = TrailingThrottle(
+                intervalMillis = BATTERY_NOTIFICATION_MILLIS,
+                now = { SystemClock.elapsedRealtime() },
+                schedule = { delay, task -> mainHandler.postDelayed(task, delay) },
+                action = { notifications.updateLink(latest) },
+            )
+            combine(linkRuntime.state, graph.database.devices().observeAll(), graph.presence.view, graph.pause.view) { state, devices, peer, _ ->
+                // What the pause view says is "look again"; the notification shows the wall clock now (a pause that ended during deep sleep is not shown as running).
+                val pause = graph.pause.viewNow()
+                val base = describe(state, devices.firstOrNull()?.name ?: device.name)
+                val connected = state is LinkState.Connected
+                val peerPause = if (connected && peer.peerPaused) {
+                    PeerPauseText(peer.peerPausedUntilResumed, peer.peerPausedUntilWall?.let { PauseSupport.time(this@LinkService, it) })
+                } else {
+                    null
+                }
+                val own = if (pause.paused) " · Paused " + PauseSupport.sentence(this@LinkService, pause.state).replaceFirstChar { it.lowercase() } else ""
+                val battery = if (connected) peer.battery else null
+                Pair(
+                    PresenceText.connected(base, null, peer.showOn, peerPause) + own,
+                    PresenceText.connected(base, battery, peer.showOn, peerPause) + own,
+                )
+            }.collect { (structural, full) ->
+                if (full == lastFull) return@collect
+                lastFull = full
+                latest = full
+                if (structural != lastStructural) {
+                    lastStructural = structural
+                    notifications.updateLink(full)
+                } else {
+                    throttle.request()
+                }
+            }
         }
     }
 
@@ -99,6 +145,9 @@ class LinkService : Service() {
     }
 
     companion object {
+        /** A battery-only change of the PC is shown in the persistent notification at most this often (design 5.2). */
+        private const val BATTERY_NOTIFICATION_MILLIS = 30_000L
+
         /**
          * Starts the service (a visible activity may) and gives it read access to [uris] with `FLAG_GRANT_READ_URI_PERMISSION`.
          * A share only grants access to the activity that receives it; the share activity finishes at once, and a grant held by the

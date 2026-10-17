@@ -36,7 +36,7 @@ import kotlinx.coroutines.launch
 
 /** A setting with a switch, a title and a line that says what each position does. */
 @Composable
-private fun SettingSwitch(title: String, description: String, checked: Boolean, onChecked: (Boolean) -> Unit) {
+internal fun SettingSwitch(title: String, description: String, checked: Boolean, onChecked: (Boolean) -> Unit) {
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
         Column(modifier = Modifier.weight(1f)) {
             Text(title, style = MaterialTheme.typography.bodyLarge)
@@ -71,6 +71,10 @@ fun SettingsScreen(
     mirrorCard: @Composable () -> Unit = {},
     /** "Media" (2B.3): the four switches. */
     mediaCard: @Composable () -> Unit = {},
+    /** "Status, pause and ring" (2B.4). */
+    presenceCard: @Composable () -> Unit = {},
+    /** "Screenshots" (2B.4): auto-send, opt-in. Empty in a build without it. */
+    shotsCard: @Composable () -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
     var name by rememberSaveable(deviceName) { mutableStateOf(deviceName) }
@@ -117,6 +121,10 @@ fun SettingsScreen(
 
         mediaCard()
 
+        presenceCard()
+
+        shotsCard()
+
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Links and text from your PC", style = MaterialTheme.typography.titleMedium)
@@ -154,7 +162,7 @@ fun SettingsScreen(
                 Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Paired PC", style = MaterialTheme.typography.titleMedium)
                     Text(pc.name)
-                    OutlinedButton(onClick = { confirmUnpair = true }, modifier = Modifier.fillMaxWidth()) { Text("Unpair") }
+                    OutlinedButton(onClick = { confirmUnpair = true }, modifier = Modifier.fillMaxWidth()) { Text("Unlink") }
                 }
             }
         }
@@ -173,9 +181,9 @@ fun SettingsScreen(
     if (confirmUnpair && pc != null) {
         AlertDialog(
             onDismissRequest = { confirmUnpair = false },
-            title = { Text("Unpair from ${pc.name}?") },
-            text = { Text("Text, files and the clipboard stop syncing until you pair again. Anything still waiting to be sent to ${pc.name} is dropped. ${pc.name} is told, if it's connected.") },
-            confirmButton = { TextButton(onClick = { confirmUnpair = false; scope.launch { onUnpair() } }) { Text("Unpair") } },
+            title = { Text("Unlink from ${pc.name}?") },
+            text = { Text(UiText.unlinkText(pc.name)) },
+            confirmButton = { TextButton(onClick = { confirmUnpair = false; scope.launch { onUnpair() } }) { Text("Unlink") } },
             dismissButton = { TextButton(onClick = { confirmUnpair = false }) { Text("Cancel") } },
         )
     }

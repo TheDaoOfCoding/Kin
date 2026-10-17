@@ -86,7 +86,7 @@ class MigrationTest {
 
     @Test
     fun theExportedSchemasAreTheVersionsTheDatabaseDeclares() {
-        for (version in 2..5) assertEquals(version, schema(version).getValue("version").jsonPrimitive.content.toInt())
+        for (version in 2..6) assertEquals(version, schema(version).getValue("version").jsonPrimitive.content.toInt())
     }
 
     @Test
@@ -199,6 +199,26 @@ class MigrationTest {
         assertTrue(KinDatabase.MIGRATION_4_5_STATEMENTS.none { it.contains("DROP", ignoreCase = true) })
         assertEquals(4, KinDatabase.MIGRATION_4_5.startVersion)
         assertEquals(5, KinDatabase.MIGRATION_4_5.endVersion)
+    }
+
+    @Test
+    fun migratingV5ToV6AddsTheOriginOfAnUploadAndKeepsEveryRow() {
+        assertEquals(6, schema(6).getValue("version").jsonPrimitive.content.toInt())
+        val old = open("v5.db")
+        createAll(old, schema(5))
+        old.execSQL("INSERT INTO devices VALUES ('pc-device-id', 'Desk PC', 'windows', 1000, 2000, '10.0.2.2:47821')")
+        old.execSQL("INSERT INTO transfers VALUES ('t-up', 'up', 'pc-device-id', 'Desk PC', 'file', 'done', 100, 200, 5000, NULL, NULL, 0, 't-up', NULL, 1, 0, 1, NULL, NULL)")
+
+        runBlocking { KinDatabase.MIGRATION_5_6.migrate(old) }
+
+        assertEquals(listOf("t-up"), query(old, "SELECT id FROM transfers") { it.getText(0) })
+        // Every upload that exists was sent by the user: no origin.
+        assertEquals(listOf("null"), query(old, "SELECT origin FROM transfers") { if (it.isNull(0)) "null" else it.getText(0) })
+        assertEquals(listOf("pc-device-id|Desk PC"), query(old, "SELECT deviceId, name FROM devices") { "${it.getText(0)}|${it.getText(1)}" })
+        assertSameAsFresh(old, 6)
+        assertTrue(KinDatabase.MIGRATION_5_6_STATEMENTS.none { it.contains("DROP", ignoreCase = true) })
+        assertEquals(5, KinDatabase.MIGRATION_5_6.startVersion)
+        assertEquals(6, KinDatabase.MIGRATION_5_6.endVersion)
     }
 
     @Test

@@ -114,6 +114,8 @@ class PairingController(private val graph: AppGraph) {
                     graph.peerGone(it.deviceId)
                 }
                 devices.upsert(DeviceEntity(target.id, name, "windows", now, now, ordered.joinToString(",")))
+                // A new pairing must survive a power cut (design 5.7, R38): the write-ahead log is checkpointed to disk.
+                app.kinrelay.android.data.Durable.flush(graph.database, log)
                 log.i("pairing", "paired with $name (${target.id.take(8)}…) via ${result.address}")
                 mutableState.value = PairingUiState.Idle
                 LinkService.start(context)

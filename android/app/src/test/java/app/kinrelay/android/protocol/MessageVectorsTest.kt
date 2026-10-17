@@ -39,6 +39,8 @@ class MessageVectorsTest {
         "notif-*",
         // 2B.3 (every `media.*` goes both ways, so the phone's own `MediaInbound` is the receiver on both roles)
         "media-*",
+        // 2B.4 (`presence` goes both ways; `ring.start` and `ring.stop` are the phone's, `ring.status` the PC's, which the PC-role receiver stands for here)
+        "presence-*", "ring-*",
     )
     private val invalidScope = listOf(
         "first-message-*", "hello-*", "ack-*", "error-*", "unpair-missing-id", "ping-*", "type-*",
@@ -55,6 +57,8 @@ class MessageVectorsTest {
         "notif-*",
         // 2B.3
         "media-*",
+        // 2B.4
+        "presence-*", "ring-*",
     )
     private val sequenceScope = listOf(
         "second-hello-after-handshake-is-a-normal-message", "invalid-hello-does-not-count-as-accepted",
@@ -83,13 +87,21 @@ class MessageVectorsTest {
         // 2B.3
         "media-is-not-in-the-dedup-memory", "media-status-change-needs-no-new-hello", "media-capability-changes-with-a-new-hello",
         "media-cmd-is-not-resent-after-reconnect", "media-image-before-state", "media-invalid-state-keeps-the-connection-open",
+        // 2B.4
+        "presence-not-sent-without-capability", "presence-dropped-when-feature-off-is-silent", "presence-is-not-acked-or-deduplicated",
+        "presence-snapshot-replaces-pause", "presence-forgotten-on-close", "ring-not-sent-without-capability", "ring-capability-follows-the-switch",
+        "ring-start-is-not-resent-after-reconnect", "ring-start-is-acked-once", "ring-status-is-ephemeral", "ring-disabled-error-is-not-remembered",
     )
 
     /** The invalid-UTF-8 case can only be checked on the PC side: OkHttp never shows the bad bytes. */
     private val skipped = setOf("text-frame-invalid-utf8")
 
     /** The phone is the receiver for `to: phone`; for `to: pc` the receiver stands for the PC, which refuses `clipboard`. */
-    private fun newReceiver(role: String = "phone") = MessageReceiver(DedupMemory({ 0L }), if (role == "phone") ReceiverRole.PHONE else ReceiverRole.PC)
+    private fun newReceiver(role: String = "phone", ringBudgetSpent: Boolean = false) = MessageReceiver(
+        DedupMemory({ 0L }), if (role == "phone") ReceiverRole.PHONE else ReceiverRole.PC,
+        // `ringBudgetSpent` (3 starts in the last 60 s, or the 60 s lock-out): the app's ring machine says `rate_limited` to the start (the receiver just forwards that answer).
+        ringAnswer = { type, id -> if (ringBudgetSpent && type == "ring.start") Frames.error("rate_limited", "Wait a minute, then try again.", id) else Frames.ack(id) },
+    )
 
     /** [peerCapabilities]: what the sender's `hello` lists (`peer` of a 2B.2 case); null sends a `hello` with no `capabilities`, as a 0.1.0 peer does. */
     private fun open(receiver: MessageReceiver, peerCapabilities: List<String>? = null) {
@@ -168,6 +180,27 @@ class MessageVectorsTest {
             val action = outcome.action as? Action.Media ?: error("$name: expected a media action, got ${outcome.action}")
             assertEquals("$name: media", media.jsonObject, mediaExpectation(action.message))
         }
+        // `expect.presence` (2B.4): what the receiver ends up with for a valid `presence` (battery and pause) or `ring.status` (state, reason with `stopped`, audible with `ringing`).
+        expect["presence"]?.let { presence ->
+            val got: JsonObject = when (val action = outcome.action) {
+                is Action.Presence -> buildJsonObject {
+                    action.snapshot.battery?.let { b ->
+                        put("battery", buildJsonObject { put("level", b.level); put("charging", b.charging); b.saver?.let { put("saver", it) } })
+                    }
+                    when (val p = action.snapshot.pause) {
+                        is app.kinrelay.android.presence.WirePause.Remaining -> put("pause", buildJsonObject { put("remainingMs", p.millis) })
+                        app.kinrelay.android.presence.WirePause.UntilResumed -> put("pause", buildJsonObject { put("untilResumed", true) })
+                        null -> Unit
+                    }
+                }
+                is Action.RingStatusReceived -> buildJsonObject {
+                    put("state", action.state)
+                    if (action.state == "stopped") action.reason?.let { put("reason", it) } else put("audible", action.audible)
+                }
+                else -> error("$name: expected a presence action, got ${outcome.action}")
+            }
+            assertEquals("$name: presence", presence.jsonObject, got)
+        }
         // `expect.sensitive` says how the receiver treats a delivered text (absent means false).
         (outcome.action as? Action.DeliverText)?.let {
             assertEquals("$name: sensitive", expect["sensitive"]?.jsonPrimitive?.boolean ?: false, it.sensitive)
@@ -225,7 +258,7 @@ class MessageVectorsTest {
         for (case in vectors.cases(section)) {
             val name = case.getValue("name").str()
             if (!Vectors.inScope(name, scope) || name in skipped) continue
-            val receiver = newReceiver(case.getValue("to").str())
+            val receiver = newReceiver(case.getValue("to").str(), ringBudgetSpent = case["ringBudgetSpent"]?.jsonPrimitive?.boolean == true)
             // 2B.2 cases say what the receiver's own `hello` and the sender's list (`own`, `peer`).
             case["own"]?.let { own -> receiver.ownCapabilities = own.jsonArray.map { it.str() }.toSet() }
             if (case.getValue("state").str() == "open") open(receiver, case["peer"]?.jsonArray?.map { it.str() })
@@ -384,7 +417,7 @@ class MessageVectorsTest {
     @Test
     fun sentFramesAreCompactAndStrictlyValid() {
         val hello = Frames.hello("0193a5c2-7b1e-7c3a-9d4f-5e6a7b8c9d32", "Pixel 8", "android", "0.1.0")
-        assertEquals("""{"type":"hello","id":"0193a5c2-7b1e-7c3a-9d4f-5e6a7b8c9d32","protocol":1,"name":"Pixel 8","platform":"android","appVersion":"0.1.0","capabilities":["link","notif","media"]}""", hello)
+        assertEquals("""{"type":"hello","id":"0193a5c2-7b1e-7c3a-9d4f-5e6a7b8c9d32","protocol":1,"name":"Pixel 8","platform":"android","appVersion":"0.1.0","capabilities":["link","notif","media","presence"]}""", hello)
         // An app with no extra features sends no `capabilities` at all (a 0.1.0 hello).
         assertEquals("""{"type":"hello","id":"h","protocol":1,"name":"Pixel 8","platform":"android","appVersion":"0.1.0"}""", Frames.hello("h", "Pixel 8", "android", "0.1.0", capabilities = emptyList()))
         assertEquals("""{"type":"ping","id":"a","sentAt":1760443200000}""", Frames.ping("a", 1760443200000))

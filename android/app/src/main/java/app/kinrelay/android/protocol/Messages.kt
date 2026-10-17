@@ -2,6 +2,7 @@ package app.kinrelay.android.protocol
 
 import app.kinrelay.android.media.MediaWire
 import app.kinrelay.android.notifmirror.NotifWire
+import app.kinrelay.android.presence.PresenceWire
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
@@ -31,6 +32,9 @@ data class Hello(val id: String, val name: String, val platform: String, val app
 
     /** The peer's latest `hello` lists `media` (2B.3): it understands the `media.*` messages. Every 0.2.0 build lists it, whatever its switches say (they travel in `media.status`). */
     val understandsMedia: Boolean get() = MediaWire.CAPABILITY in capabilities
+
+    /** The peer's latest `hello` lists `presence` (2B.4): it understands `presence`. Every 0.2.0 build lists it. */
+    val understandsPresence: Boolean get() = PresenceWire.CAPABILITY in capabilities
 }
 
 object ErrorCodes {
@@ -43,8 +47,11 @@ object ErrorCodes {
 
 /** Builders for the frames this app sends. Output is compact JSON, as senders must write it. */
 object Frames {
-    /** [capabilities]: what this app understands beyond protocol 1; `link` since 2B.1 (the sender of a `link` asks the peer's `hello` for it), `notif` since 2B.2 and `media` since 2B.3 (always listed on the phone). */
-    fun hello(id: String, name: String, platform: String, appVersion: String, capabilities: List<String> = listOf(LinkWire.CAPABILITY_LINK, NotifWire.CAPABILITY, MediaWire.CAPABILITY)): String = obj {
+    /**
+     * [capabilities]: what this app understands beyond protocol 1; `link` since 2B.1 (the sender of a `link` asks the peer's `hello` for it), `notif` since 2B.2, `media` since 2B.3 and `presence` since 2B.4
+     * (always listed on the phone). `ring` (2B.4) is listed only while "Let my PC ring this phone" is on: the caller adds it ([LOCAL_CAPABILITIES], [withRing]).
+     */
+    fun hello(id: String, name: String, platform: String, appVersion: String, capabilities: List<String> = LOCAL_CAPABILITIES): String = obj {
         put("type", "hello")
         put("id", id)
         put("protocol", PROTOCOL_VERSION)
@@ -53,6 +60,12 @@ object Frames {
         put("appVersion", appVersion)
         if (capabilities.isNotEmpty()) put("capabilities", buildJsonArray { capabilities.forEach { add(JsonPrimitive(it)) } })
     }
+
+    /** What the phone always lists in `hello`; `ring` comes on top while the switch is on. */
+    val LOCAL_CAPABILITIES: List<String> = listOf(LinkWire.CAPABILITY_LINK, NotifWire.CAPABILITY, MediaWire.CAPABILITY, PresenceWire.CAPABILITY)
+
+    /** [LOCAL_CAPABILITIES] with `ring` when [ring] is true. */
+    fun withRing(ring: Boolean): List<String> = if (ring) LOCAL_CAPABILITIES + PresenceWire.RING_CAPABILITY else LOCAL_CAPABILITIES
 
     fun ack(ref: String): String = obj {
         put("type", "ack")

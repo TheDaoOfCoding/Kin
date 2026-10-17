@@ -76,8 +76,11 @@ class MediaStats {
         const val SHARE_OFF = "share_off"
         const val BAD_IMAGE = "bad_image"
 
+        /** Dropped because this device or the peer is paused (2B.4). */
+        const val PAUSED = "paused"
+
         /** A `media.*` message arrived while a side's latest `hello` doesn't list `media`. */
         const val NOT_LISTED = "not_listed"
-        val DROP_REASONS = listOf(OFFLINE, PEER_OFF, RATE, SHARE_OFF, VIEWER_OFF, NO_SHARE, BAD_IMAGE, NOT_LISTED)
+        val DROP_REASONS = listOf(OFFLINE, PEER_OFF, RATE, SHARE_OFF, VIEWER_OFF, NO_SHARE, BAD_IMAGE, NOT_LISTED, PAUSED)
     }
 }

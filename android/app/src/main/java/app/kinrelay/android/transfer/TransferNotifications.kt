@@ -36,7 +36,13 @@ import app.kinrelay.android.notify.TrailingThrottle
  *   *arrivals*) keeps at most [MAX_SLOTS] transfers on screen ([NotificationLedger]: a new one beyond the cap pushes out the oldest), and
  *   shows a summary notification ("N file transfers") when there are two or more, so they are one stack.
  */
-class TransferNotifications(context: Context) : TransferNotifier {
+class TransferNotifications(
+    context: Context,
+    /** This phone is paused (2B.4): the "arrived" notification of a download is not shown (the file is saved and in the history); the progress notification stays. */
+    private val quiet: () -> Boolean = { false },
+    /** A download arrived quietly ("3 received while paused"). */
+    private val onQuiet: () -> Unit = {},
+) : TransferNotifier {
     private val context = context.applicationContext
     private val manager = this.context.getSystemService(NotificationManager::class.java)
     private val main = Handler(Looper.getMainLooper())
@@ -67,7 +73,8 @@ class TransferNotifications(context: Context) : TransferNotifier {
     }
 
     override fun progress(transfer: TransferEntity, files: List<TransferFileEntity>, bytesDone: Long, waiting: Boolean) {
-        if (!canPost()) return
+        // An image the phone sent by itself (2B.4) has its own notification (the 5-second hold and its result), not a progress bar.
+        if (!canPost() || transfer.origin != null) return
         // A transfer that starts again (Retry) replaces its "PC not reachable" or "Couldn't send" notification.
         if (showingProgress.add(transfer.id)) manager.cancel(transfer.id, RESULT_ID)
         val up = transfer.direction == TransferDirection.UP
@@ -96,6 +103,7 @@ class TransferNotifications(context: Context) : TransferNotifier {
     }
 
     override fun uploaded(transfer: TransferEntity, files: List<TransferFileEntity>) {
+        if (transfer.origin != null) return
         val what = if (files.size == 1) files[0].name else "${files.size} files"
         if (!canPost()) {
             message("Sent $what to ${transfer.peerName}")
@@ -112,6 +120,12 @@ class TransferNotifications(context: Context) : TransferNotifier {
         val saved = files.filter { it.finished && it.localUri != null }
         if (saved.isEmpty() || !canPost()) {
             endProgress(transfer.id)
+            return
+        }
+        if (quiet()) {
+            // Paused: the file is saved and in the history, nothing is shown (3.5).
+            endProgress(transfer.id)
+            onQuiet()
             return
         }
         val title = receivedTitle(transfer.peerName, saved)
@@ -132,6 +146,7 @@ class TransferNotifications(context: Context) : TransferNotifier {
     }
 
     override fun queued(transfer: TransferEntity, reason: String) {
+        if (transfer.origin != null) return
         val up = transfer.direction == TransferDirection.UP
         val title = if (up) "PC not reachable" else "Waiting for ${transfer.peerName}"
         val text = if (up) "Couldn't send to ${transfer.peerName}. $reason Your files are saved and go out when it is back." else "Your PC's files will download when it is back. $reason"
@@ -148,6 +163,7 @@ class TransferNotifications(context: Context) : TransferNotifier {
     }
 
     override fun failed(transfer: TransferEntity, message: String) {
+        if (transfer.origin != null) return
         val up = transfer.direction == TransferDirection.UP
         val title = if (up) "Couldn't send to ${transfer.peerName}" else "Couldn't receive from ${transfer.peerName}"
         if (!canPost()) {

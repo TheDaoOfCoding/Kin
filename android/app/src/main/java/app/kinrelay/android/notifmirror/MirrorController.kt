@@ -57,7 +57,10 @@ class MirrorController(private val graph: AppGraph) {
         flagged = { pkg -> AppCatalog.isFlagged(pkg, labelOf(pkg)) },
     )
 
-    val sender = MirrorSender(graph.scope, clock, link = { graph.link.runtime?.currentSession }, log = graph.log)
+    val sender = MirrorSender(
+        graph.scope, clock, link = { graph.link.runtime?.currentSession }, log = graph.log,
+        postsBlocked = { graph.pause.paused() || graph.presence.peerPaused() },
+    )
 
     private val sbnPort = object : SbnPort<SbnItem> {
         override fun quick(sbn: SbnItem) = SbnMapper.quick(sbn.sbn)

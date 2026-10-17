@@ -17,6 +17,8 @@ import app.kinrelay.android.protocol.UrlRules
  *   the notification always has a Copy button.
  * - `link` (2B.1): checked again (`http` or `https` only, the real address worked out from the URL), then a notification with the title,
  *   the address, a tap that opens it and a Copy link button. A link is **never** copied or opened by itself.
+ * - While this phone is **paused** (2B.4, design 3.5) the receiver gates too: an automatic `clipboard` is dropped silently, and a `text` or `link` (a manual send) is handled **quietly**: it is
+ *   recorded in the history by the caller as usual, and **nothing visible happens by itself**: no notification or toast, no clipboard write, no auto-opened link. [onQuiet] counts it.
  */
 class IncomingHandler(
     private val clipboard: ClipboardPort,
@@ -27,8 +29,16 @@ class IncomingHandler(
     private val copyAutomatically: suspend () -> Boolean = { true },
     /** "Show link previews on the lock screen" (default off). */
     private val lockScreenLinks: suspend () -> Boolean = { false },
+    /** This phone is paused (the wall-clock gate). */
+    private val paused: () -> Boolean = { false },
+    /** A manual arrival was handled quietly because of the pause ("3 received while paused"). */
+    private val onQuiet: () -> Unit = {},
 ) {
     suspend fun onClipboard(text: String) {
+        if (paused()) {
+            log.i("link", "clipboard from the PC dropped: this phone is paused")
+            return
+        }
         guard.notePeerSet(text)
         val written = write(text, sensitive = true)
         log.i("link", "clipboard from the PC ${ClipboardGuard.fingerprint(text)} written=$written")
@@ -36,6 +46,12 @@ class IncomingHandler(
     }
 
     suspend fun onText(fromName: String, id: String, text: String, isUrl: Boolean, sensitive: Boolean = false) {
+        if (paused()) {
+            // Quiet: no notification, no clipboard write (so the loop guard is not armed either). The caller records the history row; a sensitive text is never stored.
+            onQuiet()
+            log.i("link", "text from '$fromName' handled quietly: this phone is paused" + if (sensitive) "" else " ${ClipboardGuard.fingerprint(text)}")
+            return
+        }
         val automatic = copyAutomatically()
         if (automatic) guard.notePeerSet(text)
         val written = automatic && write(text, sensitive = sensitive)
@@ -59,6 +75,12 @@ class IncomingHandler(
         if (link == null) {
             log.w("link", "a link from '$fromName' was refused: not an http or https address")
             return null
+        }
+        if (paused()) {
+            // Quiet: the link is returned so the caller records it in the history, and nothing is shown or opened.
+            onQuiet()
+            log.i("link", "link from '$fromName' handled quietly: this phone is paused scheme=${link.url.substringBefore(':').lowercase()} urlChars=${link.url.length}")
+            return link
         }
         alerts.linkFrom(fromName, id, link, lockScreenPreviews = lockScreenLinks())
         // protocol.md: no URL in a log (a URL can carry a token), the length and the scheme at most.

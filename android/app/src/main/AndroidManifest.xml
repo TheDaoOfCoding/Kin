@@ -18,6 +18,18 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- Held only while file bytes move, and let go at once (architecture.md, "Battery rules for the phone"). -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Ring my phone (2B.4): the Stop screen over a locked phone. A normal permission, granted at install for a sideloaded app; Google Play may revoke it on Android 14+ (risk R37), and then the ring shows as a notification with a Stop button. Ringing never depends on it. -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- The ring vibrates (a normal permission). -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!--
+        Auto-send screenshots (2B.4, opt-in): declared, but **asked for only when the user turns the switch on**, never at start-up. Kin does not declare READ_MEDIA_VISUAL_USER_SELECTED, ACCESS_MEDIA_LOCATION,
+        READ_MEDIA_VIDEO or MANAGE_EXTERNAL_STORAGE. A Play build without this feature removes both (src/noshots, `-PkinAutoSendShots=false`).
+        Lint's "SelectedPhotoAccess" is deliberate: Android 14's "Select photos" is a grant for one session only, which cannot work for a watcher that runs in the background, so Kin runs in the
+        system's compatibility mode and shows "Needs access to all photos" when the grant is partial (design 5.6).
+    -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" tools:ignore="SelectedPhotoAccess" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
 
     <!--
         Which apps can open a web link (2B.1): "Open in YouTube" in the link notification, and the resolve check of Android 10. This is not
@@ -231,6 +243,45 @@
             </intent-filter>
         </service>
 
+        <!--
+            The "Pause Kin" quick settings tile (2B.4) and its long-press screen. The system starts the preferences activity with ACTION_QS_TILE_PREFERENCES, so it is exported for that action only.
+        -->
+        <service
+            android:name=".pause.PauseTile"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_kin"
+            android:label="@string/pause_tile_label"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <activity
+            android:name=".pause.PauseSettingsActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:label="@string/pause_settings_label"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Kin">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE_PREFERENCES" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            The Stop screen of "Ring my phone" (2B.4): shown over the lock screen from the ring notification's full-screen intent (where Android allows it) or from a tap. Not exported.
+        -->
+        <activity
+            android:name=".ring.RingActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleInstance"
+            android:showWhenLocked="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Kin"
+            android:turnScreenOn="true" />
+
         <!-- "Export logs" on the Debug screen: the zip is read by the app the user picks in the share sheet, through a grant on the intent. -->
         <provider
             android:name="androidx.core.content.FileProvider"
@@ -269,6 +320,17 @@
         <!-- The Cancel and Retry buttons of the transfer notifications. Only our own PendingIntents reach it. -->
         <receiver
             android:name=".transfer.TransferActionReceiver"
+            android:exported="false" />
+
+        <!-- 2B.4: the Stop button of the ring notification, the Pause / Resume button of the persistent notification, and the Cancel button of an auto-sent screenshot's 5-second wait. Only our own PendingIntents reach them. -->
+        <receiver
+            android:name=".ring.RingActionReceiver"
+            android:exported="false" />
+        <receiver
+            android:name=".pause.PauseReceiver"
+            android:exported="false" />
+        <receiver
+            android:name=".shots.ShotActionReceiver"
             android:exported="false" />
 
         <receiver

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Manifest overlay for a build without auto-send screenshots (`gradlew ... -PkinAutoSendShots=false`), for Google Play if it refuses the photo permission (risk R18): the two photo
+    permissions are removed from the merged manifest. The sideload/GitHub build does not use this file.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" tools:node="remove" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" tools:node="remove" />
+</manifest>

@@ -407,7 +407,7 @@ class UploadRunner(
          *   is final.
          */
         private suspend fun createOrStartOver(http: TransferHttp): ApiResult<Map<String, Long>> {
-            val first = http.createTransfer(transfer.id, files.map { UploadFileSpec(it.fileId, it.name, it.size, it.mime) })
+            val first = http.createTransfer(transfer.id, files.map { UploadFileSpec(it.fileId, it.name, it.size, it.mime) }, transfer.origin)
             // The run has reached its POST: whatever the answer, the stored "this is the user's Retry" has done its work.
             if (transfer.userRetry) {
                 d.store.clearUserRetry(transfer.id)
@@ -438,7 +438,7 @@ class UploadRunner(
             files = newFiles
             started = false
             done.set(0)
-            return http.createTransfer(transfer.id, files.map { UploadFileSpec(it.fileId, it.name, it.size, it.mime) })
+            return http.createTransfer(transfer.id, files.map { UploadFileSpec(it.fileId, it.name, it.size, it.mime) }, transfer.origin)
         }
 
         private fun fatalFor(error: ApiResult.Error): Attempt.Fatal {

@@ -277,7 +277,10 @@ class DebugCommandReceiver : BroadcastReceiver() {
                             graph.log.w("debug", "CMD SET_PING_INTERVAL needs --ei seconds <n>")
                         }
                     }
-                    else -> if (command.startsWith("MEDIA_")) DebugMedia.handle(command, intent, context, graph)
+                    else -> when {
+                        command.startsWith("MEDIA_") -> DebugMedia.handle(command, intent, context, graph)
+                        DebugPresence.handles(command) -> DebugPresence.handle(command, intent, context, graph)
+                    }
                 }
             } finally {
                 pending.finish()
