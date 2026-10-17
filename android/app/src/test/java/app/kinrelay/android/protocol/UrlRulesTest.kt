@@ -14,7 +14,15 @@ class UrlRulesTest {
             "https://example.com",
             "HTTPS://EXAMPLE.COM/Path",
             "https://example.com/a?b=c#d",
-            "https://user:pw@example.com:8443/x",
+            "https://example.com/a@b",
+            "https://example.com/?email=a@b.c#x@y",
+            "https://example.com/a\\b",
+            "https://example.com/a%20b%41",
+            "https://xn--bcher-kva.example/",
+            "https://ｇｏｏｇｌｅ.com/",
+            "http://0x7f.1/",
+            "https://256.1.1.1/",
+            "https://[abc]/",
             "http://192.168.1.20:47821/",
             "http://[::1]:8080/x",
             "https://localhost",
@@ -52,6 +60,26 @@ class UrlRulesTest {
             "https://#x",
             "https://:80/",
             "https://user@/x",
+            // changelog 55: no user information, no backslash and no percent-encoding in the authority, and no [ ] < > ^ | in a host
+            "https://user:pw@example.com:8443/x",
+            "https://google.com@evil.example/",
+            "https://google.com:443@evil.example/",
+            "https://me@[::1]:9/",
+            "https://evil.example\\@google.com",
+            "https://evil.example\\/x",
+            "https://example.com\\",
+            "https://\\example.com/",
+            "https://goog%6Ce.com/",
+            "https://%67oogle.com/",
+            "http://[fe80::1%25eth0]/",
+            "https://example.com:80%30/",
+            "https://exa[mple.com/",
+            "https://exa]mple.com/",
+            "https://exa<mple.com/",
+            "https://exa>mple.com/",
+            "https://exa^mple.com/",
+            "https://exa|mple.com/",
+            "https://[::1]x/",
             "https://[]/",
             "https://[::1",
             "https://host:80a/",
@@ -73,6 +101,14 @@ class UrlRulesTest {
         assertEquals("https://example.com/x", UrlRules.httpUrl("  https://example.com/x \n"))
         assertNull(UrlRules.httpUrl("javascript:alert(1)"))
         assertNull(UrlRules.httpUrl("https://example.com/x y"))
+    }
+
+    @Test
+    fun theTightenedRuleRejectsTheAuthorityTricksButNotTheirLookAlikesAfterTheAuthority() {
+        // Android parses `https://evil.example\@google.com` as google.com, a browser as evil.example: the URL is refused, not shown with a mark.
+        assertNull(UrlRules.httpUrl("https://evil.example\\@google.com"))
+        assertNull(UrlRules.httpUrl("https://google.com@evil.example/"))
+        assertEquals("https://example.com/a@b?x=\\@evil.com#%41", UrlRules.httpUrl("https://example.com/a@b?x=\\@evil.com#%41"))
     }
 
     @Test

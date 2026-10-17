@@ -94,7 +94,7 @@ object HistoryBuilder {
         val failedLike = x.status == TransferStatus.FAILED || x.status == TransferStatus.CANCELED
         return HistoryItem(
             key = "x:${x.id}", id = x.id, isText = true, outgoing = outgoing, status = status, timeMillis = x.createdAtMillis,
-            title = preview(x.body), sizeBytes = x.byteSize, errorCode = x.errorCode.takeIf { failedLike }, errorMessage = x.message.takeIf { failedLike },
+            title = x.title?.let { preview(it) } ?: preview(x.body), sizeBytes = x.byteSize, errorCode = x.errorCode.takeIf { failedLike }, errorMessage = x.message.takeIf { failedLike },
             peerName = x.peerName, text = x.body, openUri = null, openMime = null,
             canRetry = outgoing && x.status == TransferStatus.FAILED && x.body != null && x.retriedAs == null,
             canCancel = outgoing && x.status == TransferStatus.QUEUED,

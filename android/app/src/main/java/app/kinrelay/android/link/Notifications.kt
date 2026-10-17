@@ -18,6 +18,9 @@ import androidx.core.net.toUri
 import app.kinrelay.android.MainActivity
 import app.kinrelay.android.R
 import app.kinrelay.android.clipboard.ClipboardSendActivity
+import app.kinrelay.android.links.AndroidLinks
+import app.kinrelay.android.links.LinkNotifications
+import app.kinrelay.android.links.ReceivedLink
 import app.kinrelay.android.notify.NotificationChannels
 import app.kinrelay.android.notify.NotificationLedger
 import app.kinrelay.android.notify.TextArrivals
@@ -39,6 +42,7 @@ class Notifications(context: Context) : Alerts {
     private val main = Handler(Looper.getMainLooper())
     private val arrivals = TextArrivals()
     private val problems = NotificationLedger(MAX_PROBLEMS)
+    private val links = LinkNotifications(this.context, AndroidLinks(this.context))
     private var problemCounter = 0
 
     private val textPoster = TrailingThrottle(
@@ -80,11 +84,22 @@ class Notifications(context: Context) : Alerts {
         manager.notify(PING_ID, notification)
     }
 
-    override fun textFrom(pcName: String, messageId: String, text: String?, openUrl: String?) {
+    override fun textFrom(pcName: String, messageId: String, text: String?, openUrl: String?, copyText: String?, sensitive: Boolean, copiedAlready: Boolean) {
         if (!canPost()) return
-        arrivals.add(pcName, text?.let { preview(it, LONG_PREVIEW, singleLine = false) }, openUrl)
+        arrivals.add(pcName, text?.let { preview(it, LONG_PREVIEW, singleLine = false) }, openUrl, TextArrivals.Latest(messageId, copyText, sensitive), copiedAlready)
         textPoster.request()
     }
+
+    override fun linkFrom(pcName: String, messageId: String, link: ReceivedLink, lockScreenPreviews: Boolean) {
+        if (!canPost()) return
+        links.show(pcName, messageId, link, lockScreenPreviews)
+    }
+
+    /** A link was tapped (it went with the tap): the group summary forgets it. */
+    fun linksSeen() = links.refresh()
+
+    /** The newest text of the "Text from <PC>" notification, kept in memory only (a sensitive text is never stored anywhere else). */
+    fun latestText(messageId: String): TextArrivals.Latest? = arrivals.latest(messageId)
 
     /** The user opened the app or swiped the notification away: the next text starts a new "Text from <PC>". */
     fun textsSeen() {
@@ -103,6 +118,8 @@ class Notifications(context: Context) : Alerts {
             .setContentIntent(openApp())
             .setDeleteIntent(dismissed())
             .setNumber(state.count)
+            // The setting "Copy received text automatically" says whether the text is on the clipboard already.
+            .also { if (state.copied) it.setSubText("Copied") }
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             // The text is private: the lock screen shows only the title.
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
@@ -118,6 +135,10 @@ class Notifications(context: Context) : Alerts {
             shown.forEach { style.addLine(it?.let { line -> preview(line, SHORT_PREVIEW) } ?: TextArrivals.SENSITIVE_LINE) }
             if (state.count > shown.size) style.setSummaryText("and ${state.count - shown.size} earlier")
             builder.setStyle(style).setContentText(shown.lastOrNull()?.let { preview(it, SHORT_PREVIEW) } ?: TextArrivals.SENSITIVE_LINE)
+        }
+        // Copy: the newest text, by its message ID (the text itself is not in the PendingIntent, and a sensitive one is only in memory).
+        state.latest?.takeIf { it.text != null }?.let { latest ->
+            builder.addAction(R.drawable.ic_stat_kin, if (state.count > 1) "Copy latest" else "Copy", copyText(latest.id))
         }
         state.openUrl?.let { url ->
             val view = Intent(Intent.ACTION_VIEW, url.toUri()).addCategory(Intent.CATEGORY_BROWSABLE).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -178,6 +199,12 @@ class Notifications(context: Context) : Alerts {
 
     private fun dismissed(): PendingIntent = PendingIntent.getBroadcast(
         context, 2, Intent(context, TransferActionReceiver::class.java).setAction(TransferActionReceiver.ACTION_TEXTS_DISMISSED),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+    )
+
+    private fun copyText(messageId: String): PendingIntent = PendingIntent.getBroadcast(
+        context, 3,
+        Intent(context, TransferActionReceiver::class.java).setAction(TransferActionReceiver.ACTION_COPY_TEXT).putExtra(TransferActionReceiver.EXTRA_MESSAGE_ID, messageId),
         PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
     )
 

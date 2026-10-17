@@ -17,7 +17,7 @@ object FileNames {
     }
 
     /** `Bidi_Control` characters, which would let a name read differently from what it is (U+202E in `photo<RLO>gpj.exe`). */
-    private fun isBidiControl(c: Char): Boolean =
+    internal fun isBidiControl(c: Char): Boolean =
         c.code.let { it == 0x061C || it == 0x200E || it == 0x200F || it in 0x202A..0x202E || it in 0x2066..0x2069 }
 
     private fun isForbidden(c: Char): Boolean =

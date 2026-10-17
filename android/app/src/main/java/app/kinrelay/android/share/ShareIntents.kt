@@ -3,6 +3,7 @@ package app.kinrelay.android.share
 import android.content.Intent
 import android.net.Uri
 import androidx.core.content.IntentCompat
+import app.kinrelay.android.protocol.UrlRules
 
 /**
  * Reads the files out of a share intent. Only `content:` URIs are taken: any app can send an intent to the exported share
@@ -22,6 +23,15 @@ object ShareIntents {
         }
         return found.filter { it.scheme == "content" }
     }
+
+    /**
+     * The URL of a shared text when the text is **exactly one** web link (after trimming), else null: such a share is sent as a `link`, anything
+     * else (a sentence with a URL in it, `javascript:`, a `file:` address) stays a `text`. [sensitive] text is never a link (a `link` is never sensitive).
+     */
+    fun linkOf(text: String?, sensitive: Boolean): String? = if (sensitive || text == null) null else UrlRules.httpUrl(text)
+
+    /** The page title a sender gave the share: `EXTRA_SUBJECT` (Chrome, Firefox and most browsers), else `EXTRA_TITLE` (the share sheet's preview title). */
+    fun titleOf(subject: CharSequence?, title: CharSequence?): String? = (subject?.toString()?.takeIf { it.isNotBlank() } ?: title?.toString())?.takeIf { it.isNotBlank() }
 
     /** True if the intent carries something that isn't a `content:` URI (a `file:` URI, say), which is ignored. */
     fun hasRefusedStreams(intent: Intent): Boolean = try {

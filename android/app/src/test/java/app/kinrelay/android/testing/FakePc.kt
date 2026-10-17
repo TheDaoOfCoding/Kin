@@ -64,6 +64,9 @@ class FakePc(
 
     @Volatile var sendHelloOnOpen = true
     @Volatile var helloProtocol = 1
+
+    /** The `capabilities` the PC lists in its `hello` (null: none, like a 0.1.x PC). */
+    @Volatile var helloCapabilities: List<String>? = null
     @Volatile var ackPings = true
 
     /** What the PC does with a `text` from the phone: ack it, say nothing, or answer with this `error` code. */
@@ -101,6 +104,13 @@ class FakePc(
     fun sendClipboard(id: String, text: String) =
         send(buildJsonObject { put("type", "clipboard"); put("id", id); put("text", text) }.toString())
 
+    fun sendLink(id: String, url: String, title: String? = null, sourceApp: String? = null) =
+        send(buildJsonObject {
+            put("type", "link"); put("id", id); put("url", url)
+            title?.let { put("title", it) }
+            sourceApp?.let { put("sourceApp", it) }
+        }.toString())
+
     fun sendText(id: String, text: String, isUrl: Boolean) =
         send(buildJsonObject { put("type", "text"); put("id", id); put("text", text); put("isUrl", isUrl) }.toString())
 
@@ -118,8 +128,10 @@ class FakePc(
     fun nextFrame(timeoutMillis: Long = 5_000): JsonObject? =
         received.poll(timeoutMillis, TimeUnit.MILLISECONDS)?.let { Json.parseToJsonElement(it).jsonObject }
 
-    fun helloFrame(protocol: Int = helloProtocol) =
-        """{"type":"hello","id":"pc-hello","protocol":$protocol,"name":"$name","platform":"windows","appVersion":"0.1.0"}"""
+    fun helloFrame(protocol: Int = helloProtocol): String {
+        val capabilities = helloCapabilities?.joinToString(",", prefix = ",\"capabilities\":[", postfix = "]") { "\"$it\"" }.orEmpty()
+        return """{"type":"hello","id":"pc-hello","protocol":$protocol,"name":"$name","platform":"windows","appVersion":"0.1.0"$capabilities}"""
+    }
 
     private fun route(request: RecordedRequest): MockResponse {
         val phone = request.handshake?.peerCertificates?.firstOrNull()?.let { DeviceIds.deviceIdOfCertificate(it.encoded) }
@@ -174,6 +186,7 @@ class FakePc(
                         webSocket.send("""{"type":"ack","ref":"$id"}""")
                     }
                 }
+                "link" -> if (id != null) webSocket.send("""{"type":"ack","ref":"$id"}""")
                 "unpair" -> if (id != null) {
                     webSocket.send("""{"type":"ack","ref":"$id"}""")
                     webSocket.close(1000, "unpaired")

@@ -43,6 +43,22 @@ object SendEntry {
     }
 
     /**
+     * A web page from the share sheet (2B.1): the text was exactly one URL, so it goes as a `link` with the page title ([title], the share's
+     * subject, or null). Same shape as [run]: start the service, hand the link to the sender on the app's scope, finish at once.
+     */
+    fun runLink(activity: Activity, url: String, title: String?, tapAtMillis: Long) {
+        val graph = activity.graph
+        graph.scope.launch {
+            try {
+                graph.link.ensureRunning(activity.applicationContext)
+            } finally {
+                withContext(Dispatchers.Main) { activity.finish() }
+            }
+        }
+        graph.scope.launch { graph.sender.sendLink(url, title, tapAtMillis, SendSource.SHARE_LINK) }
+    }
+
+    /**
      * Files from the share sheet. The system lets this activity read them only while it lives, and it finishes at once, so the same
      * URIs are passed to [LinkService] with `FLAG_GRANT_READ_URI_PERMISSION`: the service is long-lived, and access given to it
      * stays after this activity is gone (android.md; the finding is in docs/results/phase-1-3-android.md, R5). Only then is the

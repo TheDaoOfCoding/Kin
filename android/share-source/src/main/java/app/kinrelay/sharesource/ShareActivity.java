@@ -26,6 +26,9 @@ public class ShareActivity extends Activity {
         boolean kill = getIntent().getBooleanExtra("kill", false);
         boolean jpeg = getIntent().getBooleanExtra("jpeg", false);
         boolean chooser = getIntent().getBooleanExtra("chooser", false);
+        // The smoke build of Kin has its own application ID (app.kinrelay.android.smoke); the classes keep the namespace.
+        String pkg = getIntent().getStringExtra("pkg");
+        if (pkg == null) pkg = "app.kinrelay.android";
         File dir = new File(getFilesDir(), "shared");
         dir.mkdirs();
         ArrayList<Uri> uris = new ArrayList<>();
@@ -45,7 +48,7 @@ public class ShareActivity extends Activity {
         Intent share = new Intent(n > 1 ? Intent.ACTION_SEND_MULTIPLE : Intent.ACTION_SEND);
         share.setType("*/*");
         if (!chooser) {
-            share.setComponent(new ComponentName("app.kinrelay.android", "app.kinrelay.android.share.ShareActivity"));
+            share.setComponent(new ComponentName(pkg, "app.kinrelay.android.share.ShareActivity"));
         }
         if (n > 1) {
             share.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris);

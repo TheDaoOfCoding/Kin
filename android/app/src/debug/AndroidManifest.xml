@@ -1,6 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- The throwaway test app android\link-target owns https://kin-link-test.example: Kin must be able to see it ("Open in Link target"). -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="https" android:host="kin-link-test.example" />
+        </intent>
+    </queries>
+
     <application>
         <!--
             Automation hooks for adb, in debug builds only (this file is not part of release).
@@ -36,6 +45,10 @@
                 <action android:name="app.kinrelay.android.debug.RETRY_TEXT" />
                 <action android:name="app.kinrelay.android.debug.FLUSH" />
                 <action android:name="app.kinrelay.android.debug.EXPIRE" />
+                <action android:name="app.kinrelay.android.debug.LINK_FROM_PC" />
+                <action android:name="app.kinrelay.android.debug.TEXT_FROM_PC" />
+                <action android:name="app.kinrelay.android.debug.SEND_LINK" />
+                <action android:name="app.kinrelay.android.debug.SET_LINK_PREFS" />
             </intent-filter>
         </receiver>
 

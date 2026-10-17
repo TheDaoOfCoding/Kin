@@ -3,10 +3,26 @@ package app.kinrelay.android.link
 /** What the app tells the user about texts and sends. The real one posts notifications and toasts. */
 interface Alerts {
     /**
-     * A `text` arrived: "Text from <pc>" with a preview. [text] is null for sensitive text: no preview at all. [openUrl] is set only for
-     * a link that is safe to open.
+     * A `text` arrived: "Text from <pc>" with a preview and a Copy button. [text] is null for sensitive text: no preview at all. [openUrl] is
+     * set only for a link that is safe to open. [copyText] is the whole text the Copy button puts on the clipboard (kept in memory only;
+     * null when there is nothing to copy), [sensitive] marks that clip sensitive, and [copiedAlready] says the text is on the clipboard
+     * already (the "copy received text automatically" setting), which the notification mentions.
      */
-    fun textFrom(pcName: String, messageId: String, text: String?, openUrl: String?)
+    fun textFrom(
+        pcName: String,
+        messageId: String,
+        text: String?,
+        openUrl: String?,
+        copyText: String? = null,
+        sensitive: Boolean = false,
+        copiedAlready: Boolean = true,
+    )
+
+    /**
+     * A `link` arrived (already acked and checked: `http` or `https`). A notification with the page title, the real address under it, a tap
+     * that opens it and a "Copy link" button. [lockScreenPreviews]: the user allows the title and the address on the lock screen.
+     */
+    fun linkFrom(pcName: String, messageId: String, link: app.kinrelay.android.links.ReceivedLink, lockScreenPreviews: Boolean)
 
     /** A send worked. [arrivalMillis] is the time from the tap to the PC's ack. */
     fun sent(pcName: String?, arrivalMillis: Long)

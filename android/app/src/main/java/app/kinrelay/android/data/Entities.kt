@@ -121,6 +121,9 @@ object TextSource {
     const val CLIPBOARD = "clipboard"
     const val DEBUG = "debug"
 
+    /** A link shared to Kin (the share sheet): sent as a `link`. */
+    const val SHARE_LINK = "share_link"
+
     /** A text the PC sent (a hotkey send): history of the receiving side. */
     const val PC = "pc"
     const val AUTO_CLIPBOARD = "auto_clipboard"
@@ -153,4 +156,14 @@ data class TextItemEntity(
     val attempts: Int,
     /** A failed text that a user Retry sent again as a new message: the ID of the new one (this row stays as it ended). */
     val retriedAs: String? = null,
+    /** [TextKind.TEXT] or [TextKind.LINK] (2B.1): a shared web page is queued and shown as a link, and goes out as a `link` (or, to an old PC, as a `text`). */
+    @ColumnInfo(defaultValue = "'text'") val kind: String = TextKind.TEXT,
+    /** The page title of a link (already cleaned), or null. Never set on a text. */
+    val title: String? = null,
 )
+
+/** What a row of `texts` is. */
+object TextKind {
+    const val TEXT = "text"
+    const val LINK = "link"
+}

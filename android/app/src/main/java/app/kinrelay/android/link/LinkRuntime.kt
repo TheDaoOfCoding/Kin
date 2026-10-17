@@ -14,6 +14,7 @@ import app.kinrelay.android.data.DeviceEntity
 import app.kinrelay.android.identity.DeviceIds
 import app.kinrelay.android.pairing.PairingAddress
 import app.kinrelay.android.protocol.CloseAction
+import app.kinrelay.android.protocol.LinkMessage
 import app.kinrelay.android.protocol.Hello
 import app.kinrelay.android.protocol.Offer
 import app.kinrelay.android.protocol.OfferHistory
@@ -44,7 +45,11 @@ class LinkRuntime(
     private val connectivity = context.getSystemService(ConnectivityManager::class.java)
     private val mdns = MdnsLookup(context, graph.log)
     private val clock = Clock { SystemClock.elapsedRealtime() }
-    private val incoming = IncomingHandler(AndroidClipboard(context), notifications, graph.clipboardGuard, graph.log)
+    private val incoming = IncomingHandler(
+        AndroidClipboard(context), notifications, graph.clipboardGuard, graph.log,
+        copyAutomatically = { graph.settings.copyReceivedTextAutomatically() },
+        lockScreenLinks = { graph.settings.showLinkPreviewsOnLockScreen() },
+    )
     private val lock = Mutex()
     private val wifi = WifiTracker<Network>()
     private var network: Network? = null
@@ -232,6 +237,12 @@ class LinkRuntime(
         }
 
         override suspend fun onClipboardReceived(id: String, text: String) = incoming.onClipboard(text)
+
+        override suspend fun onLinkReceived(fromName: String, id: String, link: LinkMessage) {
+            val shown = incoming.onLink(fromName, id, link.url, link.title, link.sourceApp) ?: return
+            // A link from the PC is history (the address and the cleaned title); it is never put on the clipboard and nothing is opened by itself.
+            runCatching { graph.textOutbox.recordIncomingLink(device.deviceId, fromName, id, shown.url, shown.title) }
+        }
 
         override fun acceptOffer(offer: Offer): String? = graph.transfers.acceptOffer(offer, device.deviceId)
 

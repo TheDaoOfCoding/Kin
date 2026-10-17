@@ -29,6 +29,8 @@ class MessageVectorsTest {
         "text-*", "clipboard-*", "duplicate-keys-*",
         // 1.3
         "offer-*", "complete-*", "cancel-*",
+        // 2B.1
+        "link-*",
     )
     private val invalidScope = listOf(
         "first-message-*", "hello-*", "ack-*", "error-*", "unpair-missing-id", "ping-*", "type-*",
@@ -39,6 +41,8 @@ class MessageVectorsTest {
         "text-*", "clipboard-*",
         // 1.3
         "offer-*", "complete-*", "cancel-*",
+        // 2B.1
+        "link-*",
     )
     private val sequenceScope = listOf(
         "second-hello-after-handshake-is-a-normal-message", "invalid-hello-does-not-count-as-accepted",
@@ -56,6 +60,9 @@ class MessageVectorsTest {
         "same-pc-repeat-after-done-is-acked", "same-pc-repeat-after-canceled-is-acked", "offer-from-another-device-is-bad-request",
         "same-pc-repeat-with-different-files-is-bad-request", "complete-re-sent-after-reconnect-is-acked-again",
         "cancel-re-sent-after-reconnect-is-acked-again",
+        // 2B.1
+        "link-duplicate-is-acked-not-redelivered", "link-rejected-id-is-not-remembered", "link-after-reconnect-is-idempotent",
+        "link-sent-as-text-to-an-old-peer-is-a-text",
     )
 
     /** The invalid-UTF-8 case can only be checked on the PC side: OkHttp never shows the bad bytes. */
@@ -114,6 +121,13 @@ class MessageVectorsTest {
             }
         }
         expect["action"]?.let { assertEquals("$name: action", it.str(), outcome.action.category) }
+        // `expect.link` is what the receiver shows and opens: the URL exactly as sent, the cleaned title and source app (absent = none).
+        (outcome.action as? Action.DeliverLink)?.let {
+            val link = expect.getValue("link").jsonObject
+            assertEquals("$name: link url", link.getValue("url").str(), it.link.url)
+            assertEquals("$name: link title", link.string("title"), it.link.title)
+            assertEquals("$name: link sourceApp", link.string("sourceApp"), it.link.sourceApp)
+        }
         // `expect.sensitive` says how the receiver treats a delivered text (absent means false).
         (outcome.action as? Action.DeliverText)?.let {
             assertEquals("$name: sensitive", expect["sensitive"]?.jsonPrimitive?.boolean ?: false, it.sensitive)
@@ -215,6 +229,15 @@ class MessageVectorsTest {
         }
     }
 
+    @Test
+    fun theLinkUrlTricksOfTheReviewAreAmongTheCasesTheLoopsRun() {
+        // B1 (changelog 55): a backslash, user information or an escape in the authority is `bad_request` (the invalid loop checks the reply and `ref`);
+        // a mixed-case scheme and host are kept as sent (the valid loop checks the URL byte for byte).
+        val invalid = vectors.cases("invalid").map { it.getValue("name").str() }
+        for (name in listOf("link-url-backslash-in-the-authority", "link-url-userinfo-lookalike", "link-url-percent-in-the-host")) assertTrue(name, name in invalid)
+        assertTrue(vectors.cases("valid").any { it.getValue("name").str() == "link-scheme-and-host-case-are-kept" })
+    }
+
     // --- cases of our own, for behaviour the vectors only touch ---
 
     @Test
@@ -267,7 +290,9 @@ class MessageVectorsTest {
     @Test
     fun sentFramesAreCompactAndStrictlyValid() {
         val hello = Frames.hello("0193a5c2-7b1e-7c3a-9d4f-5e6a7b8c9d32", "Pixel 8", "android", "0.1.0")
-        assertEquals("""{"type":"hello","id":"0193a5c2-7b1e-7c3a-9d4f-5e6a7b8c9d32","protocol":1,"name":"Pixel 8","platform":"android","appVersion":"0.1.0"}""", hello)
+        assertEquals("""{"type":"hello","id":"0193a5c2-7b1e-7c3a-9d4f-5e6a7b8c9d32","protocol":1,"name":"Pixel 8","platform":"android","appVersion":"0.1.0","capabilities":["link"]}""", hello)
+        // An app with no extra features sends no `capabilities` at all (a 0.1.0 hello).
+        assertEquals("""{"type":"hello","id":"h","protocol":1,"name":"Pixel 8","platform":"android","appVersion":"0.1.0"}""", Frames.hello("h", "Pixel 8", "android", "0.1.0", capabilities = emptyList()))
         assertEquals("""{"type":"ping","id":"a","sentAt":1760443200000}""", Frames.ping("a", 1760443200000))
         assertEquals("""{"type":"unpair","id":"u"}""", Frames.unpair("u"))
         assertEquals("""{"type":"error","code":"bad_request","message":"m"}""", Frames.error("bad_request", "m", null))

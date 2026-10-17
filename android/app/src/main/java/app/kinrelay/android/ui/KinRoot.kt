@@ -185,6 +185,10 @@ fun KinRoot(
                 tab == 2 -> SettingsScreen(
                     context = context, pc = pc, deviceName = stats.deviceName.orEmpty(), systemName = graph.deviceInfo.name,
                     phoneShortId = identity?.shortId, versionName = BuildConfig.VERSION_NAME,
+                    showLinkPreviewsOnLockScreen = stats.showLinkPreviewsOnLockScreen,
+                    copyReceivedTextAutomatically = stats.copyReceivedTextAutomatically,
+                    onShowLinkPreviewsOnLockScreen = { scope.launch { graph.settings.setShowLinkPreviewsOnLockScreen(it) } },
+                    onCopyReceivedTextAutomatically = { scope.launch { graph.settings.setCopyReceivedTextAutomatically(it) } },
                     onSaveName = { graph.settings.setDeviceName(it) },
                     onOpenSetup = { screen = SETUP }, onOpenDebug = { screen = DEBUG },
                     onUnpair = { graph.link.unpair(context) },

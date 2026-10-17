@@ -7,6 +7,7 @@ import app.kinrelay.android.protocol.CloseRules
 import app.kinrelay.android.protocol.DedupMemory
 import app.kinrelay.android.protocol.Frames
 import app.kinrelay.android.protocol.Hello
+import app.kinrelay.android.protocol.LinkMessage
 import app.kinrelay.android.protocol.MessageIds
 import app.kinrelay.android.protocol.MessageReceiver
 import app.kinrelay.android.protocol.Offer
@@ -60,6 +61,12 @@ class HttpEndpoint(val client: OkHttpClient, val address: PairingAddress)
 interface LinkConnection {
     val isReady: Boolean
 
+    /**
+     * The PC's latest accepted `hello` on this connection lists the `link` capability (protocol.md, "Versioning"): a `link` may go to it as a
+     * `link`; otherwise the same item goes as a `text`. Decided when the message goes on the wire.
+     */
+    val peerUnderstandsLink: Boolean get() = false
+
     /** The device ID of the PC this connection is pinned to (the TLS handshake accepted only that key). A transfer or a queued message is for one PC. */
     val peerDeviceId: String
 
@@ -101,6 +108,9 @@ interface SessionListener {
 
     /** A valid `clipboard` from the PC, already acked. */
     fun onClipboardReceived(id: String, text: String)
+
+    /** A valid `link` from the PC, already acked (the title and source app are cleaned). Called in arrival order from the socket's thread: don't block. */
+    fun onLinkReceived(fromName: String, id: String, link: LinkMessage) = Unit
 
     /**
      * A valid, new `offer`, before it is acked: null accepts it, an error code (`disk_full`) answers with an `error` instead of the
@@ -160,6 +170,8 @@ class LinkSession(
     private var helloTimeout: Job? = null
 
     override val isReady: Boolean get() = helloAcceptedAt != null && !ended.isCompleted
+
+    override val peerUnderstandsLink: Boolean get() = receiver.peer?.understandsLink == true
 
     /** File requests wait longer than the connection's own defaults: a response may follow a long upload, and a busy PC may be slow to write. */
     override val httpEndpoint: HttpEndpoint = HttpEndpoint(
@@ -264,6 +276,9 @@ class LinkSession(
         )
         if (!ended.complete(end)) return
         helloTimeout?.cancel()
+        // The file connections of this session are idle sockets to a PC that is gone (or about to be reached by a new session with a pool of
+        // its own): close them now instead of leaving them to the 20 s keep-alive.
+        httpEndpoint.client.connectionPool.evictAll()
         // Anyone still waiting for an ack gets an answer that isn't one, instead of a cancellation.
         pending.values.forEach { it.complete(Action.CloseOnly) }
     }
@@ -285,6 +300,7 @@ class LinkSession(
             is Action.ShowPing -> listener.onPingReceived(receiver.peer?.name ?: "PC")
             is Action.DeliverText -> listener.onTextReceived(receiver.peer?.name ?: "PC", action.id, action.text, action.isUrl, action.sensitive)
             is Action.SetClipboard -> listener.onClipboardReceived(action.id, action.text)
+            is Action.DeliverLink -> listener.onLinkReceived(receiver.peer?.name ?: "PC", action.id, action.link)
             is Action.StartDownload -> listener.onOfferReceived(receiver.peer?.name ?: "PC", action.offer)
             is Action.RepeatOffer -> listener.onOfferRepeated(receiver.peer?.name ?: "PC", action.offer)
             is Action.CancelTransfer -> listener.onCancelReceived(action.transferId, action.reason)

@@ -23,6 +23,15 @@ import kotlinx.coroutines.launch
  * See android/README.md for every command.
  */
 class DebugCommandReceiver : BroadcastReceiver() {
+    /** The handler the service uses for what the PC sends, built over the real clipboard, notifications and settings. */
+    private fun incoming(context: Context) = context.graph.let { graph ->
+        app.kinrelay.android.link.IncomingHandler(
+            AndroidClipboard(context), graph.notifications, graph.clipboardGuard, graph.log,
+            copyAutomatically = { graph.settings.copyReceivedTextAutomatically() },
+            lockScreenLinks = { graph.settings.showLinkPreviewsOnLockScreen() },
+        )
+    }
+
     override fun onReceive(context: Context, intent: Intent) {
         val graph = context.graph
         val command = intent.action.orEmpty().substringAfterLast('.')
@@ -75,6 +84,50 @@ class DebugCommandReceiver : BroadcastReceiver() {
                         } else {
                             val result = graph.sender.send(text, SystemClock.elapsedRealtime(), SendSource.DEBUG, sensitive = intent.getBooleanExtra("sensitive", false))
                             graph.log.i("debug", "CMD SEND_TEXT result=$result")
+                        }
+                    }
+                    // A `link` or `text` as if the PC had sent it (2B.1 tests; the desktop's own link send may not be built yet): the same
+                    // IncomingHandler the service uses, so the notification, its tap, Copy, grouping and the settings are the real ones.
+                    // `--es url <url> [--es title <title>] [--es id <id>]`
+                    "LINK_FROM_PC" -> {
+                        val url = intent.getStringExtra("url")
+                        if (url == null) {
+                            graph.log.w("debug", "CMD LINK_FROM_PC needs --es url <url>")
+                        } else {
+                            val shown = incoming(context).onLink(
+                                "DESK-PC", intent.getStringExtra("id") ?: app.kinrelay.android.protocol.MessageIds.newId(), url,
+                                intent.getStringExtra("title")?.let(app.kinrelay.android.protocol.LinkWire::cleanTitle), null,
+                            )
+                            graph.log.i("debug", "CMD LINK_FROM_PC shown=${shown != null}")
+                        }
+                    }
+                    // `--es text <text> [--ez sensitive true]`
+                    "TEXT_FROM_PC" -> {
+                        val text = intent.getStringExtra("text")
+                        if (text == null) {
+                            graph.log.w("debug", "CMD TEXT_FROM_PC needs --es text <text>")
+                        } else {
+                            incoming(context).onText(
+                                "DESK-PC", intent.getStringExtra("id") ?: app.kinrelay.android.protocol.MessageIds.newId(), text,
+                                isUrl = app.kinrelay.android.protocol.UrlRules.isUrl(text), sensitive = intent.getBooleanExtra("sensitive", false),
+                            )
+                            graph.log.i("debug", "CMD TEXT_FROM_PC done")
+                        }
+                    }
+                    // `--ez lockscreen true|false`, `--ez copytext true|false` (either or both)
+                    "SET_LINK_PREFS" -> {
+                        if (intent.hasExtra("lockscreen")) graph.settings.setShowLinkPreviewsOnLockScreen(intent.getBooleanExtra("lockscreen", false))
+                        if (intent.hasExtra("copytext")) graph.settings.setCopyReceivedTextAutomatically(intent.getBooleanExtra("copytext", true))
+                        graph.log.i("debug", "CMD SET_LINK_PREFS lockscreen=${graph.settings.showLinkPreviewsOnLockScreen()} copytext=${graph.settings.copyReceivedTextAutomatically()}")
+                    }
+                    // `--es url <url> [--es title <title>]`: the share sheet's path without the sheet (a ShareActivity intent works too)
+                    "SEND_LINK" -> {
+                        val url = intent.getStringExtra("url")
+                        if (url == null) {
+                            graph.log.w("debug", "CMD SEND_LINK needs --es url <url>")
+                        } else {
+                            val result = graph.sender.sendLink(url, intent.getStringExtra("title"), SystemClock.elapsedRealtime(), SendSource.DEBUG)
+                            graph.log.i("debug", "CMD SEND_LINK result=$result")
                         }
                     }
                     "SET_CLIPBOARD" -> {
@@ -135,7 +188,7 @@ class DebugCommandReceiver : BroadcastReceiver() {
                         // The text queue and history, without any text (id, direction, status, attempts, source, flags, size).
                         val items = graph.database.texts().recent(50)
                         graph.log.i("debug", "CMD TEXTS count=${items.size}")
-                        items.forEach { graph.log.i("debug", "CMD TEXT ${it.id} ${it.direction} ${it.status} attempts=${it.attempts} src=${it.source} sensitive=${it.sensitive} bytes=${it.byteSize} err=${it.errorCode} bodyKept=${it.body != null} retriedAs=${it.retriedAs}") }
+                        items.forEach { graph.log.i("debug", "CMD TEXT ${it.id} ${it.direction} ${it.status} attempts=${it.attempts} src=${it.source} sensitive=${it.sensitive} bytes=${it.byteSize} err=${it.errorCode} bodyKept=${it.body != null} retriedAs=${it.retriedAs} kind=${it.kind} titleChars=${it.title?.length ?: 0}") }
                     }
                     "CANCEL_TEXT" -> {
                         val id = intent.getStringExtra("id")

@@ -15,6 +15,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -24,6 +25,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import app.kinrelay.android.data.DeviceEntity
@@ -31,6 +33,18 @@ import app.kinrelay.android.identity.DeviceIds
 import app.kinrelay.android.notify.NotificationChannels
 import app.kinrelay.android.setup.SetupActions
 import kotlinx.coroutines.launch
+
+/** A setting with a switch, a title and a line that says what each position does. */
+@Composable
+private fun SettingSwitch(title: String, description: String, checked: Boolean, onChecked: (Boolean) -> Unit) {
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            Text(description, style = MaterialTheme.typography.bodySmall)
+        }
+        Switch(checked = checked, onCheckedChange = onChecked)
+    }
+}
 
 /**
  * Settings (milestone 1.4): the device name that goes in `hello`, the setup (onboarding) again, the notification channels, unpair, and About.
@@ -44,6 +58,10 @@ fun SettingsScreen(
     systemName: String,
     phoneShortId: String?,
     versionName: String,
+    showLinkPreviewsOnLockScreen: Boolean,
+    copyReceivedTextAutomatically: Boolean,
+    onShowLinkPreviewsOnLockScreen: (Boolean) -> Unit,
+    onCopyReceivedTextAutomatically: (Boolean) -> Unit,
     onSaveName: suspend (String) -> Unit,
     onOpenSetup: () -> Unit,
     onOpenDebug: () -> Unit,
@@ -88,6 +106,27 @@ fun SettingsScreen(
                 OutlinedButton(onClick = { SetupActions.openChannelSettings(context, NotificationChannels.LINK) }, modifier = Modifier.fillMaxWidth()) { Text("Connection status") }
                 OutlinedButton(onClick = { SetupActions.openChannelSettings(context, NotificationChannels.ARRIVALS) }, modifier = Modifier.fillMaxWidth()) { Text("Arrivals: text, files, pings") }
                 OutlinedButton(onClick = { SetupActions.openChannelSettings(context, NotificationChannels.TRANSFERS) }, modifier = Modifier.fillMaxWidth()) { Text("File transfers: progress and results") }
+            }
+        }
+
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Links and text from your PC", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "A link from your PC opens with one tap on its notification: in the app that owns it (YouTube for a YouTube link), or your browser. " +
+                        "Kin never opens a link or copies it by itself; the notification has a Copy link button.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                SettingSwitch(
+                    "Show link previews on the lock screen",
+                    "Off: a locked phone shows only \"Link from your PC\", without the page title or address (when Android is set to hide sensitive notification content on the lock screen, which is the system setting that decides). On: it shows both.",
+                    showLinkPreviewsOnLockScreen, onShowLinkPreviewsOnLockScreen,
+                )
+                SettingSwitch(
+                    "Copy received text automatically",
+                    "On: a text you send from the PC is on this phone's clipboard when it arrives. Off: the notification has a Copy button instead.",
+                    copyReceivedTextAutomatically, onCopyReceivedTextAutomatically,
+                )
             }
         }
 

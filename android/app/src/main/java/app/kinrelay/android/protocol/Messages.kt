@@ -1,6 +1,8 @@
 package app.kinrelay.android.protocol
 
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import java.security.SecureRandom
@@ -14,8 +16,14 @@ const val MAX_OFFER_FILES = 800
 /** A text larger than this (UTF-8, wire form) is sent as a `.txt` file instead (the sender size threshold). */
 const val MAX_TEXT_BYTES = 128 * 1024
 
-/** A `hello` the receiver accepted. */
-data class Hello(val id: String, val name: String, val platform: String, val appVersion: String)
+/**
+ * A `hello` the receiver accepted. [capabilities] are the extra features the peer says it understands (`link` from 0.2.0); empty for a 0.1.x
+ * peer and for a `capabilities` that is not an array. They are the peer's for this connection only.
+ */
+data class Hello(val id: String, val name: String, val platform: String, val appVersion: String, val capabilities: Set<String> = emptySet()) {
+    /** A `link` may go to this peer; to any other peer the same item goes as a `text` (protocol.md, "Versioning"). */
+    val understandsLink: Boolean get() = LinkWire.CAPABILITY_LINK in capabilities
+}
 
 object ErrorCodes {
     const val BAD_REQUEST = "bad_request"
@@ -27,13 +35,15 @@ object ErrorCodes {
 
 /** Builders for the frames this app sends. Output is compact JSON, as senders must write it. */
 object Frames {
-    fun hello(id: String, name: String, platform: String, appVersion: String): String = obj {
+    /** [capabilities]: what this app understands beyond protocol 1; `link` since 2B.1 (the sender of a `link` asks the peer's `hello` for it). */
+    fun hello(id: String, name: String, platform: String, appVersion: String, capabilities: List<String> = listOf(LinkWire.CAPABILITY_LINK)): String = obj {
         put("type", "hello")
         put("id", id)
         put("protocol", PROTOCOL_VERSION)
         put("name", name)
         put("platform", platform)
         put("appVersion", appVersion)
+        if (capabilities.isNotEmpty()) put("capabilities", buildJsonArray { capabilities.forEach { add(JsonPrimitive(it)) } })
     }
 
     fun ack(ref: String): String = obj {
@@ -66,6 +76,21 @@ object Frames {
             put("text", wireText(text))
             put("isUrl", isUrl)
             if (sensitive) put("sensitive", true)
+        }.toString()
+        return frame.takeIf { Utf8.size(it) <= MAX_FRAME_BYTES }
+    }
+
+    /**
+     * An explicit send of a web address (a shared page). The caller has checked [LinkWire.isLinkUrl]; [title] is cleaned and cut here, and left out when
+     * empty. Returns null when the serialized frame is over 1 MiB (it can't be: a URL is at most 8 KiB and a title 300 characters).
+     */
+    fun link(id: String, url: String, title: String?, sourceApp: String? = null): String? {
+        val frame = buildJsonObject {
+            put("type", "link")
+            put("id", id)
+            put("url", url)
+            title?.let(LinkWire::cleanTitle)?.let { put("title", it) }
+            sourceApp?.let(LinkWire::cleanSourceApp)?.let { put("sourceApp", it) }
         }.toString()
         return frame.takeIf { Utf8.size(it) <= MAX_FRAME_BYTES }
     }

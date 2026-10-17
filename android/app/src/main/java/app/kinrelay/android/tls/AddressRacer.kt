@@ -44,16 +44,20 @@ class AddressRacer(
                 }
             }
             val failures = LinkedHashMap<PairingAddress, Throwable>()
-            val winner = withTimeoutOrNull(timeoutMillis) {
-                repeat(addresses.size) {
-                    val (address, error) = results.receive()
-                    if (error == null) return@withTimeoutOrNull address
-                    failures[address] = error
+            val winner = try {
+                withTimeoutOrNull(timeoutMillis) {
+                    repeat(addresses.size) {
+                        val (address, error) = results.receive()
+                        if (error == null) return@withTimeoutOrNull address
+                        failures[address] = error
+                    }
+                    null
                 }
-                null
+            } finally {
+                // Closing the sockets unblocks probes that are still connecting, so the scope ends at once. In a `finally`, so a cancel of the
+                // race (a probe that is cancelled, the service stopping) unwinds as fast as a normal end instead of waiting for the connect timeout.
+                open.forEach { runCatching { it.close() } }
             }
-            // Closing the sockets unblocks probes that are still connecting, so the scope ends at once.
-            open.forEach { runCatching { it.close() } }
             if (winner != null) {
                 RaceResult.Winner(winner)
             } else {

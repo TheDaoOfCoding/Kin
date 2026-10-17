@@ -78,27 +78,42 @@ class TextArrivals(private val maxLines: Int = 5) {
         val lines: List<String?>,
         /** The newest text's link, if it is one that may be opened (`http` or `https`); null otherwise. */
         val openUrl: String?,
+        /** The newest text, for the Copy button. Null before the first arrival. */
+        val latest: Latest? = null,
+        /** The newest text is on the clipboard already ("Copy received text automatically" is on). */
+        val copied: Boolean = false,
     )
+
+    /** The newest text as the Copy button needs it: its message ID, the whole text (memory only, never in a PendingIntent) and whether it is sensitive. */
+    class Latest(val id: String, val text: String?, val sensitive: Boolean)
 
     private var pcName = ""
     private var count = 0
     private var lines = ArrayDeque<String?>()
     private var openUrl: String? = null
+    private var latest: Latest? = null
+    private var copied = false
 
     /** Adds one arrival and returns the state to show. [preview] is null for a sensitive text. */
     @Synchronized
-    fun add(pcName: String, preview: String?, openUrl: String?): State {
+    fun add(pcName: String, preview: String?, openUrl: String?, latest: Latest? = null, copied: Boolean = false): State {
         if (this.pcName != pcName) reset()
         this.pcName = pcName
         count++
         lines.addLast(preview)
         while (lines.size > maxLines) lines.removeFirst()
         this.openUrl = openUrl
+        this.latest = latest
+        this.copied = copied
         return state()
     }
 
     @Synchronized
-    fun state(): State = State(pcName, count, lines.toList(), openUrl)
+    fun state(): State = State(pcName, count, lines.toList(), openUrl, latest, copied)
+
+    /** The newest text, if [messageId] is its ID (the Copy button of an older notification asks for a text that is gone from memory). */
+    @Synchronized
+    fun latest(messageId: String): Latest? = latest?.takeIf { it.id == messageId }
 
     /** The user saw or dismissed the notification: the next text starts a new one. */
     @Synchronized
@@ -106,6 +121,8 @@ class TextArrivals(private val maxLines: Int = 5) {
         count = 0
         lines.clear()
         openUrl = null
+        latest = null
+        copied = false
     }
 
     @Synchronized

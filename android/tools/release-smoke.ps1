@@ -40,7 +40,10 @@ foreach ($name in 'ANDROID_HOME', 'JAVA_HOME') {
 $Repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $Emu = Join-Path $Repo 'tools\emulator'
 $Adb = Join-Path $(if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { Join-Path $env:LOCALAPPDATA 'Android\Sdk' }) 'platform-tools\adb.exe'
-$Pkg = 'app.kinrelay.android'
+# The smoke APK has its own application ID (applicationIdSuffix ".smoke"), so it never installs over the real app; the classes keep the namespace.
+# `-Apk` of another build (the real release, a debug build) is the real ID.
+$Ns = 'app.kinrelay.android'
+$Pkg = if ($buildSmoke -or ($Apk -like '*app-smoke.apk')) { "$Ns.smoke" } else { $Ns }
 $Serial = 'emulator-5554'
 $Run = Get-Date -Format 'HHmmss'
 $Data = Join-Path $env:TEMP ('kin-smoke-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
@@ -136,7 +139,7 @@ try {
     # ---- "Scan code": the camera permission is asked for only on the tap, a denial is handled, and the scan screen opens after "Allow"
     if ($sdk -ge 37) { A shell pm grant $Pkg android.permission.ACCESS_LOCAL_NETWORK | Out-Null }
     if ($sdk -ge 33) { A shell pm grant $Pkg android.permission.POST_NOTIFICATIONS | Out-Null }
-    A shell am start -n "$Pkg/.MainActivity" | Out-Null
+    A shell am start -n "$Pkg/$Ns.MainActivity" | Out-Null
     Check 'the pairing screen shows "Scan code"' (Wait-Until { Ui-Has 'Scan code' } 20)
     Check 'the camera permission was not asked at start-up' (-not ((Ui-Dump) -match 'take pictures'))
     Shot '01-pairing-screen'
@@ -183,7 +186,7 @@ try {
     $paired = $false
     for ($try = 1; $try -le 3 -and -not $paired; $try++) {
         if ($try -gt 1) { Say "pairing attempt $try" }
-        A shell am start -a android.intent.action.VIEW -d "'$url'" 2>$null | Out-Null
+        A shell am start -a android.intent.action.VIEW -p $Pkg -d "'$url'" 2>$null | Out-Null
         $shown = Wait-Until { Ui-Has 'Pair with this PC?' } 15
         if ($try -eq 1) { Check 'the link opens the confirmation screen' $shown; Shot '05-confirm-pairing' }
         if ($shown) { Tap-UiText @('Confirm') | Out-Null }
@@ -203,7 +206,7 @@ try {
     # ---- text phone -> PC (the share intent) and PC -> phone (--send-clipboard)
     $t1 = "release smoke text $Run"
     $beforeId = (Get-Status).lastReceived.text.id
-    A shell "am start -n $Pkg/.share.ShareActivity -a android.intent.action.SEND -t text/plain --es android.intent.extra.TEXT '$t1'" | Out-Null
+    A shell "am start -n $Pkg/$Ns.share.ShareActivity -a android.intent.action.SEND -t text/plain --es android.intent.extra.TEXT '$t1'" | Out-Null
     Check 'text phone -> PC arrived' (Wait-Until { $r = (Get-Status).lastReceived.text; $r -and $r.id -ne $beforeId } 15)
     Check 'the PC clipboard holds that text' (Wait-Until { (Get-Clipboard -Raw) -ceq $t1 } 5) ''
     A shell input keyevent KEYCODE_HOME | Out-Null
@@ -243,7 +246,7 @@ try {
     if ($mediaId) {
         $uri = "content://media/external/file/$mediaId"
         $before = @(@((Get-Status).transfers.active) + @((Get-Status).transfers.recent) | Where-Object { $_ } | ForEach-Object { $_.id })
-        A shell "am start --grant-read-uri-permission -n $Pkg/.share.ShareActivity -a android.intent.action.SEND -d $uri -t application/octet-stream --eu android.intent.extra.STREAM $uri" | Out-Null
+        A shell "am start --grant-read-uri-permission -n $Pkg/$Ns.share.ShareActivity -a android.intent.action.SEND -d $uri -t application/octet-stream --eu android.intent.extra.STREAM $uri" | Out-Null
         $done = Wait-Until { $x = @(@((Get-Status).transfers.active) + @((Get-Status).transfers.recent)) | Where-Object { $_ -and $_.direction -eq 'in' -and $before -notcontains $_.id } | Select-Object -First 1; if ($x -and $x.status -eq 'done') { $true } else { $false } } 60
         Check 'file phone -> PC: the PC finished the transfer' $done
         $recv = Join-Path (Join-Path $Data 'received') $name2
@@ -270,7 +273,7 @@ try {
     Check 'install share-source (test app)' ($srcInstall -match 'Success') ($srcInstall.Trim())
     if ($srcInstall -match 'Success') {
         $before = @(@((Get-Status).transfers.active) + @((Get-Status).transfers.recent) | Where-Object { $_ } | ForEach-Object { $_.id })
-        A shell am start -n app.kinrelay.sharesource/.ShareActivity --ei n 3 --ei size 200000 | Out-Null
+        A shell am start -n app.kinrelay.sharesource/.ShareActivity --ei n 3 --ei size 200000 --es pkg $Pkg | Out-Null
         $done = Wait-Until { $x = @(@((Get-Status).transfers.active) + @((Get-Status).transfers.recent)) | Where-Object { $_ -and $_.direction -eq 'in' -and $before -notcontains $_.id } | Select-Object -First 1; [bool]($x -and $x.status -eq 'done') } 60
         Check 'batch phone -> PC: the PC finished the 3-file transfer' $done
         $same = $true

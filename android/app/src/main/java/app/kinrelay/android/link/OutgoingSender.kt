@@ -5,6 +5,7 @@ import app.kinrelay.android.data.TextSource
 import app.kinrelay.android.data.TransferStatus
 import app.kinrelay.android.log.KinLog
 import app.kinrelay.android.protocol.Frames
+import app.kinrelay.android.protocol.LinkWire
 import app.kinrelay.android.protocol.MessageIds
 import app.kinrelay.android.protocol.TextRules
 import app.kinrelay.android.protocol.UrlRules
@@ -14,6 +15,7 @@ import app.kinrelay.android.transfer.PeerInfo
 /** Where an explicit send came from. Only a clipboard send is checked against the loop guard. */
 enum class SendSource(val stored: String) {
     SHARE(TextSource.SHARE),
+    SHARE_LINK(TextSource.SHARE_LINK),
     PROCESS_TEXT(TextSource.PROCESS_TEXT),
     CLIPBOARD(TextSource.CLIPBOARD),
     DEBUG(TextSource.DEBUG),
@@ -49,6 +51,9 @@ sealed interface SendOutcome {
 
     /** Blank text: nothing to send. */
     data object Empty : SendOutcome
+
+    /** A `link` whose URL fails the wire rule (`http` or `https` only): never sent or queued, and the user was told "That isn't a web link". */
+    data object NotAWebLink : SendOutcome
 
     /** The text is what the PC just put on the clipboard (loop guard). */
     data object Echo : SendOutcome
@@ -146,30 +151,58 @@ class OutgoingSender(
 
         // Saved first. From here on the text can't be lost by a dead connection or a killed process.
         val item = outbox.enqueue(text, isUrl, sensitive, source.stored, peer)
+        return deliver(item.id, peer, tapAtMillis, source, "text", "${logged(fingerprint, sensitive)} isUrl=$isUrl sensitive=$sensitive")
+    }
+
+    /**
+     * Sends a web link (2B.1: a page shared to Kin): the same queue-first path as a text, so it waits for the PC when it is away and goes out in
+     * order after the `hello`, for at most 7 days. [rawUrl] is what the user shared: it is trimmed here (the wire rule takes the URL as sent) and
+     * must then be one `http` or `https` URL, or nothing is queued and the user is told "That isn't a web link". [rawTitle] is the page title
+     * (the share's subject), cleaned and cut; a title that is just the URL is dropped. Whether it goes as a `link` or, to a PC that is an old
+     * version, as a `text` is decided when it goes on the wire ([TextOutbox.sendOne]).
+     */
+    suspend fun sendLink(rawUrl: String, rawTitle: String?, tapAtMillis: Long, source: SendSource): SendOutcome {
+        val url = rawUrl.trim { UrlRules.isWhitespace(it) }
+        if (!LinkWire.isLinkUrl(url)) {
+            alerts.message("That isn't a web link.")
+            return SendOutcome.NotAWebLink
+        }
+        val title = rawTitle?.let(LinkWire::cleanTitle)?.takeIf { it != url }
+        val peer = link.peer()
+        if (peer == null) {
+            alerts.message("Pair a PC first.")
+            return SendOutcome.NotPaired
+        }
+        val item = outbox.enqueueLink(url, title, source.stored, peer)
+        return deliver(item.id, peer, tapAtMillis, source, "link", "titleChars=${title?.length ?: 0}")
+    }
+
+    /** What follows saving a text or link: wait for a connection, flush the queue, and tell the user how it went. */
+    private suspend fun deliver(itemId: String, peer: PeerInfo, tapAtMillis: Long, source: SendSource, what: String, detail: String): SendOutcome {
         val connection = link.await(connectWaitMillis, peer.deviceId)
         if (connection != null) flusher.flush(connection)
 
-        val result = outbox.get(item.id)
+        val result = outbox.get(itemId)
         return when (result?.status) {
             TransferStatus.DONE -> {
                 val arrival = clock.elapsedMillis() - tapAtMillis
                 arrivals.record(arrival)
-                log.i("link", "text sent ($source) ${logged(fingerprint, sensitive)} isUrl=$isUrl sensitive=$sensitive; tap to ack $arrival ms")
+                log.i("link", "$what sent ($source) $detail; tap to ack $arrival ms")
                 alerts.sent(peer.name, arrival)
                 SendOutcome.Delivered(arrival)
             }
             TransferStatus.FAILED -> {
                 val code = result.errorCode ?: "failed"
-                log.w("link", "send ($source): not delivered, $code ${logged(fingerprint, sensitive)}")
+                log.w("link", "send ($source): not delivered, $code $detail")
                 alerts.sendFailed("${peer.name} refused it", result.message ?: "The PC answered with an error ($code).")
                 SendOutcome.Refused(code)
             }
             TransferStatus.CANCELED -> SendOutcome.Canceled
             else -> {
-                outbox.markReportedQueued(item.id)
+                outbox.markReportedQueued(itemId)
                 val noReply = connection != null
                 val reason = if (noReply) "No reply from ${peer.name} yet." else link.unreachableReason()
-                log.w("link", "send ($source): queued, ${if (noReply) "no ack" else "PC not reachable: $reason"} ${logged(fingerprint, sensitive)}")
+                log.w("link", "send ($source): queued, ${if (noReply) "no ack" else "PC not reachable: $reason"} $detail")
                 alerts.queued(peer.name, reason, afterNoReply = noReply)
                 SendOutcome.Queued(reason, afterNoReply = noReply)
             }

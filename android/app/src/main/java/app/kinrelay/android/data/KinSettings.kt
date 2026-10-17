@@ -31,6 +31,10 @@ data class Stats(
     val deviceName: String? = null,
     /** The reliability setup (notifications, battery, OEM steps) was shown and finished or skipped. */
     val setupDone: Boolean = false,
+    /** "Show link previews on the lock screen": off by default, so a link's title and address are hidden there. */
+    val showLinkPreviewsOnLockScreen: Boolean = false,
+    /** "Copy received text automatically": on by default (the behaviour since 1.2: a text from the PC is on the clipboard when it arrives). */
+    val copyReceivedTextAutomatically: Boolean = true,
 )
 
 class KinSettings(context: Context) {
@@ -48,6 +52,8 @@ class KinSettings(context: Context) {
             recentArrivals = prefs[ARRIVALS]?.split(',')?.mapNotNull { it.toLongOrNull() }.orEmpty(),
             deviceName = prefs[DEVICE_NAME]?.takeIf { it.isNotBlank() },
             setupDone = prefs[SETUP_DONE] == true,
+            showLinkPreviewsOnLockScreen = prefs[LOCK_SCREEN_LINKS] == true,
+            copyReceivedTextAutomatically = prefs[COPY_TEXT_AUTOMATICALLY] != false,
         )
     }
 
@@ -75,6 +81,15 @@ class KinSettings(context: Context) {
     suspend fun deviceName(): String? = store.data.first()[DEVICE_NAME]?.takeIf { it.isNotBlank() }
 
     suspend fun setSetupDone(done: Boolean) = store.edit { it[SETUP_DONE] = done }
+
+    suspend fun showLinkPreviewsOnLockScreen(): Boolean = store.data.first()[LOCK_SCREEN_LINKS] == true
+
+    suspend fun setShowLinkPreviewsOnLockScreen(show: Boolean) = store.edit { it[LOCK_SCREEN_LINKS] = show }
+
+    /** Whether a `text` from the PC is put on the phone's clipboard when it arrives (default true). The automatic `clipboard` sync is separate and always on. */
+    suspend fun copyReceivedTextAutomatically(): Boolean = store.data.first()[COPY_TEXT_AUTOMATICALLY] != false
+
+    suspend fun setCopyReceivedTextAutomatically(copy: Boolean) = store.edit { it[COPY_TEXT_AUTOMATICALLY] = copy }
 
     /** How the previous run of the service ended. */
     enum class PreviousRun {
@@ -124,5 +139,7 @@ class KinSettings(context: Context) {
         private val ARRIVALS = stringPreferencesKey("recent_arrivals")
         private val DEVICE_NAME = stringPreferencesKey("device_name")
         private val SETUP_DONE = booleanPreferencesKey("setup_done")
+        private val LOCK_SCREEN_LINKS = booleanPreferencesKey("link_previews_on_lock_screen")
+        private val COPY_TEXT_AUTOMATICALLY = booleanPreferencesKey("copy_received_text_automatically")
     }
 }

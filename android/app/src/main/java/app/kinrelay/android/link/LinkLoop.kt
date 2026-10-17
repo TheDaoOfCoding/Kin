@@ -5,6 +5,7 @@ import app.kinrelay.android.pairing.PairingAddress
 import app.kinrelay.android.protocol.CloseAction
 import app.kinrelay.android.protocol.CloseRules
 import app.kinrelay.android.protocol.Hello
+import app.kinrelay.android.protocol.LinkMessage
 import app.kinrelay.android.protocol.Offer
 import app.kinrelay.android.protocol.OfferHistory
 import app.kinrelay.android.tls.RaceResult
@@ -40,6 +41,9 @@ interface LinkHost {
 
     /** A `clipboard` from the PC (acked already). Called one at a time, in arrival order. */
     suspend fun onClipboardReceived(id: String, text: String)
+
+    /** A `link` from the PC (acked already; the title and source app are cleaned). Called one at a time, in arrival order, with the texts. */
+    suspend fun onLinkReceived(fromName: String, id: String, link: LinkMessage) = Unit
 
     /** Before an `offer` is acked: null accepts it, an error code refuses it. Cheap and synchronous. */
     fun acceptOffer(offer: Offer): String? = null
@@ -164,6 +168,9 @@ class LinkLoop(
 
                 override fun onClipboardReceived(id: String, text: String) =
                     deliveries.submit { host.onClipboardReceived(id, text) }
+
+                override fun onLinkReceived(fromName: String, id: String, link: LinkMessage) =
+                    deliveries.submit { host.onLinkReceived(fromName, id, link) }
 
                 override fun acceptOffer(offer: Offer): String? = host.acceptOffer(offer)
 

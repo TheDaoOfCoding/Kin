@@ -86,7 +86,7 @@ class MigrationTest {
 
     @Test
     fun theExportedSchemasAreTheVersionsTheDatabaseDeclares() {
-        for (version in 2..4) assertEquals(version, schema(version).getValue("version").jsonPrimitive.content.toInt())
+        for (version in 2..5) assertEquals(version, schema(version).getValue("version").jsonPrimitive.content.toInt())
     }
 
     @Test
@@ -178,6 +178,27 @@ class MigrationTest {
         )
         assertEquals(listOf<String?>(null), query(old, "SELECT retriedAs FROM texts") { if (it.isNull(0)) null else it.getText(0) })
         assertSameAsFresh(old, 4)
+    }
+
+    @Test
+    fun migratingV4ToV5MakesTextsAbleToHoldLinksAndKeepsEveryRow() {
+        val old = open("v4.db")
+        createAll(old, schema(4))
+        old.execSQL("INSERT INTO devices VALUES ('pc-device-id', 'Desk PC', 'windows', 1000, 2000, '10.0.2.2:47821')")
+        // columns: id, direction, peerDeviceId, peerName, status, createdAtMillis, finishedAtMillis, body, byteSize, sensitive, isUrl, source, errorCode, message, attempts, retriedAs
+        old.execSQL("INSERT INTO texts VALUES ('x1', 'up', 'pc-device-id', 'Desk PC', 'queued', 1, NULL, 'https://example.com/', 20, 0, 1, 'share', NULL, NULL, 0, NULL)")
+        old.execSQL("INSERT INTO texts VALUES ('x2', 'down', 'pc-device-id', 'Desk PC', 'done', 2, 3, 'hello', 5, 0, 0, 'pc', NULL, NULL, 0, NULL)")
+
+        runBlocking { KinDatabase.MIGRATION_4_5.migrate(old) }
+
+        assertEquals(listOf("x1", "x2"), query(old, "SELECT id FROM texts ORDER BY id") { it.getText(0) })
+        // Every row that existed is a text with no title (a link is only made by the 2B.1 code).
+        assertEquals(listOf("text|null", "text|null"), query(old, "SELECT kind, title FROM texts ORDER BY id") { "${it.getText(0)}|${if (it.isNull(1)) "null" else it.getText(1)}" })
+        assertEquals(listOf("pc-device-id|Desk PC"), query(old, "SELECT deviceId, name FROM devices") { "${it.getText(0)}|${it.getText(1)}" })
+        assertSameAsFresh(old, 5)
+        assertTrue(KinDatabase.MIGRATION_4_5_STATEMENTS.none { it.contains("DROP", ignoreCase = true) })
+        assertEquals(4, KinDatabase.MIGRATION_4_5.startVersion)
+        assertEquals(5, KinDatabase.MIGRATION_4_5.endVersion)
     }
 
     @Test

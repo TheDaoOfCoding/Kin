@@ -1,6 +1,7 @@
 package app.kinrelay.android.protocol
 
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 
 /** One file of an `offer`. [name] is the sender's raw name: it is cleaned only when the file is saved. */
@@ -25,6 +26,9 @@ sealed class Action(val category: String) {
     class ShowPing(val id: String) : Action("show_ping_toast")
     class DeliverText(val id: String, val text: String, val isUrl: Boolean, val sensitive: Boolean) : Action("deliver_text")
     class SetClipboard(val id: String, val text: String) : Action("set_clipboard")
+
+    /** A valid `link` (2B.1), acked: show it and let the user open it. The URL is exactly as sent; the title and source app are cleaned. */
+    class DeliverLink(val id: String, val link: LinkMessage) : Action("deliver_link")
 
     /** A valid `offer`, acked: download the files. */
     class StartDownload(val offer: Offer) : Action("start_download")
@@ -90,7 +94,7 @@ class MessageReceiver(
     val helloAccepted: Boolean get() = peer != null
 
     private val handled: Set<String> = buildSet {
-        addAll(listOf("hello", "ack", "error", "ping", "unpair", "text", "cancel"))
+        addAll(listOf("hello", "ack", "error", "ping", "unpair", "text", "link", "cancel"))
         if (role == ReceiverRole.PHONE) addAll(listOf("clipboard", "offer")) else add("complete")
     }
 
@@ -127,6 +131,7 @@ class MessageReceiver(
             "error" -> onError(frame)
             "ping" -> onPing(frame, ref)
             "text" -> onText(frame, ref)
+            "link" -> onLink(frame, ref)
             "clipboard" -> onClipboard(frame, ref)
             "offer" -> onOffer(frame, ref)
             "complete" -> onComplete(frame, ref)
@@ -150,10 +155,14 @@ class MessageReceiver(
             return rejected(ErrorCodes.BAD_REQUEST, "The hello is missing a field or has a wrong type.", ref)
         }
         // 8. A hello has no ack and its ID isn't remembered.
-        val hello = Hello(id, name, platform, appVersion)
+        val hello = Hello(id, name, platform, appVersion, capabilitiesOf(frame["capabilities"]))
         peer = hello
         return Outcome(emptyList(), null, Action.HandshakeOk(hello))
     }
+
+    /** `capabilities`: an array's strings; anything that isn't an array is none, a non-string entry is skipped, and a bad value never fails the `hello`. */
+    private fun capabilitiesOf(element: JsonElement?): Set<String> =
+        (element as? JsonArray)?.mapNotNull { Fields.string(it) }?.toSet() ?: emptySet()
 
     private fun onAck(frame: JsonObject): Outcome {
         val ackRef = Fields.id(frame["ref"])
@@ -191,6 +200,20 @@ class MessageReceiver(
             return rejected(ErrorCodes.BAD_REQUEST, "The text message needs an id, a non-empty text and isUrl (and sensitive, if present, must be a boolean).", ref)
         }
         return processOnce(ref, Action.DeliverText(ref, text, isUrl, sensitive))
+    }
+
+    private fun onLink(frame: JsonObject, ref: String?): Outcome {
+        val url = Fields.string(frame["url"])?.takeIf(LinkWire::isLinkUrl)
+        // `title` and `sourceApp` are optional: absent or null is none, anything but a string is invalid. A dirty one is cleaned, never rejected.
+        val rawTitle = Fields.present(frame["title"])
+        val rawSource = Fields.present(frame["sourceApp"])
+        val title = if (rawTitle == null) "" else Fields.string(rawTitle)
+        val sourceApp = if (rawSource == null) "" else Fields.string(rawSource)
+        if (ref == null || url == null || title == null || sourceApp == null) {
+            return rejected(ErrorCodes.BAD_REQUEST, "The link message needs an id and a url that is an http or https address (a title and a sourceApp, if present, must be strings).", ref)
+        }
+        val link = LinkMessage(url, LinkWire.cleanTitle(title), LinkWire.cleanSourceApp(sourceApp))
+        return processOnce(ref, Action.DeliverLink(ref, link))
     }
 
     private fun onClipboard(frame: JsonObject, ref: String?): Outcome {

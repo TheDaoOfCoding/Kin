@@ -18,7 +18,7 @@ import androidx.sqlite.execSQL
  */
 @Database(
     entities = [DeviceEntity::class, SeenMessageEntity::class, TransferEntity::class, TransferFileEntity::class, TextItemEntity::class],
-    version = 4,
+    version = 5,
     exportSchema = true,
 )
 abstract class KinDatabase : RoomDatabase() {
@@ -97,10 +97,25 @@ abstract class KinDatabase : RoomDatabase() {
             "CREATE INDEX IF NOT EXISTS `index_texts_direction_status_createdAtMillis` ON `texts` (`direction`, `status`, `createdAtMillis`)",
         )
 
+        /**
+         * 2B.1 (links): a text row can be a link, with the page title. `kind` is `text` for every row that exists, `title` is empty. Nothing is dropped.
+         */
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override suspend fun migrate(connection: SQLiteConnection) {
+                MIGRATION_4_5_STATEMENTS.forEach { connection.execSQL(it) }
+            }
+        }
+
+        /** The statements of [MIGRATION_4_5], in order (a test runs them through a real SQLite). */
+        val MIGRATION_4_5_STATEMENTS = listOf(
+            "ALTER TABLE `texts` ADD COLUMN `kind` TEXT NOT NULL DEFAULT 'text'",
+            "ALTER TABLE `texts` ADD COLUMN `title` TEXT",
+        )
+
         fun create(context: Context): KinDatabase =
             Room.databaseBuilder<KinDatabase>(context.applicationContext, "kin.db")
                 .setDriver(AndroidSQLiteDriver())
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
                 .build()
     }
 }

@@ -72,6 +72,9 @@ android {
             create("smoke") {
                 initWith(getByName("release"))
                 matchingFallbacks += listOf("release")
+                // Its own application ID, so a smoke APK can never install over (or be mistaken for) the real app: app.kinrelay.android.smoke.
+                // The classes keep the namespace app.kinrelay.android (`am start -n app.kinrelay.android.smoke/app.kinrelay.android.MainActivity`).
+                applicationIdSuffix = ".smoke"
                 ndk { abiFilters.clear(); abiFilters += listOf("arm64-v8a", "armeabi-v7a") + kinSmokeAbis }
             }
         }
@@ -91,6 +94,8 @@ android {
     sourceSets {
         // The shared protocol vectors are loaded by the unit tests as classpath resources.
         getByName("test").resources.directories.add("../../protocol")
+        // The instrumented link-display test runs the same vectors on android.icu (a device or an emulator), as assets of the test APK.
+        getByName("androidTest").assets.directories.add("../../protocol")
     }
 }
 
@@ -122,6 +127,8 @@ dependencies {
     testImplementation(libs.okhttp.tls)
     // A real SQLite on the JVM, for the migration test (the unit tests have no Android SQLite).
     testImplementation(libs.sqlite.bundled.jvm)
+    // `android.icu` is only a stub on the JVM: the link-display unit tests run the same UTS 46 algorithm on ICU4J (the instrumented test uses the real android.icu).
+    testImplementation(libs.icu4j)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))

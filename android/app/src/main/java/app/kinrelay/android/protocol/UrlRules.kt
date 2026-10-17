@@ -6,7 +6,9 @@ package app.kinrelay.android.protocol
  * by itself. A text is an openable URL when
  * - the scheme is `http` or `https` (any case), followed by `://`;
  * - there is no whitespace or control character anywhere;
- * - the host is not empty and not only dots, or it is a non-empty `[IPv6]`;
+ * - the authority (up to the first `/`, `?` or `#`) has no `@` (no user information), no `\` and no `%` (changelog 55: a browser reads
+ *   `https://evil.example\@google.com` as `evil.example`, so the URL is refused, not shown with a mark);
+ * - the host is not empty and not only dots, or it is a non-empty `[IPv6]`; a host that is not an IPv6 literal has none of `[ ] < > ^ |`;
  * - a port, if present, is 1 to 65535 in ASCII digits (a bare `:` is refused);
  * - the whole thing is at most 8 KiB (UTF-8).
  *
@@ -14,6 +16,9 @@ package app.kinrelay.android.protocol
  */
 object UrlRules {
     const val MAX_BYTES = 8 * 1024
+
+    /** A host that is not a bracketed IPv6 literal has none of these (with whitespace, controls, `/ ? #`, `:`, `@`, `\` and `%` that is every character a browser refuses). */
+    private const val FORBIDDEN_IN_HOST = "[]<>^|"
 
     /** The trimmed URL if [text] is one openable URL, else null. */
     fun httpUrl(text: String): String? {
@@ -26,8 +31,8 @@ object UrlRules {
         if (url.any { isWhitespace(it) || isControl(it) }) return null
         if (Utf8.size(url) > MAX_BYTES) return null
         val authority = rest.takeWhile { it != '/' && it != '?' && it != '#' }
-        val hostPart = authority.substringAfterLast('@')
-        return if (hostAndPortAreValid(hostPart)) url else null
+        if (authority.any { it == '@' || it == '\\' || it == '%' }) return null
+        return if (hostAndPortAreValid(authority)) url else null
     }
 
     fun isUrl(text: String): Boolean = httpUrl(text) != null
@@ -46,6 +51,7 @@ object UrlRules {
         val colon = hostPart.indexOf(':')
         val host = if (colon >= 0) hostPart.substring(0, colon) else hostPart
         if (host.all { it == '.' }) return false // empty, or only dots
+        if (host.any { it in FORBIDDEN_IN_HOST }) return false
         return colon < 0 || portIsValid(hostPart.substring(colon + 1))
     }
 

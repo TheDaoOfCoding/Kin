@@ -4,6 +4,7 @@ import app.kinrelay.android.data.OutcomeRow
 import app.kinrelay.android.data.QueuePolicy
 import app.kinrelay.android.data.TextDao
 import app.kinrelay.android.data.TextItemEntity
+import app.kinrelay.android.data.TextKind
 import app.kinrelay.android.data.TextSource
 import app.kinrelay.android.data.TransferDirection
 import app.kinrelay.android.data.TransferStatus
@@ -105,6 +106,23 @@ class TextOutbox(
         return item
     }
 
+    /**
+     * Stores a web link as `queued` for [peer] (2B.1): the page of a share. [url] has passed [LinkWire.isLinkUrl]; [title] is the cleaned title or null.
+     * It is a link in this phone's history whatever the PC is: what goes on the wire is decided when it is sent ([sendOne]).
+     */
+    suspend fun enqueueLink(url: String, title: String?, source: String, peer: PeerInfo): TextItemEntity {
+        val item = TextItemEntity(
+            id = newId(), direction = TransferDirection.UP, peerDeviceId = peer.deviceId, peerName = peer.name, status = TransferStatus.QUEUED,
+            createdAtMillis = nowMillis(), finishedAtMillis = null, body = url, byteSize = Utf8.size(url).toLong(),
+            sensitive = false, isUrl = true, source = source, errorCode = null, message = null, attempts = 0,
+            kind = TextKind.LINK, title = title,
+        )
+        store.insert(item)
+        store.trim(QueuePolicy.HISTORY_LIMIT)
+        log.i("queue", "link ${item.id} queued ($source)")
+        return item
+    }
+
     suspend fun get(id: String): TextItemEntity? = store.get(id)
 
     suspend fun queued(): List<TextItemEntity> = store.queued()
@@ -121,7 +139,16 @@ class TextOutbox(
         if (item.peerDeviceId != connection.peerDeviceId) return TextSendResult.Skipped
         if (!store.claim(item.id)) return TextSendResult.Skipped
         val body = item.body
-        val frame = body?.let { Frames.text(item.id, it, item.isUrl, item.sensitive) }
+        // A link goes as a `link` to a PC that lists the capability in its latest hello, and as the bare URL in a `text` (same id, isUrl true,
+        // no title) to any other. Decided now, when it goes on the wire: a link queued for an old PC goes out as a link after the PC updates.
+        val asLink = item.kind == TextKind.LINK && connection.peerUnderstandsLink
+        val frame = body?.let {
+            when {
+                item.kind != TextKind.LINK -> Frames.text(item.id, it, item.isUrl, item.sensitive)
+                asLink -> Frames.link(item.id, it, item.title)
+                else -> Frames.text(item.id, it, isUrl = true)
+            }
+        }
         if (frame == null) {
             store.finish(item.id, TransferStatus.FAILED, "too_large", "That text can't be sent.", nowMillis())
             return TextSendResult.Failed("too_large")
@@ -134,7 +161,7 @@ class TextOutbox(
             val outcome = when (val result = connection.sendAcked(item.id, frame, ackTimeoutMillis)) {
                 AckResult.Acked -> {
                     store.finish(item.id, TransferStatus.DONE, null, null, nowMillis())
-                    log.i("queue", "text ${item.id} delivered (attempt ${item.attempts + 1})")
+                    log.i("queue", "text ${item.id} delivered (attempt ${item.attempts + 1}${if (item.kind == TextKind.LINK) ", on the wire as ${if (asLink) "a link" else "a text"}" else ""})")
                     TextSendResult.Sent(reportedQueued.remove(item.id))
                 }
                 is AckResult.Refused -> {
@@ -213,6 +240,22 @@ class TextOutbox(
                 id = id, direction = TransferDirection.DOWN, peerDeviceId = peerDeviceId, peerName = peerName, status = TransferStatus.DONE,
                 createdAtMillis = now, finishedAtMillis = now, body = text, byteSize = Utf8.size(text).toLong(), sensitive = false, isUrl = isUrl,
                 source = TextSource.PC, errorCode = null, message = null, attempts = 0,
+            )
+        )
+        store.trim(QueuePolicy.HISTORY_LIMIT)
+    }
+
+    /**
+     * A `link` the PC sent goes into the history of this phone: the address and the cleaned title. It is never put on the clipboard. A history item
+     * of a link is not "sensitive" (a `link` never is).
+     */
+    suspend fun recordIncomingLink(peerDeviceId: String, peerName: String, id: String, url: String, title: String?) {
+        val now = nowMillis()
+        store.insert(
+            TextItemEntity(
+                id = id, direction = TransferDirection.DOWN, peerDeviceId = peerDeviceId, peerName = peerName, status = TransferStatus.DONE,
+                createdAtMillis = now, finishedAtMillis = now, body = url, byteSize = Utf8.size(url).toLong(), sensitive = false, isUrl = true,
+                source = TextSource.PC, errorCode = null, message = null, attempts = 0, kind = TextKind.LINK, title = title,
             )
         )
         store.trim(QueuePolicy.HISTORY_LIMIT)

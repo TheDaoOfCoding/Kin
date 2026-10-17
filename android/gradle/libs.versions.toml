@@ -17,6 +17,7 @@ room = "3.0.3"
 datastore = "1.2.1"
 zxing = "3.5.4"
 camerax = "1.6.2"
+icu4j = "78.3"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -43,6 +44,7 @@ room-runtime = { group = "androidx.room3", name = "room3-runtime", version.ref =
 room-compiler = { group = "androidx.room3", name = "room3-compiler", version.ref = "room" }
 sqlite-bundled-jvm = { group = "androidx.sqlite", name = "sqlite-bundled-jvm", version.ref = "sqliteBundled" }
 androidx-datastore-preferences = { group = "androidx.datastore", name = "datastore-preferences", version.ref = "datastore" }
+icu4j = { group = "com.ibm.icu", name = "icu4j", version.ref = "icu4j" }
 zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxing" }
 androidx-camera-core = { group = "androidx.camera", name = "camera-core", version.ref = "camerax" }
 androidx-camera-camera2 = { group = "androidx.camera", name = "camera-camera2", version.ref = "camerax" }

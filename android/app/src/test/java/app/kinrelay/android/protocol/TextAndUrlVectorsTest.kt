@@ -21,7 +21,7 @@ class TextAndUrlVectorsTest {
     @Test
     fun everyUrlCase() {
         val cases = urls.cases("cases")
-        assertTrue("there are ${cases.size} cases", cases.size >= 100)
+        assertTrue("there are ${cases.size} cases", cases.size >= 138)
         assertEquals(8192, urls.getValue("maxBytes").jsonPrimitive.int)
         for (case in cases) {
             val name = case.getValue("name").str()
@@ -101,7 +101,8 @@ class TextAndUrlVectorsTest {
             val handler = app.kinrelay.android.link.IncomingHandler(
                 clipboard = { t, s -> clipboard += t to s },
                 alerts = object : app.kinrelay.android.link.Alerts {
-                    override fun textFrom(pcName: String, messageId: String, text: String?, openUrl: String?) { shown += Triple(text, openUrl, pcName) }
+                    override fun textFrom(pcName: String, messageId: String, text: String?, openUrl: String?, copyText: String?, sensitive: Boolean, copiedAlready: Boolean) { shown += Triple(text, openUrl, pcName) }
+                    override fun linkFrom(pcName: String, messageId: String, link: app.kinrelay.android.links.ReceivedLink, lockScreenPreviews: Boolean) = Unit
                     override fun sent(pcName: String?, arrivalMillis: Long) = Unit
                     override fun queued(pcName: String?, reason: String, afterNoReply: Boolean) = Unit
                     override fun sentLater(pcName: String?) = Unit

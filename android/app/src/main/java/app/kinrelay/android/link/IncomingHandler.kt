@@ -2,6 +2,7 @@ package app.kinrelay.android.link
 
 import app.kinrelay.android.clipboard.ClipboardGuard
 import app.kinrelay.android.clipboard.ClipboardPort
+import app.kinrelay.android.links.LinkRules
 import app.kinrelay.android.log.KinLog
 import app.kinrelay.android.protocol.UrlRules
 
@@ -12,12 +13,20 @@ import app.kinrelay.android.protocol.UrlRules
  *   History comes in 1.4, so for now the de-duplication memory is all that remembers it.
  * - `text` with `sensitive` (the PC saw a password manager): the clipboard is set and marked sensitive, the notification has no
  *   preview and no Open action, and nothing about the text is logged, not even its hash. It is never stored.
+ * - A `text` is put on the clipboard when it arrives unless the user turned "Copy received text automatically" off ([copyAutomatically]);
+ *   the notification always has a Copy button.
+ * - `link` (2B.1): checked again (`http` or `https` only, the real address worked out from the URL), then a notification with the title,
+ *   the address, a tap that opens it and a Copy link button. A link is **never** copied or opened by itself.
  */
 class IncomingHandler(
     private val clipboard: ClipboardPort,
     private val alerts: Alerts,
     private val guard: ClipboardGuard,
     private val log: KinLog,
+    /** "Copy received text automatically" (default on, the behaviour since 1.2). */
+    private val copyAutomatically: suspend () -> Boolean = { true },
+    /** "Show link previews on the lock screen" (default off). */
+    private val lockScreenLinks: suspend () -> Boolean = { false },
 ) {
     suspend fun onClipboard(text: String) {
         guard.notePeerSet(text)
@@ -27,17 +36,31 @@ class IncomingHandler(
     }
 
     suspend fun onText(fromName: String, id: String, text: String, isUrl: Boolean, sensitive: Boolean = false) {
-        guard.notePeerSet(text)
-        val written = write(text, sensitive = sensitive)
+        val automatic = copyAutomatically()
+        if (automatic) guard.notePeerSet(text)
+        val written = automatic && write(text, sensitive = sensitive)
         if (sensitive) {
-            alerts.textFrom(fromName, id, text = null, openUrl = null)
-            log.i("link", "sensitive text from '$fromName' written=$written (its content is not logged)")
+            alerts.textFrom(fromName, id, text = null, openUrl = null, copyText = text, sensitive = true, copiedAlready = written)
+            log.i("link", "sensitive text from '$fromName' written=$written automatic=$automatic (its content is not logged)")
         } else {
             val openUrl = if (isUrl) UrlRules.httpUrl(text) else null
-            alerts.textFrom(fromName, id, text, openUrl)
-            log.i("link", "text from '$fromName' ${ClipboardGuard.fingerprint(text)} isUrl=$isUrl openable=${openUrl != null} written=$written")
+            alerts.textFrom(fromName, id, text, openUrl, copyText = text, sensitive = false, copiedAlready = written)
+            log.i("link", "text from '$fromName' ${ClipboardGuard.fingerprint(text)} isUrl=$isUrl openable=${openUrl != null} written=$written automatic=$automatic")
         }
-        if (!written) tellNotCopied()
+        if (automatic && !written) tellNotCopied()
+    }
+
+    /** A `link` from the PC, already acked. Returns the link that was shown, or null when it is not one the phone accepts (nothing is shown). */
+    suspend fun onLink(fromName: String, id: String, url: String, title: String?, sourceApp: String?): app.kinrelay.android.links.ReceivedLink? {
+        val link = LinkRules.accept(url, title, sourceApp)
+        if (link == null) {
+            log.w("link", "a link from '$fromName' was refused: not an http or https address")
+            return null
+        }
+        alerts.linkFrom(fromName, id, link, lockScreenPreviews = lockScreenLinks())
+        // protocol.md: no URL in a log (a URL can carry a token), the length and the scheme at most.
+        log.i("link", "link from '$fromName' scheme=${link.url.substringBefore(':').lowercase()} urlChars=${link.url.length} titleChars=${link.title?.length ?: 0} warn=${link.warn}")
+        return link
     }
 
     /** The ack has gone out already, so without this the PC would say "sent" and Paste on the phone would give the old text. */

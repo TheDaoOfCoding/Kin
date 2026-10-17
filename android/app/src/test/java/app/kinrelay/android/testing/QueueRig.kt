@@ -87,7 +87,13 @@ class InMemoryTextStore : TextStore {
 
 /** Records what the user would have been told. */
 class RecordingAlerts : Alerts {
-    class TextAlert(val pc: String, val id: String, val text: String?, val openUrl: String?)
+    class TextAlert(
+        val pc: String, val id: String, val text: String?, val openUrl: String?,
+        val copyText: String? = null, val sensitive: Boolean = false, val copiedAlready: Boolean = true,
+    )
+    class LinkAlert(val pc: String, val id: String, val link: app.kinrelay.android.links.ReceivedLink, val lockScreenPreviews: Boolean)
+
+    val links = java.util.concurrent.LinkedBlockingQueue<LinkAlert>()
 
     val texts = java.util.concurrent.LinkedBlockingQueue<TextAlert>()
     val sent = CopyOnWriteArrayList<Pair<String?, Long>>()
@@ -97,7 +103,12 @@ class RecordingAlerts : Alerts {
     val failureTitles = java.util.concurrent.LinkedBlockingQueue<String>()
     val messages = CopyOnWriteArrayList<String>()
 
-    override fun textFrom(pcName: String, messageId: String, text: String?, openUrl: String?) { texts.add(TextAlert(pcName, messageId, text, openUrl)) }
+    override fun textFrom(pcName: String, messageId: String, text: String?, openUrl: String?, copyText: String?, sensitive: Boolean, copiedAlready: Boolean) {
+        texts.add(TextAlert(pcName, messageId, text, openUrl, copyText, sensitive, copiedAlready))
+    }
+    override fun linkFrom(pcName: String, messageId: String, link: app.kinrelay.android.links.ReceivedLink, lockScreenPreviews: Boolean) {
+        links.add(LinkAlert(pcName, messageId, link, lockScreenPreviews))
+    }
     override fun sent(pcName: String?, arrivalMillis: Long) { sent += pcName to arrivalMillis }
     override fun queued(pcName: String?, reason: String, afterNoReply: Boolean) { queued += Triple(pcName, reason, afterNoReply) }
     override fun sentLater(pcName: String?) { sentLater += pcName }
