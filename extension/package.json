@@ -1,0 +1,24 @@
+{
+  "name": "kin-extension",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Kin Relay browser extension (Manifest V3, Chromium and Firefox)",
+  "type": "module",
+  "scripts": {
+    "build": "bun scripts/build.ts",
+    "build:dev": "bun scripts/build.ts --dev",
+    "build:test": "bun scripts/build.ts --test",
+    "package": "bun scripts/build.ts && bun scripts/package.ts",
+    "icons": "bun scripts/gen-icons.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test tests/unit",
+    "smoke": "bun scripts/build.ts --test && bun tests/smoke/run.ts",
+    "lint:firefox": "bunx web-ext lint --source-dir dist/firefox"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/chrome": "latest",
+    "playwright-core": "^1.57.0",
+    "typescript": "~6.0.3"
+  }
+}

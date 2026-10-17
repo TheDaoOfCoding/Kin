@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Kin</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <img src="../icons/icon-32.png" alt="" width="20" height="20" />
+      <h1>Kin</h1>
+      <span id="state" class="state" role="status">Checking…</span>
+    </header>
+
+    <section id="problem" class="problem" hidden>
+      <p id="problem-text"></p>
+      <div class="row">
+        <button id="start" hidden>Start Kin</button>
+        <button id="open" hidden>Open Kin</button>
+      </div>
+    </section>
+
+    <section id="devices-section" hidden>
+      <ul id="devices" class="devices"></ul>
+    </section>
+
+    <button id="send-tab" class="primary" disabled>Send this tab</button>
+    <p id="result" class="result" role="status" hidden></p>
+
+    <section>
+      <div class="row spread">
+        <h2>Recent</h2>
+        <button id="clear" class="link" hidden>Clear</button>
+      </div>
+      <ul id="history" class="history"></ul>
+      <p id="history-empty" class="muted">Nothing sent yet. Right-click a link, picture or text and choose “Send to Kin”, or press Alt+Shift+K.</p>
+    </section>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
