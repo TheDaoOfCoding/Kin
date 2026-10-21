@@ -18,6 +18,8 @@ dist/
 
 # .NET
 bin/
+# Rust binaries' sources, not build output
+!desktop/native-host/src/bin/
 obj/
 *.user
 .vs/
