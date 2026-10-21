@@ -398,6 +398,34 @@ mod tests {
         assert!(tokio::task::spawn_blocking(move || ask(&n, b"{}")).await.unwrap().unwrap().is_none());
     }
 
+    /// The DACL of a descriptor in SDDL, written by Windows.
+    fn dacl_text(sd: PSECURITY_DESCRIPTOR) -> String {
+        let mut text = windows::core::PWSTR::null();
+        // SAFETY: a valid descriptor; `text` receives a LocalAlloc'd string, freed below.
+        unsafe { ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &mut text, None) }
+            .unwrap();
+        // SAFETY: allocated by Windows with LocalAlloc.
+        unsafe {
+            let s = text.to_string().unwrap();
+            let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+            s
+        }
+    }
+
+    /// An SDDL DACL the way Windows writes it back (SIDs that have an alias become the alias).
+    fn canonical_dacl(sddl: &str) -> String {
+        let w = wide(sddl);
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: `w` is NUL-terminated; `sd` receives a LocalAlloc'd descriptor, freed below.
+        unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(w.as_ptr()), SDDL_REVISION_1, &mut sd, None) }.unwrap();
+        let s = dacl_text(sd);
+        // SAFETY: allocated by Windows with LocalAlloc.
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(sd.0)));
+        }
+        s
+    }
+
     #[test]
     fn the_security_descriptor_names_the_current_user_only() {
         let name = unique_pipe();
@@ -407,20 +435,16 @@ mod tests {
         let rc =
             unsafe { GetSecurityInfo(raw(&server), SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, None, None, None, None, Some(&mut sd)) };
         assert_eq!(rc.0, 0);
-        let mut text = windows::core::PWSTR::null();
-        // SAFETY: a valid descriptor; `text` receives a LocalAlloc'd string, freed below.
-        unsafe { ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &mut text, None) }
-            .unwrap();
-        // SAFETY: both were allocated by Windows with LocalAlloc.
-        let sddl = unsafe {
-            let s = text.to_string().unwrap();
-            let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+        let sddl = dacl_text(sd);
+        // SAFETY: allocated by Windows with LocalAlloc.
+        unsafe {
             let _ = LocalFree(Some(HLOCAL(sd.0)));
-            s
-        };
+        }
         let sid = crate::nativehost::current_user_sid().unwrap();
         // Protected (P) with exactly one entry: the user. No Everyone (WD), Users (BU), Network (NU), Administrators (BA) or SYSTEM (SY).
-        assert_eq!(sddl, format!("D:P(A;;FA;;;{sid})"));
+        // Windows writes some well-known SIDs as an alias (the built-in Administrator account is "LA"), so the expected text goes through
+        // the same conversion: the two only match if the one entry is for this user's SID.
+        assert_eq!(sddl, canonical_dacl(&format!("D:P(A;;FA;;;{sid})")));
         assert_eq!(current_user_only_sddl(&sid), format!("D:P(A;;GA;;;{sid})"));
     }
 

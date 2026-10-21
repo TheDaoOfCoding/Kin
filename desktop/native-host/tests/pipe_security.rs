@@ -9,9 +9,11 @@ use std::ptr;
 use common::unique_pipe;
 use kin_native_host::mock::server::{UNLIMITED, create_instance};
 use kin_native_host::pipe;
+use kin_native_host::winutil::wide;
 use windows_sys::Win32::Foundation::{FALSE, HANDLE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, GetTokenInformation, PSECURITY_DESCRIPTOR, RevertToSelf, TokenImpersonationLevel,
@@ -83,6 +85,18 @@ fn the_reference_server_has_a_dacl_for_the_current_user_only() {
         )
     };
     assert_eq!(rc, 0);
+    let s = dacl_text(sd);
+    // SAFETY: allocated by Windows with LocalAlloc.
+    unsafe { LocalFree(sd) };
+    let sid = kin_native_host::winutil::current_user_sid_string().unwrap();
+    // Protected (P), and exactly one entry: the user. No Everyone (WD), Users (BU), Network (NU), Administrators (BA), SYSTEM (SY).
+    // Windows writes some well-known SIDs as an alias (the built-in Administrator account is "LA"), so the expected text goes through the same
+    // conversion: the two only match if the one entry is for this user's SID.
+    assert_eq!(s, canonical_dacl(&format!("D:P(A;;FA;;;{sid})")), "the DACL must be exactly this");
+}
+
+/// The DACL of a descriptor in SDDL, written by Windows.
+fn dacl_text(sd: PSECURITY_DESCRIPTOR) -> String {
     let mut text: *mut u16 = ptr::null_mut();
     // SAFETY: a valid descriptor; `text` receives a LocalAlloc'd string, freed below.
     assert_ne!(
@@ -91,19 +105,31 @@ fn the_reference_server_has_a_dacl_for_the_current_user_only() {
         },
         FALSE
     );
-    let s = unsafe {
+    // SAFETY: `text` is a NUL-terminated string allocated by Windows with LocalAlloc.
+    unsafe {
         let mut n = 0;
         while *text.add(n) != 0 {
             n += 1;
         }
         let s = String::from_utf16_lossy(std::slice::from_raw_parts(text, n));
         LocalFree(text.cast());
-        LocalFree(sd);
         s
-    };
-    let sid = kin_native_host::winutil::current_user_sid_string().unwrap();
-    // Protected (P), and exactly one entry: the user. No Everyone (WD), Users (BU), Network (NU), Administrators (BA), SYSTEM (SY).
-    assert_eq!(s, format!("D:P(A;;FA;;;{sid})"), "the DACL must be exactly this");
+    }
+}
+
+/// An SDDL DACL the way Windows writes it back (SIDs that have an alias become the alias).
+fn canonical_dacl(sddl: &str) -> String {
+    let w = wide(std::ffi::OsStr::new(sddl));
+    let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: `w` is NUL-terminated; `sd` receives a LocalAlloc'd descriptor, freed below.
+    assert_ne!(
+        unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(w.as_ptr(), SDDL_REVISION_1, &mut sd, ptr::null_mut()) },
+        FALSE
+    );
+    let s = dacl_text(sd);
+    // SAFETY: allocated by Windows with LocalAlloc.
+    unsafe { LocalFree(sd) };
+    s
 }
 
 #[test]

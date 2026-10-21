@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -16,7 +17,7 @@ jobs:
     name: Protocol vectors
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.3
@@ -26,7 +27,7 @@ jobs:
     name: Windows app and native host (Rust)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.3
@@ -67,13 +68,20 @@ jobs:
     name: Android unit tests
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: 21
-      - uses: android-actions/setup-android@v3
-      - uses: gradle/actions/setup-gradle@v4
+      # The runner already has the Android SDK (ANDROID_HOME); it only needs the platform the app compiles against.
+      - name: Android SDK platform
+        shell: pwsh
+        run: |
+          $sdkmanager = Join-Path $env:ANDROID_HOME 'cmdline-tools\latest\bin\sdkmanager.bat'
+          1..50 | ForEach-Object { 'y' } | & $sdkmanager --licenses | Out-Null
+          & $sdkmanager --install 'platforms;android-37.0' 'build-tools;37.0.0'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: gradle/actions/setup-gradle@v5
       # No signing is needed: the unit tests run on the JVM, and nothing reads a keystore.
       - name: Unit tests
         working-directory: android
@@ -83,7 +91,7 @@ jobs:
     name: Browser extension
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.3
