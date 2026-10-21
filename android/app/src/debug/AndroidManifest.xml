@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- The throwaway test app android\link-target owns https://kin-link-test.example: Kin must be able to see it ("Open in Link target"). -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="https" android:host="kin-link-test.example" />
+        </intent>
+    </queries>
+
+    <application>
+        <!--
+            Automation hooks for adb, in debug builds only (this file is not part of release).
+            The DUMP permission is held by the adb shell and by no ordinary app.
+        -->
+        <receiver
+            android:name=".debug.DebugCommandReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="app.kinrelay.android.debug.PING" />
+                <action android:name="app.kinrelay.android.debug.STATE" />
+                <action android:name="app.kinrelay.android.debug.CONNECT" />
+                <action android:name="app.kinrelay.android.debug.UNPAIR" />
+                <action android:name="app.kinrelay.android.debug.PAIR" />
+                <action android:name="app.kinrelay.android.debug.SET_PING_INTERVAL" />
+                <action android:name="app.kinrelay.android.debug.SEND_TEXT" />
+                <action android:name="app.kinrelay.android.debug.SET_CLIPBOARD" />
+                <action android:name="app.kinrelay.android.debug.MAKE_FILES" />
+                <action android:name="app.kinrelay.android.debug.SEND_FILES" />
+                <action android:name="app.kinrelay.android.debug.TRANSFERS" />
+                <action android:name="app.kinrelay.android.debug.RECEIVED" />
+                <action android:name="app.kinrelay.android.debug.CANCEL_TRANSFER" />
+                <action android:name="app.kinrelay.android.debug.RETRY_TRANSFER" />
+                <action android:name="app.kinrelay.android.debug.RETRY_QUEUED" />
+                <action android:name="app.kinrelay.android.debug.APPEND_CHECK" />
+                <action android:name="app.kinrelay.android.debug.EMPTY_ENTRY_CHECK" />
+                <action android:name="app.kinrelay.android.debug.DELETE_RECEIVED" />
+                <action android:name="app.kinrelay.android.debug.MAKE_ORPHANS" />
+                <action android:name="app.kinrelay.android.debug.SWEEP" />
+                <action android:name="app.kinrelay.android.debug.TEXTS" />
+                <action android:name="app.kinrelay.android.debug.CANCEL_TEXT" />
+                <action android:name="app.kinrelay.android.debug.RETRY_TEXT" />
+                <action android:name="app.kinrelay.android.debug.FLUSH" />
+                <action android:name="app.kinrelay.android.debug.EXPIRE" />
+                <action android:name="app.kinrelay.android.debug.LINK_FROM_PC" />
+                <action android:name="app.kinrelay.android.debug.TEXT_FROM_PC" />
+                <action android:name="app.kinrelay.android.debug.SEND_LINK" />
+                <action android:name="app.kinrelay.android.debug.SET_LINK_PREFS" />
+                <action android:name="app.kinrelay.android.debug.MIRROR_ALLOW" />
+                <action android:name="app.kinrelay.android.debug.MIRROR_HIDDEN" />
+                <action android:name="app.kinrelay.android.debug.MIRROR_ENABLE" />
+                <action android:name="app.kinrelay.android.debug.MIRROR_DISMISS_PREF" />
+                <action android:name="app.kinrelay.android.debug.MIRROR_POST" />
+                <action android:name="app.kinrelay.android.debug.MIRROR_STATE" />
+                <action android:name="app.kinrelay.android.debug.MIRROR_CANCEL" />
+                <action android:name="app.kinrelay.android.debug.MIRROR_CLEAR_ALL" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_SET" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_TEST_START" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_TEST_TRACK" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_TEST_STATE" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_TEST_STOP" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_TEST_BURST" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_STATE" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_PC_CMD" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_PC_FAKE" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_PC_FAKE_CLEAR" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_VOLUME" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_READ_ALL" />
+                <action android:name="app.kinrelay.android.debug.MEDIA_PROBE" />
+            </intent-filter>
+        </receiver>
+
+        <!-- The Reply and Mark as read buttons of the debug "Mirror test" notifications (2B.2). Not exported: only Kin's own PendingIntents reach it. -->
+        <receiver
+            android:name=".debug.DebugMirrorReceiver"
+            android:exported="false" />
+
+        <!--
+            Lets the adb shell start the (not exported) clipboard send activity, the same one the tile and the
+            notification button start: adb shell am start -n app.kinrelay.android/.debug.SendClipboardAlias
+            The shell can't start a non-exported activity, and an alias in the debug build only costs nothing in release.
+        -->
+        <activity-alias
+            android:name=".debug.SendClipboardAlias"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:targetActivity=".clipboard.ClipboardSendActivity" />
+
+        <!--
+            Starts the real ShareActivity with a share intent for files made by MAKE_FILES, as another app's Share would:
+            adb shell am start -n app.kinrelay.android/.debug.DebugShareActivity with the string extra files = a.jpg,b.bin
+        -->
+        <activity
+            android:name=".debug.DebugShareActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:permission="android.permission.DUMP"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Kin.Transparent" />
+
+        <!-- Hands out the files of MAKE_FILES as content:// URIs. Not exported: access comes with the grant on the share intent. -->
+        <provider
+            android:name=".debug.DebugFileProvider"
+            android:authorities="app.kinrelay.android.debugfiles"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/debug_file_paths" />
+        </provider>
+
+        <!-- Reads the real clipboard for tests: adb shell am start -n app.kinrelay.android/.debug.DebugClipboardActivity -->
+        <activity
+            android:name=".debug.DebugClipboardActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:permission="android.permission.DUMP"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Kin.Transparent" />
+    </application>
+
+</manifest>

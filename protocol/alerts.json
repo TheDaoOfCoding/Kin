@@ -1,0 +1,472 @@
+{
+  "description": "Do Not Disturb, Focus and alerts (2B.5, changelog 59). Spec: docs/protocol.md, \"Do Not Disturb and Focus\" and \"Alerts\". The alert/presence FRAMES are in messages.json and presence.json (presenceDnd[]); this file holds everything that is not one frame: the cleaning of an alert, the PC's send decision, the phone's alert bucket, what \"the PC is in Focus\" means, the phone's DND follower, the wire maps, which PC toasts are held, the `Kin.exe --notify` command line and the browser's download alert. All times are integers in milliseconds unless a name says seconds. Written by hand from the spec: keep it that way.",
+  "specVersion": 1,
+  "limits": {
+    "frame": 4096, "textMax": 300, "titleMax": 60, "waitedMaxMs": 604800000, "waitedOmitBelowMs": 1000,
+    "phoneCapacity": 10, "phoneRefillMs": 6000,
+    "ttlDefaultSec": 86400, "ttlMinSec": 60, "ttlMaxSec": 604800,
+    "focusStableMs": 3000, "focusPollMs": 15000, "dndGraceMs": 60000,
+    "pipeSendsPerWindow": 30, "pipeWindowMs": 10000,
+    "downloadNameMax": 120, "downloadMinSeconds": 30, "downloadTtlSec": 1800, "downloadCoalesceMs": 3000
+  },
+  "howToRead": {
+    "alert": "A case is one alert frame (frame, or raw for JSON text that must be sent as written). frameParts: {field: [[string, count], ...]} puts the pieces, each repeated count times, into that field of the frame. expect = accepted (the receiver acks it) or bad_request (error with ref when the id is usable). content = what the receiver ends up with after cleaning (text and title cleaned like link.title: bidi controls become _, control characters become a space, runs of spaces collapse, the ends are trimmed, cut to 300 / 60 code points, an empty title is absent; waitedMs cut to 7 days); contentParts is the same pieces form for a long text or title.",
+    "alertSend": "The PC's decision when an alert item is about to go on the wire: connected (the phone's connection is open), peerCaps (the capabilities of its latest hello), createdMs, ttlMs, nowMs. Result: expired (nowMs >= createdMs + ttlMs, decided first, also while offline: the item fails locally as expired), queued (not expired, not connected), peer_unsupported (connected, the latest hello lacks alert: the item fails locally, nothing is sent, never a text), sent (waitedMs is nowMs - createdMs cut to 7 days, and left out when under 1000).",
+    "alertRate": "The phone's alert bucket: capacity 10, one token back per 6000 ms, starts full. events are the arrival times of NEW valid alerts (a repeat of a known id and an invalid frame cost nothing). expect lists accepted or rate_limited for each event; a rate_limited alert is not remembered.",
+    "focusState": "The rule of 3.5 over what Windows says now. focusSession: IsFocusActive. quiet: SHQueryUserNotificationState as a word (accepts, not_present = the PC is locked, busy, fullscreen, presentation, quiet_time, app). alsoPresenting: the checkbox. focus = focusSession OR quiet is quiet_time OR (alsoPresenting AND quiet is busy, fullscreen or presentation). A locked PC (not_present) is not Focus by itself: it neither counts as quiet time nor as presenting; a Focus SESSION still counts, because it is a Windows setting that outlives locking.",
+    "focusTimeline": "The 3 s stability filter. The stable value starts false. samples (time order) carry the raw sources; each is turned into focus by the rule above; a value that differs from the stable one is sent only after it has stayed the same for 3000 ms (counted from the first sample that gave it; a flip back before that cancels it). expect lists the sends: t is the moment the 3000 ms ended and focus the new stable value; endAt is when the run stops (a send due at or before it is made).",
+    "focusSnapshot": "Does focus: true go in the PC's presence snapshot? Only when the share setting is on, the stable value is true, the PC is not paused, and the phone's hello lists presence.",
+    "dndMap": "Android interruption filter constants and the wire dnd word. wire null = left out of the snapshot (ALL, UNKNOWN and any value this table does not know).",
+    "dndRequest": "The phone's setting \"How much\" and the filter Kin requests. Never total silence.",
+    "dndFollow": "The phone's follower (4.2). init: the settings and the phone's current filter (all, priority, alarms, total) and whether Kin holds the rule (weHold). Each step has t (ms), an event ev and the expected do (the actions, in order) and weHold after it. Events: connect {presence} (a hello of the PC was accepted; presence = it lists presence), snapshot {focus} (a presence snapshot of the PC; focus is true only when it carried focus: true), close (the connection closed), pause {on}, switch {on}, access {granted}, filter {value} (the phone's filter was reported by the system), unlink, start (LinkService / AppGraph starts: a process start, the in-memory state is gone), tick (time only). Before an event at time t is handled, the 60 s grace timer that is due at or before t fires first (and is evaluated on its own). WANT = switch on AND access AND not paused AND the PC's hello lists presence AND the PC's snapshot says focus. A rising edge of WANT while Kin does not hold: the filter is all -> request:<follow> and weHold; any other filter -> leave (nothing held, nothing done). WANT false while Kin holds -> release. A close while Kin holds starts the grace timer (retained WANT for 60000 ms); a snapshot clears it; when it fires the PC's focus is forgotten. A filter report that is not the one Kin requested while Kin holds -> override (weHold false, nothing requested; no re-apply until the next rising edge of WANT). start while holding -> release. Actions: request:priority, request:alarms, release, leave, override. The model assumes a release call works; a failing call (access lost) keeps weHold recorded and is retried at the next start.",
+    "holdToasts": "3.6: which Kin toasts of the PC are held. dnd = the phone's wire dnd (null = none known), setting = \"Hold Kin's own toasts while my phone is in Do Not Disturb\". Only low_battery and info (the Phase 1 \"connected\" style) are held, and only with the setting on and a dnd word present. result (the answer to something the user did), mirrored (a phone notification), clipboard_clear and link are never held.",
+    "notifyCli": "The command line after `Kin.exe --notify`. args are the arguments (an element {parts: [[string, count], ...]} stands for those pieces repeated and joined; stdinParts does the same for stdin; expect.textLength / titleLength say the length in code points of a text or title built that way; expect.count is the length the error message names); stdinHex is the stdin bytes (hex) for the form with -. expect: kind send (the text after trimming, ttlSec, title when given, device when given as the selector the user typed, noStart true when --no-start; source is cli and auto is false in the request it makes), or kind usage with exit (2 usage, 5 too long) and a reason. Positionals are joined with one space. A word that starts with - (and is not just -) before -- is an unknown flag. --title X and --title=X are the same; the last of a repeated flag wins. --ttl needs a whole number and a unit s, m, h or d and must be 60 s to 7 d.",
+    "notifyDevice": "--device resolution against the status of the pipe: a full device id, else a name (ASCII case-insensitive, exact), else an id prefix of at least 4 characters; one match = that device, more than one = ambiguous (usage, exit 2), none = none (exit 4).",
+    "notifyExit": "The pipe's answer to the send, as the CLI turns it into an exit code: 0 sent or queued (also PAUSED_SKIPPED, which a script never sees), 3 Kin not running, 4 not paired, 5 too large, rate limited (INTERNAL with rateLimited: true), 6 anything else.",
+    "downloadAlert": "The browser extension's rule (5.4). setting: enabled (the switch), onlyLong (\"Only for downloads over 30 seconds\"). events: a download change to complete or interrupted at time t, with the download's id, incognito, durationMs, the path the browser reports and, for an interrupted one, an optional error. A download that is not enabled, incognito, interrupted with error USER_CANCELED (the user pressed Cancel: they know), shorter than 30000 ms while onlyLong is on, or whose id AND state were already handled is skipped: a download is remembered by id and state, so one that is interrupted and later resumed to completion gives two alerts (Download failed, then Download finished) and the same state reported again gives none. The base name is the last segment of the path (split on / and \\), bidi controls become _, cut to 120 code points; empty is \"A file\". Events whose t is less than 3000 ms after the first of a burst are coalesced; the burst is sent at its first t + 3000. One item: title Download finished / Download failed and the base name. Several: all complete -> Downloads finished / \"N downloads finished\"; all interrupted -> Downloads failed / \"N downloads failed\"; mixed -> Downloads finished / \"C finished, F failed\". Every send has source downloads, auto true, ttlSec 1800. pathParts is appended to path and textParts stands for the pieces of the expected text, like parts in notifyCli."
+  },
+  "alert": [
+    {"name":"minimal","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":"Build finished"},"expect":"accepted","content":{"text":"Build finished"}},
+    {"name":"full","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","title":"Render","text":"Scene 12 finished in 41 min","waitedMs":7200000},"expect":"accepted","content":{"title":"Render","text":"Scene 12 finished in 41 min","waitedMs":7200000}},
+    {"name":"newlines-and-tabs-become-spaces","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":"line one\nline two\tend"},"expect":"accepted","content":{"text":"line one line two end"}},
+    {"name":"crlf-is-one-space","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":"a\r\nb"},"expect":"accepted","content":{"text":"a b"}},
+    {"name":"bidi-in-the-text-becomes-underscore","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":"pay \u202eexe.txt"},"expect":"accepted","content":{"text":"pay _exe.txt"}},
+    {"name":"the-ends-are-trimmed","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":"   done   "},"expect":"accepted","content":{"text":"done"}},
+    {"name":"runs-of-spaces-collapse","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":"a      b"},"expect":"accepted","content":{"text":"a b"}},
+    {"name":"non-ascii-passes-through","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":"Größe fertig ✓ 完成"},"expect":"accepted","content":{"text":"Größe fertig ✓ 完成"}},
+    {"name":"text-empty","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":""},"expect":"bad_request"},
+    {"name":"text-only-spaces","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":"      "},"expect":"bad_request","note":"empty after cleaning is bad_request"},
+    {"name":"text-only-control-characters","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":"\n\t\r"},"expect":"bad_request"},
+    {"name":"text-missing","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800"},"expect":"bad_request"},
+    {"name":"text-null","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":null},"expect":"bad_request"},
+    {"name":"text-is-a-number","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":7},"expect":"bad_request"},
+    {"name":"text-is-an-array","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":["a"]},"expect":"bad_request"},
+    {"name":"text-exactly-300","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800"},"frameParts":{"text":[["a",300]]},"expect":"accepted","contentParts":{"text":[["a",300]]}},
+    {"name":"text-301-is-cut-to-300","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800"},"frameParts":{"text":[["a",301]]},"expect":"accepted","contentParts":{"text":[["a",300]]}},
+    {"name":"text-is-cut-by-code-points-not-utf-16-units","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800"},"frameParts":{"text":[["😀",301]]},"expect":"accepted","contentParts":{"text":[["😀",300]]}},
+    {"name":"the-cut-trims-a-trailing-space","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800"},"frameParts":{"text":[["a",299],[" b",1]]},"expect":"accepted","contentParts":{"text":[["a",299]]}},
+    {"name":"title-bidi-becomes-underscore","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","title":"\u202eevil","text":"x"},"expect":"accepted","content":{"title":"_evil","text":"x"}},
+    {"name":"title-exactly-60","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":"x"},"frameParts":{"title":[["t",60]]},"expect":"accepted","contentParts":{"title":[["t",60]]},"content":{"text":"x"}},
+    {"name":"title-61-is-cut-to-60","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":"x"},"frameParts":{"title":[["t",61]]},"expect":"accepted","contentParts":{"title":[["t",60]]},"content":{"text":"x"}},
+    {"name":"title-only-spaces-is-absent","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","title":"    ","text":"x"},"expect":"accepted","content":{"text":"x"}},
+    {"name":"title-null-is-absent","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","title":null,"text":"x"},"expect":"accepted","content":{"text":"x"}},
+    {"name":"title-newline-becomes-a-space","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","title":"a\nb","text":"x"},"expect":"accepted","content":{"title":"a b","text":"x"}},
+    {"name":"title-is-a-number","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","title":5,"text":"x"},"expect":"bad_request"},
+    {"name":"title-is-an-object","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","title":{"a":1},"text":"x"},"expect":"bad_request"},
+    {"name":"waited-0","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":"x","waitedMs":0},"expect":"accepted","content":{"text":"x","waitedMs":0}},
+    {"name":"waited-exactly-7-days","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":"x","waitedMs":604800000},"expect":"accepted","content":{"text":"x","waitedMs":604800000}},
+    {"name":"waited-over-7-days-is-cut","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":"x","waitedMs":604800001},"expect":"accepted","content":{"text":"x","waitedMs":604800000}},
+    {"name":"waited-huge-is-cut","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":"x","waitedMs":9007199254740991},"expect":"accepted","content":{"text":"x","waitedMs":604800000}},
+    {"name":"waited-null-is-absent","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":"x","waitedMs":null},"expect":"accepted","content":{"text":"x"}},
+    {"name":"waited-negative","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":"x","waitedMs":-1},"expect":"bad_request"},
+    {"name":"waited-fraction","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":"x","waitedMs":1.5},"expect":"bad_request"},
+    {"name":"waited-is-a-string","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":"x","waitedMs":"5"},"expect":"bad_request"},
+    {"name":"waited-written-as-1e3","raw":"{\"type\":\"alert\",\"id\":\"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800\",\"text\":\"x\",\"waitedMs\":1e3}","expect":"bad_request"},
+    {"name":"waited-written-as-1-point-0","raw":"{\"type\":\"alert\",\"id\":\"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800\",\"text\":\"x\",\"waitedMs\":1.0}","expect":"bad_request"},
+    {"name":"id-missing","frame":{"type":"alert","text":"x"},"expect":"bad_request"},
+    {"name":"id-empty","frame":{"type":"alert","id":"","text":"x"},"expect":"bad_request"},
+    {"name":"unknown-fields-are-ignored","frame":{"type":"alert","id":"0193a5f0-7b1e-7c3a-9d4f-5e6a7b8c0800","text":"x","priority":"high","icon":{"a":[1]}},"expect":"accepted","content":{"text":"x"}}
+  ],
+  "alertSend": [
+    {"name":"connected-and-capable-sends","connected":true,"peerCaps":["link","presence","alert"],"createdMs":1000000,"ttlMs":86400000,"nowMs":1000100,"expect":{"result":"sent"},"note":"waited 100 ms: under 1000, so no waitedMs"},
+    {"name":"waited-999-ms-is-left-out","connected":true,"peerCaps":["alert"],"createdMs":0,"ttlMs":86400000,"nowMs":999,"expect":{"result":"sent"}},
+    {"name":"waited-1000-ms-is-sent","connected":true,"peerCaps":["alert"],"createdMs":0,"ttlMs":86400000,"nowMs":1000,"expect":{"result":"sent","waitedMs":1000}},
+    {"name":"waited-two-hours","connected":true,"peerCaps":["alert"],"createdMs":0,"ttlMs":86400000,"nowMs":7200000,"expect":{"result":"sent","waitedMs":7200000}},
+    {"name":"waited-is-cut-to-7-days","connected":true,"peerCaps":["alert"],"createdMs":0,"ttlMs":604800000,"nowMs":604799999,"expect":{"result":"sent","waitedMs":604799999}},
+    {"name":"waited-over-7-days-cannot-happen-but-is-cut","connected":true,"peerCaps":["alert"],"createdMs":0,"ttlMs":9999999999,"nowMs":700000000,"expect":{"result":"sent","waitedMs":604800000},"note":"a ttl is 7 days at most, so this is a clock that jumped; the cut still holds"},
+    {"name":"offline-is-queued","connected":false,"peerCaps":[],"createdMs":0,"ttlMs":86400000,"nowMs":5000,"expect":{"result":"queued"}},
+    {"name":"offline-ignores-an-old-hello","connected":false,"peerCaps":["alert"],"createdMs":0,"ttlMs":86400000,"nowMs":5000,"expect":{"result":"queued"},"note":"peerCaps of a closed connection do not count"},
+    {"name":"connected-without-alert-fails-locally","connected":true,"peerCaps":["link","presence"],"createdMs":0,"ttlMs":86400000,"nowMs":5000,"expect":{"result":"peer_unsupported"},"note":"never a text: a text would land on the phone's clipboard"},
+    {"name":"connected-with-no-capabilities-fails-locally","connected":true,"peerCaps":[],"createdMs":0,"ttlMs":86400000,"nowMs":5000,"expect":{"result":"peer_unsupported"}},
+    {"name":"capability-is-case-sensitive","connected":true,"peerCaps":["Alert"],"createdMs":0,"ttlMs":86400000,"nowMs":5000,"expect":{"result":"peer_unsupported"}},
+    {"name":"expired-offline","connected":false,"peerCaps":[],"createdMs":0,"ttlMs":86400000,"nowMs":86400000,"expect":{"result":"expired"},"note":"expired at exactly the expiry, like a queued text"},
+    {"name":"one-ms-before-expiry-offline-is-queued","connected":false,"peerCaps":[],"createdMs":0,"ttlMs":86400000,"nowMs":86399999,"expect":{"result":"queued"}},
+    {"name":"expired-wins-over-connected","connected":true,"peerCaps":["alert"],"createdMs":0,"ttlMs":1800000,"nowMs":1800001,"expect":{"result":"expired"},"note":"a 30 minute download alert that waited 30 minutes is not sent"},
+    {"name":"expired-wins-over-peer-unsupported","connected":true,"peerCaps":[],"createdMs":0,"ttlMs":60000,"nowMs":60000,"expect":{"result":"expired"}},
+    {"name":"shortest-ttl-1-minute","connected":false,"peerCaps":[],"createdMs":1000,"ttlMs":60000,"nowMs":60999,"expect":{"result":"queued"}},
+    {"name":"longest-ttl-7-days-offline","connected":false,"peerCaps":[],"createdMs":0,"ttlMs":604800000,"nowMs":604800000,"expect":{"result":"expired"}}
+  ],
+  "alertRate": [
+    {"name":"ten-at-once-then-the-eleventh-is-limited","events":[{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0}],"expect":["accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","rate_limited"]},
+    {"name":"one-token-comes-back-after-6-seconds","events":[{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":5999},{"t":6000}],"expect":["accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","rate_limited","accepted"]},
+    {"name":"eleven-in-ten-seconds-is-fine-thanks-to-the-refill","events":[{"t":0},{"t":1000},{"t":2000},{"t":3000},{"t":4000},{"t":5000},{"t":6000},{"t":7000},{"t":8000},{"t":9000},{"t":10000}],"expect":["accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted"],"note":"the refill of the first 10 s gave one token back: 11 in 10 s is fine"},
+    {"name":"twelve-in-a-burst-limits-two","events":[{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0}],"expect":["accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","rate_limited","rate_limited"]},
+    {"name":"one-every-6-seconds-is-always-fine","events":[{"t":0},{"t":6000},{"t":12000},{"t":18000},{"t":24000},{"t":30000},{"t":36000},{"t":42000},{"t":48000},{"t":54000},{"t":60000},{"t":66000},{"t":72000}],"expect":["accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted"]},
+    {"name":"a-pause-of-a-minute-refills-everything","events":[{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":0},{"t":60000},{"t":60000},{"t":60000},{"t":60000},{"t":60000},{"t":60000},{"t":60000},{"t":60000},{"t":60000},{"t":60000},{"t":60000}],"expect":["accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","rate_limited","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","rate_limited"]},
+    {"name":"the-bucket-never-holds-more-than-ten","events":[{"t":0},{"t":600000},{"t":600000},{"t":600000},{"t":600000},{"t":600000},{"t":600000},{"t":600000},{"t":600000},{"t":600000},{"t":600000},{"t":600000}],"expect":["accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","accepted","rate_limited"],"note":"after 10 minutes idle the bucket is full (10), not 100: events 2 to 11 are ten alerts, the 12th is not"}
+  ],
+  "focusState": [
+    {"name":"nothing","focusSession":false,"quiet":"accepts","alsoPresenting":false,"expect":false},
+    {"name":"a-focus-session","focusSession":true,"quiet":"accepts","alsoPresenting":false,"expect":true},
+    {"name":"quiet-time","focusSession":false,"quiet":"quiet_time","alsoPresenting":false,"expect":true},
+    {"name":"session-and-quiet-time","focusSession":true,"quiet":"quiet_time","alsoPresenting":false,"expect":true},
+    {"name":"busy-without-the-checkbox","focusSession":false,"quiet":"busy","alsoPresenting":false,"expect":false},
+    {"name":"fullscreen-without-the-checkbox","focusSession":false,"quiet":"fullscreen","alsoPresenting":false,"expect":false},
+    {"name":"presentation-without-the-checkbox","focusSession":false,"quiet":"presentation","alsoPresenting":false,"expect":false},
+    {"name":"busy-with-the-checkbox","focusSession":false,"quiet":"busy","alsoPresenting":true,"expect":true},
+    {"name":"fullscreen-with-the-checkbox","focusSession":false,"quiet":"fullscreen","alsoPresenting":true,"expect":true},
+    {"name":"presentation-with-the-checkbox","focusSession":false,"quiet":"presentation","alsoPresenting":true,"expect":true},
+    {"name":"accepts-with-the-checkbox-is-not-focus","focusSession":false,"quiet":"accepts","alsoPresenting":true,"expect":false},
+    {"name":"a-store-app-in-full-screen-is-not-presenting","focusSession":false,"quiet":"app","alsoPresenting":true,"expect":false},
+    {"name":"locked-is-not-focus","focusSession":false,"quiet":"not_present","alsoPresenting":true,"expect":false},
+    {"name":"locked-with-a-focus-session-still-counts","focusSession":true,"quiet":"not_present","alsoPresenting":false,"expect":true,"note":"the session is a Windows setting; locking does not end it"},
+    {"name":"quiet-time-ignores-the-checkbox","focusSession":false,"quiet":"quiet_time","alsoPresenting":true,"expect":true}
+  ],
+  "focusTimeline": [
+    {"name":"steady-off-sends-nothing","alsoPresenting":false,"samples":[{"t":0,"focusSession":false,"quiet":"accepts"},{"t":15000,"focusSession":false,"quiet":"accepts"}],"endAt":60000,"expect":[]},
+    {"name":"focus-on-is-sent-after-3-seconds","alsoPresenting":false,"samples":[{"t":0,"focusSession":true,"quiet":"accepts"},{"t":15000,"focusSession":true,"quiet":"accepts"}],"endAt":60000,"expect":[{"t":3000,"focus":true}]},
+    {"name":"a-flip-back-inside-3-seconds-sends-nothing","alsoPresenting":true,"samples":[{"t":0,"focusSession":false,"quiet":"accepts"},{"t":1000,"focusSession":false,"quiet":"fullscreen"},{"t":3500,"focusSession":false,"quiet":"accepts"}],"endAt":60000,"expect":[]},
+    {"name":"exactly-3-seconds-is-enough","alsoPresenting":false,"samples":[{"t":10000,"focusSession":false,"quiet":"quiet_time"},{"t":13000,"focusSession":false,"quiet":"quiet_time"}],"endAt":13000,"expect":[{"t":13000,"focus":true}]},
+    {"name":"2999-ms-is-not-enough","alsoPresenting":false,"samples":[{"t":10000,"focusSession":false,"quiet":"quiet_time"}],"endAt":12999,"expect":[]},
+    {"name":"on-then-off-each-after-3-seconds","alsoPresenting":false,"samples":[{"t":0,"focusSession":true,"quiet":"accepts"},{"t":20000,"focusSession":false,"quiet":"accepts"},{"t":35000,"focusSession":false,"quiet":"accepts"}],"endAt":60000,"expect":[{"t":3000,"focus":true},{"t":23000,"focus":false}]},
+    {"name":"a-flicker-while-on-sends-nothing-more","alsoPresenting":false,"samples":[{"t":0,"focusSession":true,"quiet":"accepts"},{"t":10000,"focusSession":false,"quiet":"accepts"},{"t":11000,"focusSession":true,"quiet":"accepts"},{"t":30000,"focusSession":true,"quiet":"accepts"}],"endAt":60000,"expect":[{"t":3000,"focus":true}],"note":"off for 1 s: the candidate false never lasted 3 s"},
+    {"name":"a-video-flipping-fullscreen-every-2-seconds-never-flaps","alsoPresenting":true,"samples":[{"t":0,"focusSession":false,"quiet":"fullscreen"},{"t":2000,"focusSession":false,"quiet":"accepts"},{"t":4000,"focusSession":false,"quiet":"fullscreen"},{"t":6000,"focusSession":false,"quiet":"accepts"},{"t":8000,"focusSession":false,"quiet":"fullscreen"}],"endAt":10000,"expect":[]},
+    {"name":"locking-during-presenting-ends-it-after-3-seconds","alsoPresenting":true,"samples":[{"t":0,"focusSession":false,"quiet":"presentation"},{"t":5000,"focusSession":false,"quiet":"presentation"},{"t":6000,"focusSession":false,"quiet":"not_present"}],"endAt":20000,"expect":[{"t":3000,"focus":true},{"t":9000,"focus":false}]},
+    {"name":"the-checkbox-off-makes-fullscreen-nothing","alsoPresenting":false,"samples":[{"t":0,"focusSession":false,"quiet":"fullscreen"},{"t":15000,"focusSession":false,"quiet":"fullscreen"}],"endAt":60000,"expect":[]},
+    {"name":"a-poll-after-the-stable-point-reports-at-the-3-second-mark","alsoPresenting":false,"samples":[{"t":0,"focusSession":true,"quiet":"accepts"},{"t":15000,"focusSession":false,"quiet":"accepts"}],"endAt":15000,"expect":[{"t":3000,"focus":true}],"note":"the pending change is made before the next sample is looked at; the off at 15000 would be sent at 18000, after endAt"}
+  ],
+  "focusSnapshot": [
+    {"name":"in-focus-and-sharing","shareOn":true,"stable":true,"paused":false,"peerHasPresence":true,"expect":true},
+    {"name":"not-in-focus","shareOn":true,"stable":false,"paused":false,"peerHasPresence":true,"expect":false},
+    {"name":"switch-off-never-sends","shareOn":false,"stable":true,"paused":false,"peerHasPresence":true,"expect":false},
+    {"name":"a-paused-pc-sends-none","shareOn":true,"stable":true,"paused":true,"peerHasPresence":true,"expect":false},
+    {"name":"a-phone-without-presence-gets-none","shareOn":true,"stable":true,"paused":false,"peerHasPresence":false,"expect":false},
+    {"name":"resuming-sends-it-again","shareOn":true,"stable":true,"paused":false,"peerHasPresence":true,"expect":true,"note":"the same inputs as the first case: the snapshot after Resume carries focus again if the PC is still in Focus"}
+  ],
+  "dndMap": [
+    {"name":"priority","filter":2,"constant":"INTERRUPTION_FILTER_PRIORITY","wire":"priority"},
+    {"name":"alarms","filter":4,"constant":"INTERRUPTION_FILTER_ALARMS","wire":"alarms"},
+    {"name":"none-is-total-silence","filter":3,"constant":"INTERRUPTION_FILTER_NONE","wire":"total"},
+    {"name":"all-is-absent","filter":1,"constant":"INTERRUPTION_FILTER_ALL","wire":null},
+    {"name":"unknown-is-absent","filter":0,"constant":"INTERRUPTION_FILTER_UNKNOWN","wire":null},
+    {"name":"a-later-filter-is-absent","filter":5,"constant":null,"wire":null},
+    {"name":"a-negative-value-is-absent","filter":-1,"constant":null,"wire":null}
+  ],
+  "dndRequest": [
+    {"name":"priority-only","setting":"priority","filter":2},
+    {"name":"alarms-only","setting":"alarms","filter":4},
+    {"name":"an-unknown-setting-is-priority","setting":"total","filter":2,"note":"never total silence, whatever is stored"},
+    {"name":"no-setting-is-priority","setting":null,"filter":2}
+  ],
+  "dndFollow": [
+    {"name":"focus-on-then-off","init":{"switch":true,"access":true,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":100,"ev":"snapshot","focus":false,"do":[],"weHold":false},
+      {"t":5000,"ev":"snapshot","focus":true,"do":["request:priority"],"weHold":true},
+      {"t":5100,"ev":"filter","value":"priority","do":[],"weHold":true},
+      {"t":900000,"ev":"snapshot","focus":false,"do":["release"],"weHold":false},
+      {"t":900100,"ev":"filter","value":"all","do":[],"weHold":false}
+    ]},
+    {"name":"the-first-snapshot-of-a-connection-is-a-rising-edge","init":{"switch":true,"access":true,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":["request:priority"],"weHold":true}
+    ]},
+    {"name":"a-repeated-focus-snapshot-requests-once","init":{"switch":true,"access":true,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":["request:priority"],"weHold":true},
+      {"t":60,"ev":"filter","value":"priority","do":[],"weHold":true},
+      {"t":30000,"ev":"snapshot","focus":true,"do":[],"weHold":true},
+      {"t":60000,"ev":"snapshot","focus":true,"do":[],"weHold":true}
+    ]},
+    {"name":"alarms-only-requests-alarms","init":{"switch":true,"access":true,"paused":false,"filter":"all","follow":"alarms","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":["request:alarms"],"weHold":true},
+      {"t":60,"ev":"filter","value":"alarms","do":[],"weHold":true},
+      {"t":9000,"ev":"snapshot","focus":false,"do":["release"],"weHold":false}
+    ]},
+    {"name":"already-in-alarms-leaves-it-alone","init":{"switch":true,"access":true,"paused":false,"filter":"alarms","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":["leave"],"weHold":false},
+      {"t":9000,"ev":"snapshot","focus":false,"do":[],"weHold":false}
+    ]},
+    {"name":"already-in-priority-is-not-taken-over","init":{"switch":true,"access":true,"paused":false,"filter":"priority","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":["leave"],"weHold":false},
+      {"t":60,"ev":"filter","value":"all","do":[],"weHold":false},
+      {"t":7000,"ev":"snapshot","focus":true,"do":[],"weHold":false}
+    ],"note":"the user's own DND ended while the PC is still in Focus: Kin does not step in"},
+    {"name":"already-in-total-silence-leaves-it-alone","init":{"switch":true,"access":true,"paused":false,"filter":"total","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":["leave"],"weHold":false}
+    ]},
+    {"name":"the-user-turns-dnd-off-while-held-is-an-override","init":{"switch":true,"access":true,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":["request:priority"],"weHold":true},
+      {"t":60,"ev":"filter","value":"priority","do":[],"weHold":true},
+      {"t":30000,"ev":"filter","value":"all","do":["override"],"weHold":false},
+      {"t":60000,"ev":"snapshot","focus":true,"do":[],"weHold":false},
+      {"t":120000,"ev":"snapshot","focus":false,"do":[],"weHold":false},
+      {"t":180000,"ev":"snapshot","focus":true,"do":["request:priority"],"weHold":true}
+    ]},
+    {"name":"the-user-changes-it-to-total-while-held-is-an-override","init":{"switch":true,"access":true,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":["request:priority"],"weHold":true},
+      {"t":60,"ev":"filter","value":"priority","do":[],"weHold":true},
+      {"t":30000,"ev":"filter","value":"total","do":["override"],"weHold":false},
+      {"t":60000,"ev":"snapshot","focus":false,"do":[],"weHold":false}
+    ]},
+    {"name":"switching-it-off-releases","init":{"switch":true,"access":true,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":["request:priority"],"weHold":true},
+      {"t":60,"ev":"filter","value":"priority","do":[],"weHold":true},
+      {"t":9000,"ev":"switch","on":false,"do":["release"],"weHold":false},
+      {"t":9100,"ev":"filter","value":"all","do":[],"weHold":false},
+      {"t":12000,"ev":"snapshot","focus":true,"do":[],"weHold":false}
+    ]},
+    {"name":"switching-it-on-while-the-pc-is-in-focus-requests","init":{"switch":false,"access":true,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":[],"weHold":false},
+      {"t":9000,"ev":"switch","on":true,"do":["request:priority"],"weHold":true}
+    ]},
+    {"name":"pausing-the-phone-releases-and-resuming-requests-again","init":{"switch":true,"access":true,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":["request:priority"],"weHold":true},
+      {"t":60,"ev":"filter","value":"priority","do":[],"weHold":true},
+      {"t":9000,"ev":"pause","on":true,"do":["release"],"weHold":false},
+      {"t":9100,"ev":"filter","value":"all","do":[],"weHold":false},
+      {"t":20000,"ev":"snapshot","focus":true,"do":[],"weHold":false},
+      {"t":3600000,"ev":"pause","on":false,"do":["request:priority"],"weHold":true}
+    ],"note":"a pause is a master gate, so on resume the PC's Focus that is still on counts as a new rising edge of WANT"},
+    {"name":"a-paused-phone-never-requests","init":{"switch":true,"access":true,"paused":true,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":[],"weHold":false},
+      {"t":9000,"ev":"snapshot","focus":false,"do":[],"weHold":false}
+    ]},
+    {"name":"without-access-it-never-requests","init":{"switch":true,"access":false,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":[],"weHold":false}
+    ]},
+    {"name":"granting-access-while-the-pc-is-in-focus-requests","init":{"switch":true,"access":false,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":[],"weHold":false},
+      {"t":9000,"ev":"access","granted":true,"do":["request:priority"],"weHold":true}
+    ]},
+    {"name":"access-revoked-while-held-releases","init":{"switch":true,"access":true,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":["request:priority"],"weHold":true},
+      {"t":60,"ev":"filter","value":"priority","do":[],"weHold":true},
+      {"t":9000,"ev":"access","granted":false,"do":["release"],"weHold":false}
+    ],"note":"the controller attempts the release; if the call fails because the access is gone it keeps weHold recorded and retries at the next start"},
+    {"name":"a-close-releases-after-60-seconds","init":{"switch":true,"access":true,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":["request:priority"],"weHold":true},
+      {"t":60,"ev":"filter","value":"priority","do":[],"weHold":true},
+      {"t":10000,"ev":"close","do":[],"weHold":true},
+      {"t":69999,"ev":"tick","do":[],"weHold":true},
+      {"t":70000,"ev":"tick","do":["release"],"weHold":false},
+      {"t":70100,"ev":"filter","value":"all","do":[],"weHold":false}
+    ]},
+    {"name":"a-reconnect-inside-the-grace-with-focus-keeps-holding","init":{"switch":true,"access":true,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":["request:priority"],"weHold":true},
+      {"t":60,"ev":"filter","value":"priority","do":[],"weHold":true},
+      {"t":10000,"ev":"close","do":[],"weHold":true},
+      {"t":40000,"ev":"connect","presence":true,"do":[],"weHold":true},
+      {"t":40050,"ev":"snapshot","focus":true,"do":[],"weHold":true},
+      {"t":100000,"ev":"tick","do":[],"weHold":true},
+      {"t":200000,"ev":"snapshot","focus":false,"do":["release"],"weHold":false}
+    ],"note":"the new snapshot cleared the grace timer; it was not a rising edge, so nothing is requested twice"},
+    {"name":"a-reconnect-inside-the-grace-without-focus-releases","init":{"switch":true,"access":true,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":["request:priority"],"weHold":true},
+      {"t":60,"ev":"filter","value":"priority","do":[],"weHold":true},
+      {"t":10000,"ev":"close","do":[],"weHold":true},
+      {"t":40000,"ev":"connect","presence":true,"do":[],"weHold":true},
+      {"t":40050,"ev":"snapshot","focus":false,"do":["release"],"weHold":false}
+    ]},
+    {"name":"a-reconnect-with-no-snapshot-still-releases-at-60-seconds","init":{"switch":true,"access":true,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":["request:priority"],"weHold":true},
+      {"t":60,"ev":"filter","value":"priority","do":[],"weHold":true},
+      {"t":10000,"ev":"close","do":[],"weHold":true},
+      {"t":40000,"ev":"connect","presence":true,"do":[],"weHold":true},
+      {"t":70000,"ev":"tick","do":["release"],"weHold":false}
+    ],"note":"a peer that never sends a snapshot cannot keep the phone silent"},
+    {"name":"a-close-when-not-holding-does-nothing-and-a-reconnect-is-a-new-edge","init":{"switch":true,"access":true,"paused":false,"filter":"alarms","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":["leave"],"weHold":false},
+      {"t":10000,"ev":"close","do":[],"weHold":false},
+      {"t":20000,"ev":"filter","value":"all","do":[],"weHold":false},
+      {"t":30000,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":30050,"ev":"snapshot","focus":true,"do":["request:priority"],"weHold":true}
+    ]},
+    {"name":"a-peer-that-no-longer-lists-presence-releases","init":{"switch":true,"access":true,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":["request:priority"],"weHold":true},
+      {"t":60,"ev":"filter","value":"priority","do":[],"weHold":true},
+      {"t":9000,"ev":"connect","presence":false,"do":["release"],"weHold":false}
+    ]},
+    {"name":"a-peer-without-presence-never-requests","init":{"switch":true,"access":true,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":false,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":[],"weHold":false}
+    ]},
+    {"name":"a-start-while-holding-releases","init":{"switch":true,"access":true,"paused":false,"filter":"priority","follow":"priority","weHold":true},"steps":[
+      {"t":0,"ev":"start","do":["release"],"weHold":false},
+      {"t":50,"ev":"filter","value":"all","do":[],"weHold":false}
+    ],"note":"the crash and update case: weHold was persisted, there is no connection yet, so it is released now"},
+    {"name":"a-start-while-not-holding-does-nothing","init":{"switch":true,"access":true,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"start","do":[],"weHold":false}
+    ]},
+    {"name":"after-a-start-the-pc-in-focus-is-a-fresh-edge","init":{"switch":true,"access":true,"paused":false,"filter":"priority","follow":"priority","weHold":true},"steps":[
+      {"t":0,"ev":"start","do":["release"],"weHold":false},
+      {"t":100,"ev":"filter","value":"all","do":[],"weHold":false},
+      {"t":2000,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":2050,"ev":"snapshot","focus":true,"do":["request:priority"],"weHold":true}
+    ]},
+    {"name":"unlinking-releases","init":{"switch":true,"access":true,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":["request:priority"],"weHold":true},
+      {"t":60,"ev":"filter","value":"priority","do":[],"weHold":true},
+      {"t":9000,"ev":"unlink","do":["release"],"weHold":false},
+      {"t":9100,"ev":"snapshot","focus":true,"do":[],"weHold":false}
+    ]},
+    {"name":"unlinking-when-not-holding-does-nothing","init":{"switch":true,"access":true,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":9000,"ev":"unlink","do":[],"weHold":false}
+    ]},
+    {"name":"a-release-while-not-holding-never-happens","init":{"switch":true,"access":true,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":false,"do":[],"weHold":false},
+      {"t":100,"ev":"switch","on":false,"do":[],"weHold":false},
+      {"t":200,"ev":"access","granted":false,"do":[],"weHold":false},
+      {"t":300,"ev":"pause","on":true,"do":[],"weHold":false},
+      {"t":400,"ev":"close","do":[],"weHold":false},
+      {"t":70000,"ev":"tick","do":[],"weHold":false}
+    ],"note":"never requests ALL while it does not hold the rule"},
+    {"name":"focus-on-then-the-user-overrides-then-the-connection-drops","init":{"switch":true,"access":true,"paused":false,"filter":"all","follow":"priority","weHold":false},"steps":[
+      {"t":0,"ev":"connect","presence":true,"do":[],"weHold":false},
+      {"t":50,"ev":"snapshot","focus":true,"do":["request:priority"],"weHold":true},
+      {"t":60,"ev":"filter","value":"priority","do":[],"weHold":true},
+      {"t":9000,"ev":"filter","value":"all","do":["override"],"weHold":false},
+      {"t":10000,"ev":"close","do":[],"weHold":false},
+      {"t":80000,"ev":"tick","do":[],"weHold":false}
+    ]}
+  ],
+  "holdToasts": [
+    {"name":"low-battery-held-in-priority","dnd":"priority","setting":true,"kind":"low_battery","expect":"held"},
+    {"name":"low-battery-held-in-alarms","dnd":"alarms","setting":true,"kind":"low_battery","expect":"held"},
+    {"name":"low-battery-held-in-total","dnd":"total","setting":true,"kind":"low_battery","expect":"held"},
+    {"name":"low-battery-shown-without-dnd","dnd":null,"setting":true,"kind":"low_battery","expect":"shown"},
+    {"name":"low-battery-shown-with-the-setting-off","dnd":"priority","setting":false,"kind":"low_battery","expect":"shown"},
+    {"name":"info-held-in-dnd","dnd":"priority","setting":true,"kind":"info","expect":"held"},
+    {"name":"info-shown-without-dnd","dnd":null,"setting":true,"kind":"info","expect":"shown"},
+    {"name":"info-shown-with-the-setting-off","dnd":"total","setting":false,"kind":"info","expect":"shown"},
+    {"name":"the-result-of-a-send-is-never-held","dnd":"total","setting":true,"kind":"result","expect":"shown"},
+    {"name":"a-mirrored-notification-is-never-held","dnd":"total","setting":true,"kind":"mirrored","expect":"shown"},
+    {"name":"the-clipboard-clear-is-never-held","dnd":"priority","setting":true,"kind":"clipboard_clear","expect":"shown"},
+    {"name":"a-link-offer-is-never-held","dnd":"priority","setting":true,"kind":"link","expect":"shown"},
+    {"name":"an-unknown-kind-is-shown","dnd":"priority","setting":true,"kind":"something_new","expect":"shown","note":"hold is for the two named kinds only"}
+  ],
+  "notifyCli": [
+    {"name":"one-word","args":["Done"],"stdinHex":null,"expect":{"kind":"send","text":"Done","ttlSec":86400}},
+    {"name":"a-sentence-in-quotes","args":["Build finished"],"stdinHex":null,"expect":{"kind":"send","text":"Build finished","ttlSec":86400}},
+    {"name":"unquoted-words-are-joined-with-one-space","args":["Build","finished","ok"],"stdinHex":null,"expect":{"kind":"send","text":"Build finished ok","ttlSec":86400}},
+    {"name":"the-text-is-trimmed","args":["  padded  "],"stdinHex":null,"expect":{"kind":"send","text":"padded","ttlSec":86400}},
+    {"name":"title-and-device-and-ttl","args":["--title","Render","--ttl","2h","--device","Pixel 8","--","Scene 12 finished"],"stdinHex":null,"expect":{"kind":"send","text":"Scene 12 finished","title":"Render","ttlSec":7200,"device":"Pixel 8"}},
+    {"name":"the-equals-form","args":["--title=Render","--ttl=90m","--device=Pixel 8","Done"],"stdinHex":null,"expect":{"kind":"send","text":"Done","title":"Render","ttlSec":5400,"device":"Pixel 8"}},
+    {"name":"flags-after-the-text","args":["Done","--title","T"],"stdinHex":null,"expect":{"kind":"send","text":"Done","title":"T","ttlSec":86400}},
+    {"name":"no-start","args":["--no-start","Done"],"stdinHex":null,"expect":{"kind":"send","text":"Done","ttlSec":86400,"noStart":true}},
+    {"name":"the-last-title-wins","args":["--title","a","--title","b","Done"],"stdinHex":null,"expect":{"kind":"send","text":"Done","title":"b","ttlSec":86400}},
+    {"name":"double-dash-ends-the-options","args":["--","--title","is","text"],"stdinHex":null,"expect":{"kind":"send","text":"--title is text","ttlSec":86400}},
+    {"name":"dash-reads-stdin","args":["-"],"stdinHex":"616c6c20677265656e","expect":{"kind":"send","text":"all green","ttlSec":86400}},
+    {"name":"stdin-is-trimmed-and-keeps-inner-newlines","args":["-"],"stdinHex":"0a206c696e6520310a6c696e652032200d0a","expect":{"kind":"send","text":"line 1\nline 2","ttlSec":86400}},
+    {"name":"stdin-with-a-flag","args":["--title","CI","-"],"stdinHex":"6f6b","expect":{"kind":"send","text":"ok","title":"CI","ttlSec":86400}},
+    {"name":"stdin-is-utf-8","args":["-"],"stdinHex":"c3a9","expect":{"kind":"send","text":"é","ttlSec":86400}},
+    {"name":"a-utf-8-bom-on-stdin-is-stripped","args":["-"],"stdinHex":"efbbbf6f6b","expect":{"kind":"send","text":"ok","ttlSec":86400},"note":"PowerShell's Out-File and some editors put a BOM in front of piped text"},
+    {"name":"stdin-that-is-not-utf-8","args":["-"],"stdinHex":"fffe","expect":{"kind":"usage","exit":2,"reason":"stdin_not_utf8"}},
+    {"name":"empty-stdin","args":["-"],"stdinHex":"","expect":{"kind":"usage","exit":2,"reason":"missing_text"}},
+    {"name":"stdin-of-only-spaces","args":["-"],"stdinHex":"20200a","expect":{"kind":"usage","exit":2,"reason":"missing_text"}},
+    {"name":"dash-with-other-words-is-text","args":["-","a"],"stdinHex":null,"expect":{"kind":"send","text":"- a","ttlSec":86400}},
+    {"name":"no-text","args":[],"stdinHex":null,"expect":{"kind":"usage","exit":2,"reason":"missing_text"}},
+    {"name":"only-flags-no-text","args":["--title","T"],"stdinHex":null,"expect":{"kind":"usage","exit":2,"reason":"missing_text"}},
+    {"name":"a-blank-text","args":["   "],"stdinHex":null,"expect":{"kind":"usage","exit":2,"reason":"missing_text"}},
+    {"name":"unknown-flag","args":["--loud","Done"],"stdinHex":null,"expect":{"kind":"usage","exit":2,"reason":"unknown_flag"}},
+    {"name":"a-text-starting-with-a-dash-is-an-unknown-flag","args":["-5 files"],"stdinHex":null,"expect":{"kind":"usage","exit":2,"reason":"unknown_flag"}},
+    {"name":"a-text-starting-with-a-dash-after-double-dash","args":["--","-5 files"],"stdinHex":null,"expect":{"kind":"send","text":"-5 files","ttlSec":86400}},
+    {"name":"a-flag-without-its-value","args":["Done","--title"],"stdinHex":null,"expect":{"kind":"usage","exit":2,"reason":"missing_value"}},
+    {"name":"ttl-without-a-value","args":["Done","--ttl"],"stdinHex":null,"expect":{"kind":"usage","exit":2,"reason":"missing_value"}},
+    {"name":"device-without-a-value","args":["Done","--device"],"stdinHex":null,"expect":{"kind":"usage","exit":2,"reason":"missing_value"}},
+    {"name":"ttl-60-seconds-is-the-smallest","args":["--ttl","60s","Done"],"stdinHex":null,"expect":{"kind":"send","text":"Done","ttlSec":60}},
+    {"name":"ttl-1-minute","args":["--ttl","1m","Done"],"stdinHex":null,"expect":{"kind":"send","text":"Done","ttlSec":60}},
+    {"name":"ttl-59-seconds","args":["--ttl","59s","Done"],"stdinHex":null,"expect":{"kind":"usage","exit":2,"reason":"bad_ttl"}},
+    {"name":"ttl-7-days-is-the-largest","args":["--ttl","7d","Done"],"stdinHex":null,"expect":{"kind":"send","text":"Done","ttlSec":604800}},
+    {"name":"ttl-168-hours","args":["--ttl","168h","Done"],"stdinHex":null,"expect":{"kind":"send","text":"Done","ttlSec":604800}},
+    {"name":"ttl-8-days","args":["--ttl","8d","Done"],"stdinHex":null,"expect":{"kind":"usage","exit":2,"reason":"bad_ttl"}},
+    {"name":"ttl-10081-minutes","args":["--ttl","10081m","Done"],"stdinHex":null,"expect":{"kind":"usage","exit":2,"reason":"bad_ttl"}},
+    {"name":"ttl-without-a-unit","args":["--ttl","120","Done"],"stdinHex":null,"expect":{"kind":"usage","exit":2,"reason":"bad_ttl"}},
+    {"name":"ttl-with-a-fraction","args":["--ttl","1.5h","Done"],"stdinHex":null,"expect":{"kind":"usage","exit":2,"reason":"bad_ttl"}},
+    {"name":"ttl-with-an-unknown-unit","args":["--ttl","2w","Done"],"stdinHex":null,"expect":{"kind":"usage","exit":2,"reason":"bad_ttl"}},
+    {"name":"ttl-zero","args":["--ttl","0s","Done"],"stdinHex":null,"expect":{"kind":"usage","exit":2,"reason":"bad_ttl"}},
+    {"name":"ttl-negative","args":["--ttl","-5m","Done"],"stdinHex":null,"expect":{"kind":"usage","exit":2,"reason":"bad_ttl"}},
+    {"name":"ttl-upper-case-unit","args":["--ttl","2H","Done"],"stdinHex":null,"expect":{"kind":"usage","exit":2,"reason":"bad_ttl"}},
+    {"name":"text-of-300-characters","args":[{"parts":[["a",300]]}],"stdinHex":null,"expect":{"kind":"send","ttlSec":86400,"textLength":300}},
+    {"name":"text-of-301-characters-fails-with-exit-5","args":[{"parts":[["a",301]]}],"stdinHex":null,"expect":{"kind":"usage","exit":5,"reason":"text_too_long","count":301}},
+    {"name":"the-limit-counts-code-points","args":[{"parts":[["😀",300]]}],"stdinHex":null,"expect":{"kind":"send","ttlSec":86400,"textLength":300}},
+    {"name":"301-emoji-is-too-long","args":[{"parts":[["😀",301]]}],"stdinHex":null,"expect":{"kind":"usage","exit":5,"reason":"text_too_long","count":301}},
+    {"name":"the-limit-is-checked-after-trimming","args":[{"parts":[[" ",5],["a",300],[" ",5]]}],"stdinHex":null,"expect":{"kind":"send","ttlSec":86400,"textLength":300}},
+    {"name":"title-of-60","args":["--title",{"parts":[["t",60]]},"Done"],"stdinHex":null,"expect":{"kind":"send","text":"Done","ttlSec":86400,"titleLength":60}},
+    {"name":"title-of-61-fails-with-exit-5","args":["--title",{"parts":[["t",61]]},"Done"],"stdinHex":null,"expect":{"kind":"usage","exit":5,"reason":"title_too_long","count":61}},
+    {"name":"stdin-over-300-characters-fails-with-exit-5","args":["-"],"stdinParts":[["b",301]],"expect":{"kind":"usage","exit":5,"reason":"text_too_long","count":301}},
+    {"name":"an-empty-title-is-left-out","args":["--title","","Done"],"stdinHex":null,"expect":{"kind":"send","text":"Done","ttlSec":86400}},
+    {"name":"a-title-is-trimmed","args":["--title","  T  ","Done"],"stdinHex":null,"expect":{"kind":"send","text":"Done","title":"T","ttlSec":86400}}
+  ],
+  "notifyDevice": [
+    {"name":"exact-name","selector":"Pixel 8","devices":[{"id":"AAAAbbbbCCCCdddd","name":"Pixel 8"},{"id":"ZZZZyyyyXXXXwwww","name":"Galaxy A54"}],"expect":{"result":"match","id":"AAAAbbbbCCCCdddd"}},
+    {"name":"name-ignores-ascii-case","selector":"pixel 8","devices":[{"id":"AAAAbbbbCCCCdddd","name":"Pixel 8"}],"expect":{"result":"match","id":"AAAAbbbbCCCCdddd"}},
+    {"name":"full-id","selector":"ZZZZyyyyXXXXwwww","devices":[{"id":"AAAAbbbbCCCCdddd","name":"Pixel 8"},{"id":"ZZZZyyyyXXXXwwww","name":"Galaxy A54"}],"expect":{"result":"match","id":"ZZZZyyyyXXXXwwww"}},
+    {"name":"id-prefix-of-4","selector":"ZZZZ","devices":[{"id":"AAAAbbbbCCCCdddd","name":"Pixel 8"},{"id":"ZZZZyyyyXXXXwwww","name":"Galaxy A54"}],"expect":{"result":"match","id":"ZZZZyyyyXXXXwwww"}},
+    {"name":"id-prefix-is-case-sensitive","selector":"zzzz","devices":[{"id":"ZZZZyyyyXXXXwwww","name":"Galaxy A54"}],"expect":{"result":"none"}},
+    {"name":"id-prefix-of-3-is-too-short","selector":"ZZZ","devices":[{"id":"ZZZZyyyyXXXXwwww","name":"Galaxy A54"}],"expect":{"result":"none"}},
+    {"name":"a-name-wins-over-an-id-prefix","selector":"AAAA","devices":[{"id":"BBBBbbbbCCCCdddd","name":"AAAA"},{"id":"AAAAbbbbCCCCdddd","name":"Pixel 8"}],"expect":{"result":"match","id":"BBBBbbbbCCCCdddd"}},
+    {"name":"two-devices-with-the-same-name-are-ambiguous","selector":"Pixel","devices":[{"id":"AAAAbbbbCCCCdddd","name":"Pixel"},{"id":"BBBBbbbbCCCCdddd","name":"pixel"}],"expect":{"result":"ambiguous"}},
+    {"name":"a-prefix-of-two-ids-is-ambiguous","selector":"AAAA","devices":[{"id":"AAAAbbbbCCCCdddd","name":"One"},{"id":"AAAAccccCCCCdddd","name":"Two"}],"expect":{"result":"ambiguous"}},
+    {"name":"unknown-name","selector":"Tablet","devices":[{"id":"AAAAbbbbCCCCdddd","name":"Pixel 8"}],"expect":{"result":"none"}},
+    {"name":"no-devices","selector":"Pixel 8","devices":[],"expect":{"result":"none"}}
+  ],
+  "notifyExit": [
+    {"name":"sent","response":{"ok":true,"queued":false},"expect":{"exit":0,"word":"sent"}},
+    {"name":"queued-because-the-phone-is-offline","response":{"ok":true,"queued":true,"code":"DEVICE_OFFLINE_QUEUED"},"expect":{"exit":0,"word":"queued"}},
+    {"name":"skipped-while-paused-is-still-success","response":{"ok":true,"queued":false,"code":"PAUSED_SKIPPED"},"expect":{"exit":0,"word":"skipped"}},
+    {"name":"not-paired","response":{"ok":false,"code":"NOT_PAIRED"},"expect":{"exit":4,"word":"refused"}},
+    {"name":"too-large","response":{"ok":false,"code":"TOO_LARGE"},"expect":{"exit":5,"word":"refused"}},
+    {"name":"rate-limited","response":{"ok":false,"code":"INTERNAL","rateLimited":true},"expect":{"exit":5,"word":"refused"}},
+    {"name":"internal-without-the-flag","response":{"ok":false,"code":"INTERNAL"},"expect":{"exit":6,"word":"refused"}},
+    {"name":"the-phone-does-not-support-alerts","response":{"ok":false,"code":"INTERNAL","message":"Update Kin on your phone"},"expect":{"exit":6,"word":"refused"}},
+    {"name":"kin-not-running","response":{"ok":false,"code":"KIN_NOT_RUNNING"},"expect":{"exit":3,"word":"refused"}},
+    {"name":"bad-request","response":{"ok":false,"code":"BAD_REQUEST"},"expect":{"exit":6,"word":"refused"}},
+    {"name":"unsupported-type","response":{"ok":false,"code":"UNSUPPORTED_TYPE"},"expect":{"exit":6,"word":"refused"}},
+    {"name":"timeout","response":{"ok":false,"code":"TIMEOUT"},"expect":{"exit":6,"word":"refused"}},
+    {"name":"an-unknown-code","response":{"ok":false,"code":"SOMETHING_NEW"},"expect":{"exit":6,"word":"refused"}},
+    {"name":"no-pipe-and-no-start","response":null,"noStart":true,"expect":{"exit":3,"word":"not_running"}},
+    {"name":"no-pipe-and-start-failed","response":null,"noStart":false,"startFailed":true,"expect":{"exit":3,"word":"not_running"}}
+  ],
+  "downloadAlert": [
+    {"name":"a-long-download-sends-one-alert","setting":{"enabled":true,"onlyLong":true},"events":[{"t":0,"id":1,"state":"complete","incognito":false,"durationMs":40000,"path":"C:\\Users\\someone\\Downloads\\movie.mkv"}],"expect":[{"t":3000,"title":"Download finished","text":"movie.mkv"}]},
+    {"name":"a-short-download-is-skipped","setting":{"enabled":true,"onlyLong":true},"events":[{"t":0,"id":1,"state":"complete","incognito":false,"durationMs":10000,"path":"/home/a/b.zip"}],"expect":[]},
+    {"name":"exactly-30-seconds-counts","setting":{"enabled":true,"onlyLong":true},"events":[{"t":0,"id":1,"state":"complete","incognito":false,"durationMs":30000,"path":"b.zip"}],"expect":[{"t":3000,"title":"Download finished","text":"b.zip"}]},
+    {"name":"29999-ms-does-not","setting":{"enabled":true,"onlyLong":true},"events":[{"t":0,"id":1,"state":"complete","incognito":false,"durationMs":29999,"path":"b.zip"}],"expect":[]},
+    {"name":"the-short-filter-off-sends-a-short-one","setting":{"enabled":true,"onlyLong":false},"events":[{"t":0,"id":1,"state":"complete","incognito":false,"durationMs":500,"path":"b.zip"}],"expect":[{"t":3000,"title":"Download finished","text":"b.zip"}]},
+    {"name":"the-switch-off-sends-nothing","setting":{"enabled":false,"onlyLong":false},"events":[{"t":0,"id":1,"state":"complete","incognito":false,"durationMs":99999,"path":"b.zip"}],"expect":[]},
+    {"name":"incognito-never","setting":{"enabled":true,"onlyLong":false},"events":[{"t":0,"id":1,"state":"complete","incognito":true,"durationMs":99999,"path":"secret.pdf"}],"expect":[]},
+    {"name":"an-interrupted-long-download-says-failed","setting":{"enabled":true,"onlyLong":true},"events":[{"t":0,"id":1,"state":"interrupted","incognito":false,"durationMs":60000,"path":"big.iso"}],"expect":[{"t":3000,"title":"Download failed","text":"big.iso"}]},
+    {"name":"an-interrupted-short-download-is-skipped","setting":{"enabled":true,"onlyLong":true},"events":[{"t":0,"id":1,"state":"interrupted","incognito":false,"durationMs":1000,"path":"big.iso"}],"expect":[]},
+    {"name":"the-same-id-twice-is-one-alert","setting":{"enabled":true,"onlyLong":true},"events":[{"t":0,"id":7,"state":"complete","incognito":false,"durationMs":40000,"path":"a.zip"},{"t":5000,"id":7,"state":"complete","incognito":false,"durationMs":40000,"path":"a.zip"}],"expect":[{"t":3000,"title":"Download finished","text":"a.zip"}]},
+    {"name":"three-in-3-seconds-are-one-alert","setting":{"enabled":true,"onlyLong":true},"events":[{"t":0,"id":1,"state":"complete","incognito":false,"durationMs":40000,"path":"a.zip"},{"t":1000,"id":2,"state":"complete","incognito":false,"durationMs":40000,"path":"b.zip"},{"t":2999,"id":3,"state":"complete","incognito":false,"durationMs":40000,"path":"c.zip"}],"expect":[{"t":3000,"title":"Downloads finished","text":"3 downloads finished"}]},
+    {"name":"an-event-at-exactly-3-seconds-starts-a-new-burst","setting":{"enabled":true,"onlyLong":true},"events":[{"t":0,"id":1,"state":"complete","incognito":false,"durationMs":40000,"path":"a.zip"},{"t":3000,"id":2,"state":"complete","incognito":false,"durationMs":40000,"path":"b.zip"}],"expect":[{"t":3000,"title":"Download finished","text":"a.zip"},{"t":6000,"title":"Download finished","text":"b.zip"}]},
+    {"name":"two-interrupted-in-a-burst","setting":{"enabled":true,"onlyLong":true},"events":[{"t":0,"id":1,"state":"interrupted","incognito":false,"durationMs":40000,"path":"a.zip"},{"t":500,"id":2,"state":"interrupted","incognito":false,"durationMs":40000,"path":"b.zip"}],"expect":[{"t":3000,"title":"Downloads failed","text":"2 downloads failed"}]},
+    {"name":"a-mixed-burst","setting":{"enabled":true,"onlyLong":true},"events":[{"t":0,"id":1,"state":"complete","incognito":false,"durationMs":40000,"path":"a.zip"},{"t":500,"id":2,"state":"interrupted","incognito":false,"durationMs":40000,"path":"b.zip"},{"t":900,"id":3,"state":"complete","incognito":false,"durationMs":40000,"path":"c.zip"}],"expect":[{"t":3000,"title":"Downloads finished","text":"2 finished, 1 failed"}]},
+    {"name":"a-skipped-download-does-not-join-a-burst","setting":{"enabled":true,"onlyLong":true},"events":[{"t":0,"id":1,"state":"complete","incognito":false,"durationMs":40000,"path":"a.zip"},{"t":500,"id":2,"state":"complete","incognito":false,"durationMs":1000,"path":"b.zip"},{"t":900,"id":3,"state":"complete","incognito":true,"durationMs":40000,"path":"c.zip"}],"expect":[{"t":3000,"title":"Download finished","text":"a.zip"}]},
+    {"name":"the-name-is-the-last-segment-of-a-windows-path","setting":{"enabled":true,"onlyLong":false},"events":[{"t":0,"id":1,"state":"complete","incognito":false,"durationMs":1,"path":"D:\\dl\\sub dir\\report final.pdf"}],"expect":[{"t":3000,"title":"Download finished","text":"report final.pdf"}]},
+    {"name":"the-name-is-the-last-segment-of-a-posix-path","setting":{"enabled":true,"onlyLong":false},"events":[{"t":0,"id":1,"state":"complete","incognito":false,"durationMs":1,"path":"/home/a/Downloads/report.pdf"}],"expect":[{"t":3000,"title":"Download finished","text":"report.pdf"}]},
+    {"name":"mixed-separators","setting":{"enabled":true,"onlyLong":false},"events":[{"t":0,"id":1,"state":"complete","incognito":false,"durationMs":1,"path":"C:\\a/b\\c.txt"}],"expect":[{"t":3000,"title":"Download finished","text":"c.txt"}]},
+    {"name":"a-name-over-120-is-cut-by-code-points","setting":{"enabled":true,"onlyLong":false},"events":[{"t":0,"id":1,"state":"complete","incognito":false,"durationMs":1,"path":"x/","pathParts":[["😀",121]]}],"expect":[{"t":3000,"title":"Download finished","textParts":[["😀",120]]}]},
+    {"name":"a-path-with-no-name-says-a-file","setting":{"enabled":true,"onlyLong":false},"events":[{"t":0,"id":1,"state":"complete","incognito":false,"durationMs":1,"path":"C:\\dl\\"}],"expect":[{"t":3000,"title":"Download finished","text":"A file"}]},
+    {"name":"an-empty-path-says-a-file","setting":{"enabled":true,"onlyLong":false},"events":[{"t":0,"id":1,"state":"complete","incognito":false,"durationMs":1,"path":""}],"expect":[{"t":3000,"title":"Download finished","text":"A file"}]},
+    {"name":"two-separate-downloads-minutes-apart","setting":{"enabled":true,"onlyLong":true},"events":[{"t":0,"id":1,"state":"complete","incognito":false,"durationMs":40000,"path":"a.zip"},{"t":120000,"id":2,"state":"complete","incognito":false,"durationMs":40000,"path":"b.zip"}],"expect":[{"t":3000,"title":"Download finished","text":"a.zip"},{"t":123000,"title":"Download finished","text":"b.zip"}]},
+    {"name":"a-canceled-download-is-skipped","setting":{"enabled":true,"onlyLong":false},"events":[{"t":0,"id":1,"state":"interrupted","error":"USER_CANCELED","incognito":false,"durationMs":60000,"path":"big.iso"}],"expect":[],"note":"the user pressed Cancel: they know"},
+    {"name":"an-interrupted-download-that-was-not-canceled-says-failed","setting":{"enabled":true,"onlyLong":true},"events":[{"t":0,"id":1,"state":"interrupted","error":"NETWORK_FAILED","incognito":false,"durationMs":60000,"path":"big.iso"}],"expect":[{"t":3000,"title":"Download failed","text":"big.iso"}]},
+    {"name":"interrupted-then-resumed-is-two-alerts","setting":{"enabled":true,"onlyLong":true},"events":[{"t":0,"id":5,"state":"interrupted","error":"NETWORK_FAILED","incognito":false,"durationMs":40000,"path":"big.iso"},{"t":60000,"id":5,"state":"complete","incognito":false,"durationMs":120000,"path":"big.iso"}],"expect":[{"t":3000,"title":"Download failed","text":"big.iso"},{"t":63000,"title":"Download finished","text":"big.iso"}],"note":"a download is remembered by id AND state: the failure and the later finish are two things the user wants to know"},
+    {"name":"the-same-state-twice-is-skipped","setting":{"enabled":true,"onlyLong":true},"events":[{"t":0,"id":5,"state":"interrupted","error":"NETWORK_FAILED","incognito":false,"durationMs":40000,"path":"big.iso"},{"t":10000,"id":5,"state":"interrupted","error":"NETWORK_FAILED","incognito":false,"durationMs":40000,"path":"big.iso"},{"t":60000,"id":5,"state":"complete","incognito":false,"durationMs":120000,"path":"big.iso"},{"t":70000,"id":5,"state":"complete","incognito":false,"durationMs":120000,"path":"big.iso"}],"expect":[{"t":3000,"title":"Download failed","text":"big.iso"},{"t":63000,"title":"Download finished","text":"big.iso"}]},
+    {"name":"a-name-with-bidi-controls-gets-underscores","setting":{"enabled":true,"onlyLong":false},"events":[{"t":0,"id":1,"state":"complete","incognito":false,"durationMs":1,"path":"C:\\dl\\evil\u202efdp.exe"}],"expect":[{"t":3000,"title":"Download finished","text":"evil_fdp.exe"}],"note":"bidi controls (U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069) become _ in the name, like a link title"}
+  ]
+}

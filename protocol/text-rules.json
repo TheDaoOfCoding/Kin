@@ -1,0 +1,58 @@
+{
+  "description": "Text rules shared by both apps. Spec: docs/protocol.md, \"Text messages\": the sender's size threshold, line ends, and the sensitive flag. Strings use \\u escapes for every non-ASCII character.",
+  "specVersion": 1,
+  "senderThresholdBytes": 131072,
+  "howToRead": "lineEndings[]: toWire(clipboardText) must equal wire (every CRLF becomes LF in one left-to-right pass; a lone CR stays), windowsClipboard is what a Windows receiver writes for that wire text (every LF not preceded by a CR becomes CRLF), and wireSha256Hex is the SHA-256 of the UTF-8 bytes of the wire form: the loop guard hashes that, never the clipboard form. A case without clipboardText only checks the receiver direction. senderSize[]: decideSend(kind, sensitive, wireBytes) must equal expected. kind text is an explicit send, clipboard the automatic one. expected: text (a text message), file (a .txt file transfer), clipboard (a clipboard message), too_large (an automatic clipboard that is not sent: status too_large) or not_sent (a sensitive text over the threshold). wireBytes is the UTF-8 size after the line-end conversion; a case with synthesize builds the text as fill repeated fillCount times (+ suffix), and rawBytes is its size before the conversion. sensitiveSender[]: what a sender does, by category, with a fake clipboard that offers the listed formats (a string is a format that is present, an object a value format with its DWORD): expect.send is text, clipboard or none, and expect.sensitive the flag on the text. receiver[]: what a receiver does with a text frame, by category, with a fake clipboard, notifier and history.",
+  "lineEndings": [
+    {"name":"lf-only","clipboardText":"a\nb\n","wire":"a\nb\n","windowsClipboard":"a\r\nb\r\n","wireSha256Hex":"911169ddaaf146aff539f58c26c489af3b892dff0fe283c1c264c65ae5aa59a2"},
+    {"name":"crlf-becomes-lf","clipboardText":"a\r\nb\r\n","wire":"a\nb\n","windowsClipboard":"a\r\nb\r\n","wireSha256Hex":"911169ddaaf146aff539f58c26c489af3b892dff0fe283c1c264c65ae5aa59a2"},
+    {"name":"mixed","clipboardText":"a\r\nb\nc\r\n","wire":"a\nb\nc\n","windowsClipboard":"a\r\nb\r\nc\r\n","wireSha256Hex":"880553fca8fcea94e325ee2cfb48e5a985cc797f39a14cc6d3cedecfeb2ae4d2"},
+    {"name":"lone-cr-stays","clipboardText":"a\rb","wire":"a\rb","windowsClipboard":"a\rb","wireSha256Hex":"af9081672dd5ef3247a30c2db5b0dafcc9bcf981a26aefb3c55d210d43fcc14e"},
+    {"name":"cr-then-crlf-single-pass","clipboardText":"a\r\r\nb","wire":"a\r\nb","windowsClipboard":"a\r\nb","wireSha256Hex":"18745f36a05e29072709042d6062ce54f1b08ff36c27ba80c39f81fb010c8ce2"},
+    {"name":"crlf-crlf","clipboardText":"\r\n\r\n","wire":"\n\n","windowsClipboard":"\r\n\r\n","wireSha256Hex":"75a11da44c802486bc6f65640aa48a730f0f684c5c07a42ba3cd1735eb3fb070"},
+    {"name":"trailing-cr","clipboardText":"abc\r","wire":"abc\r","windowsClipboard":"abc\r","wireSha256Hex":"e2af64b38bbaf25b74d1e999d27370bde03f62b612f43a3f8f548287079ef77e"},
+    {"name":"no-line-ends","clipboardText":"plain","wire":"plain","windowsClipboard":"plain","wireSha256Hex":"a116c9ed46d6207734a43317d30fd88f52ac8634c37d904bbf4e41d865f90475"},
+    {"name":"lf-lf-cr-lf","clipboardText":"x\n\n\r\ny","wire":"x\n\n\ny","windowsClipboard":"x\r\n\r\n\r\ny","wireSha256Hex":"2f413ecfcf47cfde22878a21e43c6a7fc9d996304ed20edb0948f5ccc614459c"},
+    {"name":"unicode-and-crlf","clipboardText":"r\u00e9sum\u00e9\r\n\u65e5\u672c\r\n\ud83d\ude00","wire":"r\u00e9sum\u00e9\n\u65e5\u672c\n\ud83d\ude00","windowsClipboard":"r\u00e9sum\u00e9\r\n\u65e5\u672c\r\n\ud83d\ude00","wireSha256Hex":"5d633be772678620ad6c8938e755995ae29dfab233e2d4c53dd8165feee4a8c7"},
+    {"name":"receiver-keeps-an-existing-crlf","wire":"a\r\nb\nc","windowsClipboard":"a\r\nb\r\nc","wireSha256Hex":"5aecdf775ccf109670b2a18c5b43105ca48df3fedc2a6e707aa90cdfefe74843","note":"a text with CRLF on the wire (a sender that broke the rule) is not doubled: an LF that already follows a CR stays as it is"}
+  ],
+  "senderSize": [
+    {"name":"text-small","kind":"text","wireBytes":5,"expected":"text"},
+    {"name":"text-exactly-128-KiB","kind":"text","wireBytes":131072,"expected":"text","note":"131,072 bytes of UTF-8 on the wire is still a message"},
+    {"name":"text-one-byte-over-128-KiB","kind":"text","wireBytes":131073,"expected":"file","note":"sent as a .txt file instead"},
+    {"name":"text-1-MiB","kind":"text","wireBytes":1048576,"expected":"file"},
+    {"name":"text-over-1-MiB","kind":"text","wireBytes":1048577,"expected":"file"},
+    {"name":"clipboard-small","kind":"clipboard","wireBytes":5,"expected":"clipboard"},
+    {"name":"clipboard-exactly-128-KiB","kind":"clipboard","wireBytes":131072,"expected":"clipboard"},
+    {"name":"clipboard-one-byte-over-128-KiB","kind":"clipboard","wireBytes":131073,"expected":"too_large","note":"an automatic clipboard that big is not sent; the PC records too_large"},
+    {"name":"clipboard-over-1-MiB","kind":"clipboard","wireBytes":1048577,"expected":"too_large"},
+    {"name":"sensitive-text-exactly-128-KiB","kind":"text","wireBytes":131072,"expected":"text","sensitive":true},
+    {"name":"sensitive-text-one-byte-over-128-KiB","kind":"text","wireBytes":131073,"expected":"not_sent","sensitive":true,"note":"a file has no sensitive mark, so a sensitive text that big is not sent at all"},
+    {"name":"not-sensitive-explicit-false-over-128-KiB","kind":"text","wireBytes":131073,"expected":"file","sensitive":false},
+    {"name":"crlf-text-is-measured-after-conversion-fits","kind":"text","wireBytes":131070,"expected":"text","synthesize":{"fill":"ab\r\n","fillCount":43690,"rawBytes":174760},"note":"174,760 bytes as the clipboard holds it, 131,070 on the wire"},
+    {"name":"crlf-text-is-measured-after-conversion-over","kind":"text","wireBytes":131073,"expected":"file","synthesize":{"fill":"ab\r\n","fillCount":43691,"rawBytes":174764},"note":"131,073 bytes on the wire"},
+    {"name":"multibyte-text-exactly-128-KiB","kind":"text","wireBytes":131072,"expected":"text","synthesize":{"fill":"\u00e9","fillCount":65536,"rawBytes":131072}},
+    {"name":"multibyte-text-over-128-KiB","kind":"text","wireBytes":131073,"expected":"file","synthesize":{"fill":"\u00e9","fillCount":65536,"suffix":"a","rawBytes":131073}}
+  ],
+  "sensitiveSender": [
+    {"name":"pc-hotkey-with-exclude-format","side":"pc","trigger":"hotkey","formats":["ExcludeClipboardContentFromMonitorProcessing"],"expect":{"send":"text","sensitive":true}},
+    {"name":"pc-hotkey-with-history-format-0","side":"pc","trigger":"hotkey","formats":[{"CanIncludeInClipboardHistory":0}],"expect":{"send":"text","sensitive":true}},
+    {"name":"pc-hotkey-with-cloud-format-0","side":"pc","trigger":"hotkey","formats":[{"CanUploadToCloudClipboard":0}],"expect":{"send":"text","sensitive":true}},
+    {"name":"pc-hotkey-with-viewer-ignore","side":"pc","trigger":"hotkey","formats":["Clipboard Viewer Ignore"],"expect":{"send":"text","sensitive":true}},
+    {"name":"pc-hotkey-with-history-format-1","side":"pc","trigger":"hotkey","formats":[{"CanIncludeInClipboardHistory":1}],"expect":{"send":"text","sensitive":false}},
+    {"name":"pc-hotkey-with-history-format-2","side":"pc","trigger":"hotkey","formats":[{"CanIncludeInClipboardHistory":2}],"expect":{"send":"text","sensitive":false}},
+    {"name":"pc-hotkey-plain-text","side":"pc","trigger":"hotkey","formats":[],"expect":{"send":"text","sensitive":false}},
+    {"name":"pc-automatic-with-exclude-format-is-not-sent","side":"pc","trigger":"automatic","formats":["ExcludeClipboardContentFromMonitorProcessing"],"expect":{"send":"none","reason":"password_manager"}},
+    {"name":"pc-automatic-plain-text","side":"pc","trigger":"automatic","formats":[],"expect":{"send":"clipboard"}},
+    {"name":"phone-share-with-sensitive-extra","side":"phone","trigger":"send","extraIsSensitive":true,"expect":{"send":"text","sensitive":true}},
+    {"name":"phone-share-without-sensitive-extra","side":"phone","trigger":"send","extraIsSensitive":false,"expect":{"send":"text","sensitive":false}}
+  ],
+  "receiver": [
+    {"name":"sensitive-text","frame":{"text":"hunter2","isUrl":false,"sensitive":true},"expect":{"clipboard":"set","clipboardMarkedSensitive":true,"notification":"Text from <device>","preview":false,"openAction":false,"storedInHistory":false,"logsTextLengthOrHash":false}},
+    {"name":"sensitive-link-has-no-open-action","frame":{"text":"https://example.com/reset?t=abc","isUrl":true,"sensitive":true},"expect":{"clipboard":"set","clipboardMarkedSensitive":true,"notification":"Text from <device>","preview":false,"openAction":false,"storedInHistory":false,"logsTextLengthOrHash":false}},
+    {"name":"ordinary-text","frame":{"text":"hello","isUrl":false},"expect":{"clipboard":"set","clipboardMarkedSensitive":false,"notification":"Text from <device>","preview":true,"openAction":false,"storedInHistory":true,"logsTextLengthOrHash":true}},
+    {"name":"ordinary-link","frame":{"text":"https://example.com/","isUrl":true},"expect":{"clipboard":"set","clipboardMarkedSensitive":false,"notification":"Text from <device>","preview":true,"openAction":true,"storedInHistory":true,"logsTextLengthOrHash":true}},
+    {"name":"explicit-sensitive-false","frame":{"text":"hello","isUrl":false,"sensitive":false},"expect":{"clipboard":"set","clipboardMarkedSensitive":false,"notification":"Text from <device>","preview":true,"openAction":false,"storedInHistory":true,"logsTextLengthOrHash":true}}
+  ],
+  "windowsSensitiveFormats": {"description":"What a Windows receiver writes along with a sensitive text.","formats":[{"name":"ExcludeClipboardContentFromMonitorProcessing","data":"present"},{"name":"CanIncludeInClipboardHistory","dword":0},{"name":"CanUploadToCloudClipboard","dword":0}]}
+}

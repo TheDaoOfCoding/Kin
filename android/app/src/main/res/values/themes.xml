@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <style name="Theme.Kin" parent="android:Theme.Material.Light.NoActionBar" />
+
+    <!--
+        For the activities that only do something and finish (share, text menu, send clipboard): a see-through
+        window with no animation, so the user sees nothing but the screen they were on.
+    -->
+    <style name="Theme.Kin.Transparent" parent="android:Theme.Translucent.NoTitleBar">
+        <item name="android:windowAnimationStyle">@null</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:backgroundDimEnabled">false</item>
+    </style>
+</resources>

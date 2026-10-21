@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "debug-window",
+  "description": "The debug window: it listens for the app's events and may call only its own commands, nothing else",
+  "windows": ["debug"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten", "allow-debug-view", "allow-debug-ping", "allow-export-logs", "allow-close-window"]
+}

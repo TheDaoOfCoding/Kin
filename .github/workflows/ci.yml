@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  protocol:
+    name: Protocol vectors
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+      - run: bun protocol/check-vectors.ts
+
+  rust:
+    name: Windows app and native host (Rust)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+      # The toolchain, components and target come from rust-toolchain.toml.
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            desktop/src-tauri
+            desktop/native-host
+      # Tauri embeds the built UI (desktop/dist) at compile time, so it has to exist before cargo runs.
+      - name: Build the UI
+        working-directory: desktop
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+      - name: Windows app - fmt
+        working-directory: desktop/src-tauri
+        run: cargo fmt --check
+      - name: Windows app - clippy
+        working-directory: desktop/src-tauri
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Windows app - test
+        working-directory: desktop/src-tauri
+        run: cargo test --locked
+      - name: Native host - fmt
+        working-directory: desktop/native-host
+        run: cargo fmt --check
+      - name: Native host - clippy
+        working-directory: desktop/native-host
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Native host - test
+        working-directory: desktop/native-host
+        run: cargo test --locked
+
+  android:
+    name: Android unit tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+      # No signing is needed: the unit tests run on the JVM, and nothing reads a keystore.
+      - name: Unit tests
+        working-directory: android
+        run: ./gradlew.bat testDebugUnitTest --no-daemon --console=plain
+
+  extension:
+    name: Browser extension
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+      - name: Install, type-check and test
+        working-directory: extension
+        run: |
+          bun install --frozen-lockfile
+          bun run typecheck
+          bun test tests/unit

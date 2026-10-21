@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:allowBackup="false"
+        android:label="Link target"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <!-- Owns https://kin-link-test.example/... (a non-browser app: it has a host in its filter, so it is not a web browser). -->
+        <activity
+            android:name=".ViewActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="https" />
+                <data android:host="kin-link-test.example" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

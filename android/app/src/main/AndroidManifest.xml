@@ -1,0 +1,358 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- One of the permissions Android 14+ requires for a connectedDevice foreground service. -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- Android 17 (API 37) asks for this before an app may reach devices on the local network, including the PC. -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Asked for only when the user taps "Scan code" (see MainActivity.scan). The camera is optional: without one, the pairing link can be pasted. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Held only while file bytes move, and let go at once (architecture.md, "Battery rules for the phone"). -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Ring my phone (2B.4): the Stop screen over a locked phone. A normal permission, granted at install for a sideloaded app; Google Play may revoke it on Android 14+ (risk R37), and then the ring shows as a notification with a Stop button. Ringing never depends on it. -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- The ring vibrates (a normal permission). -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!--
+        Do Not Disturb sync (2B.5): a normal permission that only **names** the special access "Do Not Disturb access" (Settings > Notifications > Do Not Disturb > Apps that can interrupt, or the
+        screen that Kin opens). The access itself is granted by the user, **only after** they turn on "Silence this phone while my PC is in Focus" and none exists yet: never asked at start-up. It lets Kin
+        turn Do Not Disturb on and off; it does not let Kin read notifications. (Notification access, if the user already gave it for mirroring, covers it too: spike S5.)
+    -->
+    <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
+    <!--
+        Auto-send screenshots (2B.4, opt-in): declared, but **asked for only when the user turns the switch on**, never at start-up. Kin does not declare READ_MEDIA_VISUAL_USER_SELECTED, ACCESS_MEDIA_LOCATION,
+        READ_MEDIA_VIDEO or MANAGE_EXTERNAL_STORAGE. A Play build without this feature removes both (src/noshots, `-PkinAutoSendShots=false`).
+        Lint's "SelectedPhotoAccess" is deliberate: Android 14's "Select photos" is a grant for one session only, which cannot work for a watcher that runs in the background, so Kin runs in the
+        system's compatibility mode and shows "Needs access to all photos" when the grant is partial (design 5.6).
+    -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" tools:ignore="SelectedPhotoAccess" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+
+    <!--
+        Which apps can open a web link (2B.1): "Open in YouTube" in the link notification, and the resolve check of Android 10. This is not
+        QUERY_ALL_PACKAGES. Two kinds of entries:
+        - ACTION_VIEW of plain `https` / `http`: the web browsers (apps whose filter has no host), which the plan needs to tell browsers from the
+          apps that own a link;
+        - ACTION_VIEW of one named host: the apps that own it. Android does NOT show an app whose filter has a host (YouTube: www.youtube.com) to a
+          query that names no host, found on the emulator in 2B.1, so the well-known sites are listed one by one. A site that is not listed still
+          opens in its app on a tap (the system picks it); only the label is then the neutral "Open link" instead of "Open in <App>".
+    -->
+    <queries>
+        <!--
+            2B.2: the apps with a launcher icon, for the notification picker ("which apps may show notifications on your PC"). This is the usual way to
+            list the apps a user knows, and it is not QUERY_ALL_PACKAGES. A Play review may ask why (risk R27).
+        -->
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="https" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="http" />
+        </intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="youtube.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="www.youtube.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="m.youtube.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="music.youtube.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="youtu.be" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="open.spotify.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="spotify.link" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="twitter.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="www.twitter.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="mobile.twitter.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="x.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="www.x.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="t.co" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="www.reddit.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="reddit.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="old.reddit.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="redd.it" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="www.instagram.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="instagram.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="www.facebook.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="facebook.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="m.facebook.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="fb.watch" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="www.tiktok.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="tiktok.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="vm.tiktok.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="www.twitch.tv" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="twitch.tv" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="m.twitch.tv" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="maps.google.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="maps.app.goo.gl" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="drive.google.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="docs.google.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="www.amazon.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="amazon.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="amzn.to" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="www.netflix.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="www.linkedin.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="linkedin.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="www.pinterest.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="pin.it" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="t.me" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="wa.me" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="chat.whatsapp.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="discord.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="discord.gg" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="github.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="www.github.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="en.wikipedia.org" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="medium.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="www.imdb.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="soundcloud.com" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="https" android:host="music.apple.com" /></intent>
+    </queries>
+
+    <!-- No backup: identity keys and paired devices must not be restored to another device. -->
+    <application
+        android:name=".KinApp"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Kin">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Kin">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- kinrelay://pair?... -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="kinrelay" />
+                <data android:host="pair" />
+            </intent-filter>
+            <!--
+                https://<any host>/pair#... : any host for now, see protocol.md "Parsing rules". It can't be
+                verified (autoVerify) because there is no domain yet; the phone pins the PC by ID instead.
+            -->
+            <intent-filter tools:ignore="AppLinkWarning">
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="https" />
+                <data android:host="*" />
+                <data android:path="/pair" />
+                <data android:path="/pair/" />
+            </intent-filter>
+            <!-- The direct-share target (the paired PC in the share sheet's top row): see ShareShortcuts. -->
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
+        </activity>
+
+        <!--
+            Share sheet: text and files of any type, one or many. No UI: it hands them to the sender and finishes.
+            Exported on purpose: any app may offer text or files to Kin, and the user picks Kin in the share sheet (risk R13).
+        -->
+        <activity
+            android:name=".share.ShareActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Kin.Transparent">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
+
+        <!-- The QR scanner. Not exported: only MainActivity starts it, after the camera permission was granted. -->
+        <activity
+            android:name=".scan.ScanActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Kin" />
+
+        <!-- "Send to PC" in the text selection menu. -->
+        <activity
+            android:name=".share.ProcessTextActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:label="@string/send_to_pc"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Kin.Transparent">
+            <intent-filter>
+                <action android:name="android.intent.action.PROCESS_TEXT" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            Reads the clipboard while it has focus and sends it. Not exported: only our own tile and notification
+            button start it. (The adb shell may start it for tests, see android/README.md.)
+        -->
+        <activity
+            android:name=".clipboard.ClipboardSendActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Kin.Transparent" />
+
+        <!--
+            The tap on a link notification: opens the link in the app that owns it (or the browser) and finishes. No UI. Not exported: only our own
+            PendingIntents start it (a notification may not trampoline through a service or a receiver on Android 12+).
+        -->
+        <activity
+            android:name=".links.LinkOpenActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Kin.Transparent" />
+
+        <service
+            android:name=".clipboard.SendClipboardTile"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_kin"
+            android:label="@string/send_clipboard"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <!--
+            The "Pause Kin" quick settings tile (2B.4) and its long-press screen. The system starts the preferences activity with ACTION_QS_TILE_PREFERENCES, so it is exported for that action only.
+        -->
+        <service
+            android:name=".pause.PauseTile"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_kin"
+            android:label="@string/pause_tile_label"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <activity
+            android:name=".pause.PauseSettingsActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:label="@string/pause_settings_label"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Kin">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE_PREFERENCES" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            The Stop screen of "Ring my phone" (2B.4): shown over the lock screen from the ring notification's full-screen intent (where Android allows it) or from a tap. Not exported.
+        -->
+        <activity
+            android:name=".ring.RingActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleInstance"
+            android:showWhenLocked="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Kin"
+            android:turnScreenOn="true" />
+
+        <!-- "Export logs" on the Debug screen: the zip is read by the app the user picks in the share sheet, through a grant on the intent. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.exports"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/export_paths" />
+        </provider>
+
+        <service
+            android:name=".link.LinkService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+        <!--
+            Notification mirroring (2B.2), opt-in: the user gives Kin "Notification access" in the system settings (a special access: there is no
+            permission to ask for), and ticks the apps whose notifications may appear on the PC. The label is what the user sees in that list.
+        -->
+        <service
+            android:name=".notifmirror.MirrorListenerService"
+            android:exported="true"
+            android:label="@string/mirror_service_label"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <!-- The buttons and the swipe of the notification that shows the PC's media (2B.3). Only our own PendingIntents reach it. -->
+        <receiver
+            android:name=".media.PcMediaReceiver"
+            android:exported="false" />
+
+        <!-- The Cancel and Retry buttons of the transfer notifications. Only our own PendingIntents reach it. -->
+        <receiver
+            android:name=".transfer.TransferActionReceiver"
+            android:exported="false" />
+
+        <!-- 2B.5: the watchdog alarm of a held Do Not Disturb (a timer that survives deep sleep). Only our own PendingIntent reaches it. -->
+        <receiver
+            android:name=".dnd.DndWatchdogReceiver"
+            android:exported="false" />
+
+        <!-- 2B.4: the Stop button of the ring notification, the Pause / Resume button of the persistent notification, and the Cancel button of an auto-sent screenshot's 5-second wait. Only our own PendingIntents reach them. -->
+        <receiver
+            android:name=".ring.RingActionReceiver"
+            android:exported="false" />
+        <receiver
+            android:name=".pause.PauseReceiver"
+            android:exported="false" />
+        <receiver
+            android:name=".shots.ShotActionReceiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".link.BootReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <!-- An update of the app kills its foreground service: this brings it back (0.2.1). Only this app receives it. -->
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+    </application>
+
+</manifest>

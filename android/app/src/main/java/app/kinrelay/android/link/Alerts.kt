@@ -1,0 +1,44 @@
+package app.kinrelay.android.link
+
+/** What the app tells the user about texts and sends. The real one posts notifications and toasts. */
+interface Alerts {
+    /**
+     * A `text` arrived: "Text from <pc>" with a preview and a Copy button. [text] is null for sensitive text: no preview at all. [openUrl] is
+     * set only for a link that is safe to open. [copyText] is the whole text the Copy button puts on the clipboard (kept in memory only;
+     * null when there is nothing to copy), [sensitive] marks that clip sensitive, and [copiedAlready] says the text is on the clipboard
+     * already (the "copy received text automatically" setting), which the notification mentions.
+     */
+    fun textFrom(
+        pcName: String,
+        messageId: String,
+        text: String?,
+        openUrl: String?,
+        copyText: String? = null,
+        sensitive: Boolean = false,
+        copiedAlready: Boolean = true,
+    )
+
+    /**
+     * A `link` arrived (already acked and checked: `http` or `https`). A notification with the page title, the real address under it, a tap
+     * that opens it and a "Copy link" button. [lockScreenPreviews]: the user allows the title and the address on the lock screen.
+     */
+    fun linkFrom(pcName: String, messageId: String, link: app.kinrelay.android.links.ReceivedLink, lockScreenPreviews: Boolean)
+
+    /** A send worked. [arrivalMillis] is the time from the tap to the PC's ack. */
+    fun sent(pcName: String?, arrivalMillis: Long)
+
+    /**
+     * A send didn't go out yet and was saved in the queue: it goes out by itself when the PC is back. [afterNoReply]: it was sent, but the
+     * PC didn't ack in time (it may or may not have arrived; it is sent again with the same ID, which the PC recognises).
+     */
+    fun queued(pcName: String?, reason: String, afterNoReply: Boolean)
+
+    /** A text that had been reported as queued has gone out now. */
+    fun sentLater(pcName: String?)
+
+    /** A send didn't work and won't be tried again: a notification, because the user may have left the screen already. */
+    fun sendFailed(title: String, reason: String)
+
+    /** A short message that needs no follow-up (a toast). */
+    fun message(text: String)
+}

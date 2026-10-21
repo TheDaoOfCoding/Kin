@@ -1,0 +1,53 @@
+# Android / Gradle / Kotlin
+.gradle/
+build/
+local.properties
+.kotlin/
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Rust
+target/
+
+# Node
+node_modules/
+dist/
+
+# .NET
+bin/
+obj/
+*.user
+.vs/
+publish/
+
+# Private maintainer notes (design history, test results, plans); kept outside the public repo
+notes/
+
+# Secrets
+*.jks
+*.keystore
+.env
+.env.*
+!.env.example
+*.pfx
+*.pem
+*.p12
+*.key
+signing.properties
+identity.key
+log-key.dat
+
+# Local app data (a dev instance's database)
+kin.db
+kin.db-*
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Logs
+*.log

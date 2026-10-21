@@ -1,0 +1,88 @@
+:root { color-scheme: light dark; font: 14px "Segoe UI", system-ui, sans-serif; }
+body { margin: 0; }
+main { padding: 20px 24px; text-align: center; }
+h1 { font-size: 18px; font-weight: 600; margin: 0 0 12px; }
+p { margin: 8px 0; }
+.big { font-size: 20px; font-weight: 600; }
+.hint { opacity: 0.7; font-size: 12px; }
+.id { margin-top: 12px; }
+.qr { display: inline-block; background: #fff; padding: 8px; border-radius: 8px; }
+.qr svg { display: block; width: 256px; height: 256px; }
+.row { display: flex; gap: 8px; justify-content: center; margin-top: 16px; }
+button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid transparent; background: #2563eb; color: #fff; cursor: pointer; }
+button.secondary { background: transparent; border-color: currentColor; color: inherit; }
+button:disabled { opacity: 0.5; }
+
+/* The drop window (1.3) */
+main.drop { text-align: left; }
+main.drop h1 { text-align: center; }
+.zone { border: 2px dashed currentColor; border-radius: 12px; padding: 28px 16px; text-align: center; display: flex; flex-direction: column; gap: 6px; opacity: 0.75; cursor: pointer; user-select: none; }
+.zone:hover, .zone:focus, .zone.over { opacity: 1; border-color: #2563eb; background: rgba(37, 99, 235, 0.08); outline: none; }
+.drop .hint { text-align: center; }
+.drop .small { font-size: 12px; }
+.transfers { margin-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+.transfer .line { display: flex; align-items: center; gap: 8px; }
+.transfer .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.transfer progress { width: 100%; height: 8px; margin-top: 4px; }
+.transfer .hint { text-align: left; margin: 2px 0 0; }
+.transfer.failed .hint, .transfer.canceled .hint { color: #b45309; opacity: 1; }
+button.small { padding: 2px 10px; font-size: 12px; }
+
+/* The media strip of the drop window (2B.3) */
+.media { margin: 0 0 14px; padding: 10px 12px; border-radius: 10px; background: rgba(128, 128, 128, 0.12); }
+.media[hidden] { display: none; }
+.mediacard { display: flex; gap: 10px; align-items: center; }
+.mediacard .art { width: 56px; height: 56px; border-radius: 6px; object-fit: cover; flex: none; }
+.mediacard .text { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.mediacard .text strong, .mediacard .text span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.media input[type="range"] { flex: 1; min-width: 0; }
+.media label.hint { display: flex; align-items: center; gap: 8px; text-align: left; }
+
+/* The phone strip of the drop window (2B.4): the phone and its battery, the pause chips, Ring my phone and Pause */
+.phonestrip { margin: 0 0 12px; padding: 8px 12px; border-radius: 10px; background: rgba(128, 128, 128, 0.12); display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.phonestrip[hidden] { display: none; }
+.phonestrip .row { margin-top: 0; flex-wrap: wrap; }
+.phonestrip .hint { text-align: left; }
+
+/* The history, settings and debug windows (1.4) */
+main.list { text-align: left; padding: 16px 20px; }
+main.list h1 { text-align: left; }
+main.list h2 { font-size: 13px; font-weight: 600; margin: 18px 0 6px; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.7; }
+.flash { min-height: 1.4em; margin: 10px 0 0; font-size: 12px; }
+.flash.ok { color: #15803d; }
+.flash.bad, .hint.bad, .warn { color: #b45309; opacity: 1; }
+.good { color: #15803d; }
+.items { display: flex; flex-direction: column; margin-top: 8px; }
+.item { display: flex; align-items: flex-start; gap: 10px; padding: 8px 6px; border-bottom: 1px solid rgba(128, 128, 128, 0.25); }
+.item.clickable { cursor: pointer; }
+.item.clickable:hover { background: rgba(37, 99, 235, 0.07); }
+.item .dir { width: 18px; text-align: center; font-weight: 700; opacity: 0.7; }
+.item .body { flex: 1; min-width: 0; }
+.item .name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item .name.text { font-style: italic; }
+.item .meta { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; opacity: 0.8; margin-top: 2px; }
+.chip { padding: 0 6px; border-radius: 8px; background: rgba(128, 128, 128, 0.2); }
+.chip.done { background: rgba(21, 128, 61, 0.18); }
+.chip.failed { background: rgba(180, 83, 9, 0.22); }
+.chip.queued, .chip.active { background: rgba(37, 99, 235, 0.2); }
+.item .buttons { display: flex; gap: 6px; }
+.empty { opacity: 0.7; margin: 24px 0; text-align: center; }
+.row.left { justify-content: flex-start; align-items: center; margin-top: 8px; }
+.settings .field { display: flex; flex-direction: column; gap: 4px; }
+input[type="text"] { font: inherit; padding: 5px 8px; border-radius: 6px; border: 1px solid rgba(128, 128, 128, 0.6); background: transparent; color: inherit; width: 100%; box-sizing: border-box; }
+input.key { max-width: 260px; text-align: center; font-family: Consolas, monospace; }
+.toggle { display: flex; align-items: flex-start; gap: 8px; margin: 8px 0; cursor: pointer; }
+.toggle input { margin-top: 3px; }
+.toggle small { display: block; opacity: 0.7; font-size: 12px; }
+.path { display: block; word-break: break-all; padding: 6px 8px; border-radius: 6px; background: rgba(128, 128, 128, 0.15); font-size: 12px; }
+.device { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; margin: 6px 0; }
+.device .hint { flex-basis: 100%; margin: 2px 0 0; }
+.confirm { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.debug .big { font-size: 34px; font-weight: 600; margin: 4px 0; text-align: left; }
+.debug table { border-collapse: collapse; width: 100%; font-size: 13px; }
+.debug th, .debug td { text-align: left; padding: 3px 10px 3px 0; font-weight: 400; }
+.debug th { opacity: 0.75; }
+.debug ul { margin: 4px 0; padding-left: 18px; }
+.debug ul.log { list-style: none; padding-left: 0; font-size: 12px; }
+.debug ul.log li { padding: 2px 0; border-bottom: 1px solid rgba(128, 128, 128, 0.15); }
+code { font-family: Consolas, monospace; }

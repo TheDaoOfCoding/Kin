@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:allowBackup="false"
+        android:label="Share source"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <!--
+            Shares made-up files to Kin the way a gallery would: ACTION_SEND or ACTION_SEND_MULTIPLE with content:// URIs of this app's own
+            provider and FLAG_GRANT_READ_URI_PERMISSION. Extras: n (files, default 2), size (bytes each, default 100000), kill (true: this
+            process dies half a second after the share, to see that Kin keeps its read access), jpeg (true: names end in .jpg), chooser (true: open the system share sheet instead of going straight to Kin).
+              adb shell am start -n app.kinrelay.sharesource/.ShareActivity with the integer extras n and size and the boolean extra kill
+        -->
+        <activity
+            android:name=".ShareActivity"
+            android:exported="true"
+            android:excludeFromRecents="true" />
+
+        <!-- Not exported: a receiver can read a file only through the grant on the share intent. This is what makes the test real. -->
+        <provider
+            android:name=".SourceProvider"
+            android:authorities="app.kinrelay.sharesource.files"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+    </application>
+</manifest>
