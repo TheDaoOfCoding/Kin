@@ -6,12 +6,14 @@ import android.content.Context
 import android.content.Intent
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -23,7 +25,9 @@ import androidx.compose.runtime.produceState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.dp
 import android.os.Build
 import androidx.core.net.toUri
@@ -38,8 +42,11 @@ import app.kinrelay.android.debuginfo.LogExport
 import app.kinrelay.android.history.HistoryItem
 import app.kinrelay.android.history.HistoryStatus
 import app.kinrelay.android.history.SuccessRate
+import app.kinrelay.android.data.Appearance
 import app.kinrelay.android.pairing.PairingConfirmation
 import app.kinrelay.android.pairing.PairingUiState
+import app.kinrelay.android.pause.PauseSupport
+import app.kinrelay.android.ui.theme.KinTheme
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
@@ -53,8 +60,8 @@ private const val MIRROR_SETUP = 3
 private const val MIRROR_APPS = 4
 
 /**
- * The screens in one. When a link is waiting: Confirm pairing. With no PC paired: pairing (and Debug). With a PC: Home, History and Settings
- * as tabs, and, from Settings or after the first pairing, the setup (onboarding) and Debug as full screens.
+ * The screens in one. When a link is waiting: Confirm pairing. With no PC paired: the welcome and pairing (and Debug). With a PC: Home, History and
+ * Settings, picked in the floating bottom nav, and, from Settings or after the first pairing, the setup (onboarding) and Debug as full screens.
  */
 @Composable
 fun KinRoot(
@@ -79,10 +86,16 @@ fun KinRoot(
     val lastPing by graph.link.lastPing.collectAsState()
     val pairingState by graph.pairing.state.collectAsState()
     val loadedStats by graph.settings.stats.collectAsState(initial = null)
+    val appearance by graph.settings.appearance.collectAsState(initial = Appearance())
     val stats = loadedStats ?: Stats()
     val logLines by graph.log.recent.collectAsState()
     val history by graph.history.items.collectAsState(initial = emptyList())
     val pc = devices?.firstOrNull()
+    // The user's own Pause (Home's status card shows it asleep): what the screens show is the wall clock now, so a pause that ended while the phone slept is over.
+    graph.pause.view.collectAsState().value
+    LaunchedEffect(Unit) { graph.pause.refresh() }
+    val pauseNow = graph.pause.viewNow()
+    val pausedText = if (pauseNow.paused) PauseSupport.sentence(context, pauseNow.state) else null
     val localNetworkAllowed = permissions.localNetwork
 
     // The setup is shown once, right after the first pairing (and never before the settings are known).
@@ -92,8 +105,8 @@ fun KinRoot(
             screen = SETUP
         }
     }
-    // The tab row has 3 tabs with a PC and 2 without: once the PC is known to be gone (unlinked from the Settings tab, say) the old index is
-    // meaningless and a row of 2 must not be handed index 2 (the 0.2.0 crash). The row below also clamps, for the frames before this runs.
+    // The nav has 3 tabs with a PC and none without: once the PC is known to be gone (unlinked from the Settings tab, say) the old index is
+    // meaningless, so it starts again at Home. `shown` below also clamps, for the frames before this runs.
     val pairingKnown = devices != null
     LaunchedEffect(pairingKnown, pc != null) {
         if (pairingKnown) tab = TabSelection.afterPairingKnown(tab, pc != null)
@@ -127,9 +140,16 @@ fun KinRoot(
         }
     }
 
-    Scaffold(modifier = Modifier.fillMaxSize()) { padding ->
-        Column(modifier = Modifier.padding(padding)) {
-            val confirm = pairingState as? PairingUiState.Confirm
+    val confirm = pairingState as? PairingUiState.Confirm
+    // The floating nav belongs to the three tabs: not to a pairing link, the setup, Debug or the welcome.
+    val navVisible = confirm == null && screen == MAIN && pc != null
+    Scaffold(modifier = Modifier.fillMaxSize(), containerColor = KinTheme.colors.background) { padding ->
+      Box(Modifier.fillMaxSize()) {
+        // With the nav the lists scroll under it, so the bottom inset is theirs to handle (bottomPadding below); without it they stop above the system bar.
+        val layout = LocalLayoutDirection.current
+        val area = if (navVisible) PaddingValues.Absolute(left = padding.calculateLeftPadding(layout), top = padding.calculateTopPadding(), right = padding.calculateRightPadding(layout)) else padding
+        val bottomPadding = padding.calculateBottomPadding() + NavClearance
+        Column(modifier = Modifier.padding(area)) {
             if (confirm != null) {
                 // A pairing link from outside the app: nothing else is shown until the user decides.
                 ConfirmPairingScreen(confirm.confirmation, onConfirm = { onConfirmPairing(confirm.confirmation) }, onCancel = onCancelPairing)
@@ -175,6 +195,8 @@ fun KinRoot(
                             DebugHooks.MirrorTest(graph, context)
                         }
                     },
+                    lastPing = lastPing,
+                    onPing = { graph.link.ping() },
                     onPingInterval = { scope.launch { graph.settings.setPingIntervalSeconds(it) } },
                     onExport = {
                         scope.launch {
@@ -197,21 +219,11 @@ fun KinRoot(
                 debug()
                 return@Column
             }
-            // `shown` is always a tab this row has; `tab` is what was saved or asked for, and can be stale for a frame.
+            // `shown` is always a tab the nav has; `tab` is what was saved or asked for, and can be stale for a frame.
             val shown = TabSelection.clamp(tab, TabSelection.count(pc != null))
-            PrimaryTabRow(selectedTabIndex = shown) {
-                Tab(selected = shown == 0, onClick = { tab = 0 }, text = { Text("Kin") })
-                if (pc != null) {
-                    Tab(selected = shown == 1, onClick = { tab = 1 }, text = { Text("History") })
-                    Tab(selected = shown == 2, onClick = { tab = 2 }, text = { Text("Settings") })
-                } else {
-                    Tab(selected = shown == 1, onClick = { tab = 1 }, text = { Text("Debug") })
-                }
-            }
             val now = System.currentTimeMillis()
             when {
                 devices == null -> Unit
-                pc == null && shown == 1 -> debug()
                 pc == null -> OnboardingScreen(
                     state = pairingState,
                     localNetworkAllowed = localNetworkAllowed,
@@ -219,10 +231,12 @@ fun KinRoot(
                     identityProblem = identityProblem,
                     onScan = onScan,
                     onPair = onPair,
+                    onOpenDebug = { screen = DEBUG },
                 )
                 shown == 1 -> HistoryScreen(
                     items = history, nowMillis = now, onOpen = ::open,
                     onRetry = { graph.retryItem(it) }, onCancel = { graph.cancelItem(it) },
+                    bottomPadding = bottomPadding,
                 )
                 shown == 2 -> SettingsScreen(
                     context = context, pc = pc, deviceName = stats.deviceName.orEmpty(), systemName = graph.deviceInfo.name,
@@ -234,6 +248,10 @@ fun KinRoot(
                     onSaveName = { graph.settings.setDeviceName(it) },
                     onOpenSetup = { screen = SETUP }, onOpenDebug = { screen = DEBUG },
                     onUnpair = { graph.link.unpair(context) },
+                    appearance = appearance,
+                    onSkin = { scope.launch { graph.settings.setSkin(it) } },
+                    onThemeMode = { scope.launch { graph.settings.setThemeMode(it) } },
+                    bottomPadding = bottomPadding,
                     mirrorCard = { MirrorSettingsCard(graph, context, permissions, onOpenSetup = { screen = MIRROR_SETUP }, onOpenApps = { screen = MIRROR_APPS }) },
                     mediaCard = { MediaSettingsCard(graph, context, permissions) },
                     presenceCard = { PresenceSettingsCard(graph, context) },
@@ -242,15 +260,13 @@ fun KinRoot(
                 )
                 else -> HomeScreen(
                     pc = pc,
-                    phoneShortId = identity?.shortId,
                     localNetworkAllowed = localNetworkAllowed,
                     onAllowLocalNetwork = onAllowLocalNetwork,
                     identityProblem = identityProblem,
                     pairingState = pairingState,
                     onDismissPairing = { graph.pairing.reset() },
                     state = linkState,
-                    lastPing = lastPing,
-                    onPing = { graph.link.ping() },
+                    pausedText = pausedText,
                     onReconnect = { graph.link.userAction() },
                     onUnpair = { graph.link.unpair(context) },
                     recent = history, nowMillis = now, onSeeHistory = { tab = 1 },
@@ -260,8 +276,18 @@ fun KinRoot(
                     statusLine = { PcStatusLine(graph, context) },
                     pauseCard = { PauseCard(graph, context) },
                     shotsCard = { ShotsHomeCard(graph, context, permissions) },
+                    bottomPadding = bottomPadding,
                 )
             }
         }
+        if (navVisible) {
+            // The page fades out under the nav, so a list sliding beneath it never shows a hard cut.
+            NavFade(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(padding.calculateBottomPadding() + 112.dp))
+            KinBottomNav(
+                selected = TabSelection.clamp(tab, TabSelection.count(true)), onSelect = { tab = it },
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = padding.calculateBottomPadding() + 8.dp),
+            )
+        }
+      }
     }
 }

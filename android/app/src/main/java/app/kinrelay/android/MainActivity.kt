@@ -18,7 +18,7 @@ import app.kinrelay.android.pairing.PairingSource
 import app.kinrelay.android.pairing.PairingTarget
 import app.kinrelay.android.scan.ScanContract
 import app.kinrelay.android.ui.KinRoot
-import app.kinrelay.android.ui.theme.KinTheme
+import app.kinrelay.android.ui.theme.KinAppTheme
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
@@ -50,7 +50,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            KinTheme {
+            KinAppTheme(graph.settings, bars = this) {
                 KinRoot(
                     graph, this,
                     permissions = permissions.value,
@@ -193,7 +193,7 @@ class MainActivity : ComponentActivity() {
     }
 
     companion object {
-        /** An int extra: the tab to show (0 Kin, 1 History, 2 Settings). */
+        /** An int extra: the tab to show (0 Home, 1 History, 2 Settings). */
         const val EXTRA_TAB = "kin_tab"
         const val TAB_HISTORY = 1
     }

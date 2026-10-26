@@ -5,6 +5,25 @@ import app.kinrelay.android.link.PingResult
 import java.util.Locale
 
 object UiText {
+    /** The short words in the status card's pill: it has room for a few, not for a sentence (that goes under it, see [detail]). */
+    fun pill(state: LinkState): String = when (state) {
+        is LinkState.Connected -> "Connected on Wi-Fi"
+        is LinkState.Connecting -> "Looking for your PC…"
+        LinkState.NotOnWifi -> "Not on Wi-Fi"
+        LinkState.Stopped -> "Not running"
+        LinkState.Replaced -> "Connected elsewhere"
+        LinkState.UpdateApp -> "Update needed"
+        LinkState.PairAgain -> "Pair again"
+        LinkState.PermissionNeeded -> "Permission needed"
+    }
+
+    /** The sentence under the pill for the states that need one (what to do), else null: [pill] says it all. */
+    fun detail(state: LinkState): String? = when (state) {
+        is LinkState.Connecting -> (state.retryInMillis)?.let { "Next try in ${it / 1000} s" }
+        LinkState.Replaced, LinkState.UpdateApp, LinkState.PairAgain -> status(state)
+        is LinkState.Connected, LinkState.NotOnWifi, LinkState.Stopped, LinkState.PermissionNeeded -> null
+    }
+
     fun status(state: LinkState): String = when (state) {
         is LinkState.Connected -> "Connected"
         is LinkState.Connecting ->
@@ -72,6 +91,20 @@ object HistoryText {
         app.kinrelay.android.history.HistoryStatus.FAILED -> "Failed"
         app.kinrelay.android.history.HistoryStatus.CANCELED -> "Canceled"
         app.kinrelay.android.history.HistoryStatus.EXPIRED -> "Expired"
+    }
+
+    /**
+     * The line under a history row's title: "Sent to Desk PC · 12:03 · 1.2 MB". A finished row says where it went or came from; one still
+     * moving, waiting or ended says what it is doing. A text has no size (a few bytes say nothing).
+     */
+    fun line(item: app.kinrelay.android.history.HistoryItem, nowMillis: Long, zone: java.time.ZoneId = java.time.ZoneId.systemDefault()): String {
+        val what = when (item.status) {
+            app.kinrelay.android.history.HistoryStatus.DONE -> if (item.outgoing) "Sent to ${item.peerName}" else "Received from ${item.peerName}"
+            else -> status(item)
+        }
+        val parts = mutableListOf(what, time(item.timeMillis, nowMillis, zone))
+        if (!item.isText && item.sizeBytes > 0) parts += size(item.sizeBytes)
+        return parts.joinToString(" · ")
     }
 
     /** "To Desk PC" or "From Desk PC". */

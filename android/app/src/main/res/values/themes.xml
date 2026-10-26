@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 
-    <style name="Theme.Kin" parent="android:Theme.Material.Light.NoActionBar" />
+    <style name="Theme.Kin" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/kin_window_background</item>
+    </style>
 
     <!--
         For the activities that only do something and finish (share, text menu, send clipboard): a see-through

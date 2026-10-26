@@ -7,7 +7,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Slider
@@ -30,6 +29,11 @@ import app.kinrelay.android.media.MediaUiText
 import app.kinrelay.android.media.SliderSendGate
 import app.kinrelay.android.notifmirror.RestrictedSettings
 import kotlinx.coroutines.launch
+import app.kinrelay.android.ui.theme.ArtSlot
+import app.kinrelay.android.ui.theme.KinTheme
+import app.kinrelay.android.ui.theme.MediaArt
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.foundation.layout.size
 
 /** The least time between two values a drag of the PC's volume slider sends: 5 in 10 s at most, a quarter of the sender's 20 per 10 s, so the last value has room. */
 private const val SLIDER_SEND_GAP_MILLIS = 400L
@@ -58,7 +62,7 @@ fun MediaSettingsCard(graph: AppGraph, context: Context, permissions: Permission
     val access = permissions.notificationAccess
     // Back from the system's access screen: the hub looks again.
     LaunchedEffect(access) { graph.media.refreshAccess() }
-    Card(modifier = modifier.fillMaxWidth()) {
+    KinCard(modifier = modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Media", style = MaterialTheme.typography.titleMedium)
             Text(
@@ -95,10 +99,15 @@ fun MediaSettingsCard(graph: AppGraph, context: Context, permissions: Permission
 fun MediaHomeCard(graph: AppGraph, permissions: PermissionSnapshot, modifier: Modifier = Modifier) {
     val ui by graph.media.ui.collectAsState()
     val line = MediaUiText.homeLine(ui, permissions.notificationAccess) ?: return
-    Card(modifier = modifier.fillMaxWidth()) {
-        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("Media", style = MaterialTheme.typography.titleMedium)
-            Text(line, style = MaterialTheme.typography.bodyMedium)
+    KinCard(modifier = modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                ArtSlot(50.dp, 50.dp, shape = KinTheme.style.avatarShape) { MediaArt(Modifier.size(50.dp)) }
+                Column(Modifier.weight(1f)) {
+                    Text("Media", style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold))
+                    Text(line, style = MaterialTheme.typography.bodyMedium, color = KinTheme.colors.onSurfaceVariant)
+                }
+            }
             val volume = ui.pcVolume
             if (volume != null) {
                 var level by remember(volume.level) { mutableFloatStateOf(volume.level.toFloat()) }

@@ -28,7 +28,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.kinrelay.android.graph
-import app.kinrelay.android.ui.theme.KinTheme
+import app.kinrelay.android.ui.theme.KinAppTheme
 import kotlinx.coroutines.delay
 import java.lang.ref.WeakReference
 
@@ -46,7 +46,7 @@ class RingActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         val ring = applicationContext.graph.ring
         setContent {
-            KinTheme {
+            KinAppTheme(applicationContext.graph.settings) {
                 val ui by ring.ui.collectAsState()
                 var secondsLeft by remember { mutableLongStateOf(0L) }
                 LaunchedEffect(ui.ringing, ui.endsAtElapsed) {

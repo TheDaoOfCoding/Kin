@@ -7,11 +7,15 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
@@ -21,6 +25,8 @@ import app.kinrelay.android.debuginfo.ConnectionEvent
 import app.kinrelay.android.debuginfo.LatencySummary
 import app.kinrelay.android.history.HistoryItem
 import app.kinrelay.android.history.SuccessRate
+import app.kinrelay.android.link.PingResult
+import kotlinx.coroutines.launch
 
 private val PING_CHOICES = listOf(60 to "1 min", 240 to "4 min", 600 to "10 min")
 
@@ -38,12 +44,17 @@ fun DebugScreen(
     events: List<ConnectionEvent>,
     onPingInterval: (Int) -> Unit,
     onExport: () -> Unit,
+    /** "Ping PC" (it used to be on Home): one round trip to the PC, and the last answer. */
+    onPing: suspend () -> Unit = {},
+    lastPing: PingResult? = null,
     modifier: Modifier = Modifier,
     /** The notification-mirroring counters and, in a debug build, the "Mirror test" section (2B.2). */
     mirror: @Composable () -> Unit = {},
 ) {
     val rtt = LatencySummary.of(stats.recentRtts)
     val arrival = LatencySummary.of(stats.recentArrivals.map { it.toDouble() })
+    val scope = rememberCoroutineScope()
+    var pinging by remember { mutableStateOf(false) }
     LazyColumn(modifier = modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         item { Text("Debug", style = MaterialTheme.typography.titleLarge) }
         item { Text("First-try success: ${success.label()}", style = MaterialTheme.typography.titleMedium) }
@@ -59,7 +70,11 @@ fun DebugScreen(
                 }
             }
         }
-        item { Button(onClick = onExport, modifier = Modifier.fillMaxWidth()) { Text("Export logs") } }
+        item {
+            KinButton(if (pinging) "Pinging…" else "Ping PC", { scope.launch { pinging = true; onPing(); pinging = false } }, style = KinButtonStyle.PLAIN, block = true, enabled = !pinging)
+        }
+        if (lastPing != null) item { Text(UiText.ping(lastPing), style = MaterialTheme.typography.titleMedium) }
+        item { KinButton("Export logs", onExport, block = true) }
         item { mirror() }
 
         item { Text("Recent errors", style = MaterialTheme.typography.titleMedium) }

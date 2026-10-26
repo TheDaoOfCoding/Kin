@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The window behind the app before its first frame: Warm's page colour, light or dark with the phone. Compose draws the real one over it. -->
+    <color name="kin_window_background">#FFF8F1</color>
+</resources>

@@ -39,10 +39,20 @@
 | `PauseTile`, `PauseSettingsActivity`, `PauseReceiver` | `TileService`, activity (exported for `ACTION_QS_TILE_PREFERENCES` only), `BroadcastReceiver` (not exported) (2B.4) | The "Pause Kin" quick settings tile, its long-press screen, and the "Pause 1 h" / "Resume" action of the persistent notification |
 | `RingActivity`, `RingActionReceiver` | Activity (not exported, over the lock screen), `BroadcastReceiver` (not exported) (2B.4) | The Stop screen of "Ring my phone" and its Stop button |
 | `ShotActionReceiver` | `BroadcastReceiver`, not exported (2B.4) | The Cancel button of the 5-second wait of an auto-sent screenshot |
-| `MainActivity` | Compose | Pairing, Home, History, Settings, Debug, the setup (onboarding) |
+| `MainActivity` | Compose | Welcome and pairing, Home, History, Settings (with Appearance), Debug, the setup (onboarding) |
 | `TextOutbox`, `OutboxFlusher` | Plain classes on the app scope | The queue (1.4): texts saved first, flushed in creation order after the `hello`, with uploads |
 | `HistoryRepository` | Plain class | The history list from the database (1.4) |
 | Direct share shortcut | Sharing shortcuts API (`ShareShortcuts`, `res/xml/shortcuts.xml`) | Shows the PC in the share sheet's top row |
+
+## Look: skins and themes (`ui/theme/`)
+
+One layout, two skins. **Warm** (the default: cream and apricot, round corners, illustrations) and **Simple** (calm teal, flat, plain icons where Warm has an illustration), each in light and dark. A skin changes only tokens (colours, radii, the 3 dp "press lip" under buttons, shadows) and whether an art slot draws an illustration or an icon; never the layout.
+
+- **Tokens.** `KinTokens.kt` holds all 55 colours of the design for the four skin and mode combinations (`KinColors`, read as `KinTheme.colors`). `KinPalette` maps them to a Material3 `ColorScheme` and a `KinStyle` (shapes, press lip, shadows; `KinTheme.style`). No dynamic colour. Text is the system font: bold titles, semibold labels.
+- **Choice.** Settings, "Appearance": skin Warm or Simple (with a small preview of each) and theme System, Light or Dark. Kept in `KinSettings` (`skin`, `theme_mode`; default Warm and System; an unknown value reads as the default). `KinAppTheme` reads it live and gives the status and navigation bars light or dark icons to match the chosen theme. The Ring, Pause and Scan screens use it too.
+- **Parts.** `ui/KinComponents.kt` (card, button with press lip, chips, switch colours, segmented choice, the floating bottom nav) and `ui/theme/KinIcons.kt` (the design's icon set as vectors). `ui/theme/KinArt.kt` draws the illustrations on a Canvas (the PC and phone with faces that follow the link, the happy box, the record) and the Kin mark.
+- **The mark.** The app icon and the in-app logo are always the Warm "kin-mark" on apricot `#F2804A`, in every skin and mode (`ic_launcher_foreground`, a monochrome layer for themed icons, and `ic_stat_kin` as a white silhouette for the notification bar).
+- **Home** has a slot for the Send button (`sendButton`, right under the PC's status card). "Ping PC" is on the Debug screen.
 
 ## Why sending the clipboard is manual
 

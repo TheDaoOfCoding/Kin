@@ -16,7 +16,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.Card
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -54,6 +53,8 @@ import app.kinrelay.android.setup.SetupActions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import app.kinrelay.android.ui.theme.KinIcons
+import app.kinrelay.android.ui.theme.KinTint
 
 /** The apps that have a launcher icon (the `<queries>` entry), as picker candidates. No `QUERY_ALL_PACKAGES`. */
 internal fun launchableApps(context: Context): List<PickerModel.Candidate> {
@@ -280,7 +281,7 @@ fun MirrorSetupScreen(
 /** The numbered "Restricted setting" steps, with a button for Kin's App info page (design 4.2). */
 @Composable
 fun RestrictedSettingsCard(context: Context, modifier: Modifier = Modifier) {
-    Card(modifier = modifier.fillMaxWidth()) {
+    KinCard(modifier = modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Notification access isn't on yet", style = MaterialTheme.typography.titleMedium)
             Text("If Android says \"Restricted setting\", that is because Kin was installed from a file. Allowing it takes four steps:", style = MaterialTheme.typography.bodyMedium)
@@ -303,7 +304,7 @@ fun MirrorSettingsCard(
     val scope = rememberCoroutineScope()
     val policy by graph.mirror.store.policy.collectAsState(initial = MirrorPolicy())
     val pcAccepts by graph.mirror.pcAcceptsNotif.collectAsState()
-    Card(modifier = modifier.fillMaxWidth()) {
+    KinCard(modifier = modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Show notifications on your PC", style = MaterialTheme.typography.titleMedium)
             Text(
@@ -358,16 +359,14 @@ fun MirrorHomeCard(graph: AppGraph, permissions: PermissionSnapshot, onOpenSetup
     val policy by graph.mirror.store.policy.collectAsState(initial = MirrorPolicy())
     val pcAccepts by graph.mirror.pcAcceptsNotif.collectAsState()
     if (!policy.enabled) return
-    Card(modifier = modifier.fillMaxWidth()) {
-        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            if (!permissions.notificationAccess) {
-                Text("Notification access is off", style = MaterialTheme.typography.titleMedium)
-                Text("Mirroring is paused until you give Kin notification access again.", style = MaterialTheme.typography.bodyMedium)
-                OutlinedButton(onClick = onOpenSetup) { Text("Fix") }
-            } else {
-                Text("Mirroring notifications", style = MaterialTheme.typography.titleMedium)
-                Text(mirrorStatusLine(policy, true, pcAccepts), style = MaterialTheme.typography.bodyMedium)
-            }
+    if (!permissions.notificationAccess) {
+        FeatureCard(KinTint.LILAC, KinIcons.Bell, "Notification access is off", modifier) { small ->
+            Text("Mirroring is paused until you give Kin notification access again.", style = MaterialTheme.typography.bodyMedium, color = small)
+            KinButton("Fix", onOpenSetup, style = KinButtonStyle.PLAIN, small = true)
+        }
+    } else {
+        FeatureCard(KinTint.LILAC, KinIcons.Bell, "Mirroring notifications", modifier) { small ->
+            Text(mirrorStatusLine(policy, true, pcAccepts), style = MaterialTheme.typography.bodyMedium, color = small)
         }
     }
 }

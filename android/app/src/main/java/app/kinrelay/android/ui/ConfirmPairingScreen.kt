@@ -8,7 +8,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
-import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -34,7 +33,7 @@ fun ConfirmPairingScreen(
     ) {
         Text("Kin", style = MaterialTheme.typography.displayMedium)
         Text("Pair with this PC?", style = MaterialTheme.typography.titleLarge)
-        Card(modifier = Modifier.fillMaxWidth()) {
+        KinCard(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(confirmation.pcName, style = MaterialTheme.typography.titleLarge)
                 Text("PC ID: ${confirmation.shortId}", style = MaterialTheme.typography.titleMedium)

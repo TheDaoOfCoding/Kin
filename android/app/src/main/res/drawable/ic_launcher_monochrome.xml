@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- The same mark as outlines in one colour, for themed icons (Android uses only the shape and tints it). -->
+    <group
+        android:scaleX="1.68"
+        android:scaleY="1.68"
+        android:translateX="18.89"
+        android:translateY="21.24">
+        <path
+            android:pathData="M5.5,21a9.5,9.5 0 1,0 19.0,0a9.5,9.5 0 1,0 -19.0,0zM16.0,18a9.5,9.5 0 1,0 19.0,0a9.5,9.5 0 1,0 -19.0,0z"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="2.6" />
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M20.9,17a1.6,1.6 0 1,0 3.2,0a1.6,1.6 0 1,0 -3.2,0zM26.9,17a1.6,1.6 0 1,0 3.2,0a1.6,1.6 0 1,0 -3.2,0zM10.0,21a1.5,1.5 0 1,0 3.0,0a1.5,1.5 0 1,0 -3.0,0z" />
+        <path
+            android:pathData="M23,21.2q2.5,2.2 5,0"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="2.2"
+            android:strokeLineCap="round" />
+    </group>
+</vector>

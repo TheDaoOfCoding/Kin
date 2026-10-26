@@ -11,7 +11,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
-import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -98,7 +97,7 @@ fun SetupScreen(
 @Composable
 private fun OemCard(guide: OemGuide?, context: Context) {
     var note by remember { mutableStateOf<String?>(null) }
-    Card(modifier = Modifier.fillMaxWidth()) {
+    KinCard(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(guide?.title ?: "Your phone", style = MaterialTheme.typography.titleMedium)
             if (guide == null) {
@@ -123,7 +122,7 @@ private fun OemCard(guide: OemGuide?, context: Context) {
 
 @Composable
 private fun StepCard(title: String, done: Boolean, text: String, actions: @Composable () -> Unit) {
-    Card(modifier = Modifier.fillMaxWidth()) {
+    KinCard(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(title, style = MaterialTheme.typography.titleMedium)

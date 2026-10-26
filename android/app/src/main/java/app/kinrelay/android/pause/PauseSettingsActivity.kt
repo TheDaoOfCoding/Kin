@@ -14,7 +14,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import app.kinrelay.android.graph
 import app.kinrelay.android.ui.PauseCard
-import app.kinrelay.android.ui.theme.KinTheme
+import app.kinrelay.android.ui.theme.KinAppTheme
 
 /**
  * The long-press of the "Pause Kin" tile (`ACTION_QS_TILE_PREFERENCES`): the three choices and Resume, in the same card as Home. Exported only for the system's tile settings intent.
@@ -24,7 +24,7 @@ class PauseSettingsActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val graph = applicationContext.graph
         setContent {
-            KinTheme {
+            KinAppTheme(graph.settings) {
                 Scaffold(modifier = Modifier.fillMaxSize()) { padding ->
                     Column(
                         modifier = Modifier.padding(padding).padding(24.dp).verticalScroll(rememberScrollState()),

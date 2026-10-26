@@ -39,7 +39,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import app.kinrelay.android.ui.theme.KinTheme
+import app.kinrelay.android.graph
+import app.kinrelay.android.ui.theme.KinAppTheme
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -65,7 +66,7 @@ class ScanActivity : ComponentActivity() {
         }
         val executor = Executors.newSingleThreadExecutor().also { analysisExecutor = it }
         setContent {
-            KinTheme {
+            KinAppTheme(applicationContext.graph.settings) {
                 ScanScreen(executor, onCode = ::onCode, onCancel = { finishScan(null) })
             }
         }

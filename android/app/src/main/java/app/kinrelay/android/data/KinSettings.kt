@@ -1,6 +1,7 @@
 package app.kinrelay.android.data
 
 import android.content.Context
+import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
@@ -37,8 +38,17 @@ data class Stats(
     val copyReceivedTextAutomatically: Boolean = true,
 )
 
-class KinSettings(context: Context) {
-    private val store = context.applicationContext.dataStore
+/** The look of the app: Warm (the default) or Simple. Both use the same layout; a skin only changes colours, corners and the art. */
+enum class KinSkin { WARM, SIMPLE }
+
+/** Light, dark, or whatever the phone is set to. */
+enum class KinThemeMode { SYSTEM, LIGHT, DARK }
+
+/** The skin and the theme the user chose in Settings, "Appearance". The default is Warm and the phone's own light or dark. */
+data class Appearance(val skin: KinSkin = KinSkin.WARM, val mode: KinThemeMode = KinThemeMode.SYSTEM)
+
+class KinSettings internal constructor(private val store: DataStore<Preferences>) {
+    constructor(context: Context) : this(context.applicationContext.dataStore)
 
     val stats: Flow<Stats> = store.data.map { prefs ->
         Stats(
@@ -56,6 +66,18 @@ class KinSettings(context: Context) {
             copyReceivedTextAutomatically = prefs[COPY_TEXT_AUTOMATICALLY] != false,
         )
     }
+
+    /** The skin and the theme. A value this version doesn't know (a later app wrote it, then the app was downgraded) reads as the default. */
+    val appearance: Flow<Appearance> = store.data.map { prefs ->
+        Appearance(
+            skin = enumOrDefault(prefs[SKIN], KinSkin.WARM),
+            mode = enumOrDefault(prefs[THEME_MODE], KinThemeMode.SYSTEM),
+        )
+    }
+
+    suspend fun setSkin(skin: KinSkin) = store.edit { it[SKIN] = skin.name }
+
+    suspend fun setThemeMode(mode: KinThemeMode) = store.edit { it[THEME_MODE] = mode.name }
 
     suspend fun pingIntervalSeconds(): Int = store.data.first()[PING_INTERVAL] ?: DEFAULT_PING_INTERVAL_SECONDS
 
@@ -122,6 +144,9 @@ class KinSettings(context: Context) {
 
     suspend fun markServiceStopped() = store.edit { it[SERVICE_RUNNING] = false }
 
+    private inline fun <reified E : Enum<E>> enumOrDefault(name: String?, default: E): E =
+        enumValues<E>().firstOrNull { it.name == name } ?: default
+
     private suspend fun increment(key: Preferences.Key<Int>) = store.edit { it[key] = (it[key] ?: 0) + 1 }
 
     companion object {
@@ -141,5 +166,7 @@ class KinSettings(context: Context) {
         private val SETUP_DONE = booleanPreferencesKey("setup_done")
         private val LOCK_SCREEN_LINKS = booleanPreferencesKey("link_previews_on_lock_screen")
         private val COPY_TEXT_AUTOMATICALLY = booleanPreferencesKey("copy_received_text_automatically")
+        private val SKIN = stringPreferencesKey("skin")
+        private val THEME_MODE = stringPreferencesKey("theme_mode")
     }
 }

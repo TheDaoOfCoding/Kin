@@ -2,9 +2,23 @@
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="24dp"
     android:height="24dp"
-    android:viewportWidth="24"
-    android:viewportHeight="24">
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M7,5h2.4v5.6L14.2,5h3l-5,5.9L17.4,19h-2.9l-3.8,-5.6L9.4,15v4H7z" />
+    android:viewportWidth="40"
+    android:viewportHeight="40">
+    <!-- The Kin mark as a white silhouette (outlines and face), shifted to sit in the middle of the box. The status bar uses only its shape. -->
+    <group
+        android:translateX="-0.9"
+        android:translateY="0.5">
+        <path
+            android:pathData="M5.5,21a9.5,9.5 0 1,0 19.0,0a9.5,9.5 0 1,0 -19.0,0zM16.0,18a9.5,9.5 0 1,0 19.0,0a9.5,9.5 0 1,0 -19.0,0z"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="3.2" />
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M20.9,17a1.6,1.6 0 1,0 3.2,0a1.6,1.6 0 1,0 -3.2,0zM26.9,17a1.6,1.6 0 1,0 3.2,0a1.6,1.6 0 1,0 -3.2,0zM10.0,21a1.5,1.5 0 1,0 3.0,0a1.5,1.5 0 1,0 -3.0,0z" />
+        <path
+            android:pathData="M23,21.2q2.5,2.2 5,0"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="2.6"
+            android:strokeLineCap="round" />
+    </group>
 </vector>

@@ -9,7 +9,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RadioButton
@@ -43,7 +42,7 @@ fun DndSettingsCard(graph: AppGraph, context: Context, modifier: Modifier = Modi
     // Back from the system's access screen: look at the access again (idempotent).
     LaunchedEffect(Unit) { graph.dnd.refreshAccess() }
     val needsUpdate = peer.connected && !peer.peerListsPresence
-    Card(modifier = modifier.fillMaxWidth()) {
+    KinCard(modifier = modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("Focus and Do Not Disturb", style = MaterialTheme.typography.titleMedium)
             SettingSwitch(DndText.FOLLOW_TITLE, DndText.FOLLOW_DESCRIPTION, view.followOn) { on ->

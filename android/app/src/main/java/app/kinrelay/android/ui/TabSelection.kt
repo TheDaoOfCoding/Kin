@@ -1,14 +1,15 @@
 package app.kinrelay.android.ui
 
 /**
- * The tab row of [KinRoot] has 3 tabs (Kin, History, Settings) with a PC paired and 2 (Kin, Debug) without. The selected index is kept across
- * rotation and process death and is set by a notification tap, so it can be 2 while the row has 2 tabs: a PC that was unlinked from the Settings
- * tab, or a screen restored before the paired PC is read from the database. `PrimaryTabRow(selectedTabIndex = 2)` with 2 tabs throws
- * `IndexOutOfBoundsException` in its indicator (0.2.0 crash, fixed in 0.2.1). Everything that hands an index to the row goes through here.
+ * The bottom nav of [KinRoot] has 3 tabs (Home, History, Settings) with a PC paired and none without (the welcome screen has no nav, and Debug is
+ * a full screen). The selected index is kept across rotation and process death and is set by a notification tap, so it can be 2 while there is
+ * only one place to be: a PC that was unlinked from the Settings tab, or a screen restored before the paired PC is read from the database. In
+ * 0.2.0 that index crashed the old tab row (`PrimaryTabRow(selectedTabIndex = 2)` with 2 tabs, fixed in 0.2.1). Everything that hands an index
+ * to the nav goes through here.
  */
 object TabSelection {
     const val PAIRED_TABS = 3
-    const val UNPAIRED_TABS = 2
+    const val UNPAIRED_TABS = 1
 
     fun count(paired: Boolean): Int = if (paired) PAIRED_TABS else UNPAIRED_TABS
 
@@ -17,7 +18,7 @@ object TabSelection {
 
     /**
      * The selection to keep once the paired state is known to have changed to [paired]: with no PC the old index means nothing (2 was
-     * Settings, 1 was History, but 1 is Debug here), so a row without a PC starts again at the first tab. With a PC any valid index is kept.
+     * Settings, 1 was History), so it starts again at the first tab. With a PC any valid index is kept.
      */
     fun afterPairingKnown(selected: Int, paired: Boolean): Int = if (paired) clamp(selected, PAIRED_TABS) else 0
 }
