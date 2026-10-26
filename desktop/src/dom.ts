@@ -1,4 +1,5 @@
-// Small helpers the 1.4 windows (history, settings, debug) share. Plain DOM, no component library.
+// Small helpers the windows share. Plain DOM, no component library.
+import { icon } from "./icons";
 
 export function el<K extends keyof HTMLElementTagNameMap>(tag: K, props: Partial<HTMLElementTagNameMap[K]> = {}, ...children: (Node | string)[]): HTMLElementTagNameMap[K] {
   const node = Object.assign(document.createElement(tag), props);
@@ -6,8 +7,17 @@ export function el<K extends keyof HTMLElementTagNameMap>(tag: K, props: Partial
   return node;
 }
 
+/** A text button. `className` says what kind: "secondary" (plain instead of the main look) and "small". */
 export function button(label: string, onClick: () => void, className = ""): HTMLButtonElement {
-  const b = el("button", { type: "button", className }, label);
+  const words = className.split(" ");
+  const b = el("button", { type: "button", className: `btn ${words.includes("secondary") ? "plain" : "primary"}${words.includes("small") ? " sm" : ""}` }, label);
+  b.addEventListener("click", onClick);
+  return b;
+}
+
+/** A button with an icon of the sprite in front of its label. `className` is the look: "primary", "soft", "plain", "warn", with "sm" for a small one. */
+export function actionButton(iconName: string | null, label: string, onClick: () => void, className = "plain"): HTMLButtonElement {
+  const b = el("button", { type: "button", className: `btn ${className}` }, ...(iconName ? [icon(iconName)] : []), label);
   b.addEventListener("click", onClick);
   return b;
 }

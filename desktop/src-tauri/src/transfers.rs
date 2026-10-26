@@ -1532,6 +1532,9 @@ impl Core {
             "folder": status["receivedFolder"],
             "media": self.media_panel(),
             "presence": self.presence_panel(),
+            // For the sidebar the window shares with the history and settings windows.
+            "pcName": self.pc_name(),
+            "version": crate::core::APP_VERSION,
         })
     }
 

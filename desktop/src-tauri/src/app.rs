@@ -90,7 +90,10 @@ pub fn run(parsed: Parsed) {
             ui::send_files,
             ui::pick_files,
             ui::cancel_transfer,
+            ui::send_text,
             ui::open_window,
+            ui::appearance_view,
+            ui::set_appearance,
             ui::history_view,
             ui::history_open,
             ui::history_cancel,
@@ -963,6 +966,15 @@ fn dev_set(app: &AppHandle, core: &Arc<Core>, key: &str, value: &str) {
         "openLinksAutomatically" => {
             core.set_open_links_automatically(on);
             write(true, on.to_string());
+        }
+        // The Appearance setting: "warm" or "simple", and "system", "light" or "dark". The open windows change at once.
+        "skin" | "theme" => {
+            let (skin, theme) = core.appearance();
+            let (skin, theme) = if key == "skin" { (value, theme) } else { (skin, value) };
+            match ui::set_appearance_and_tell(app, core, skin, theme) {
+                Ok(()) => write(true, value.to_string()),
+                Err(e) => write(false, e),
+            }
         }
         // Phone notifications (2B.2): the switch starts the toast layer and registers the instance's own keys (registered under a name of its own, removed at exit).
         "mirrorNotifications" => {

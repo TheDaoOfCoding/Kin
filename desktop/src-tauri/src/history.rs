@@ -93,6 +93,9 @@ impl Core {
             "phone": snap.headline_device().map(|d| d.name.clone()),
             "connected": snap.state == crate::core::LinkState::PhoneConnected,
             "queued": snap.queued,
+            // For the sidebar the window shares with the drop and settings windows.
+            "pcName": self.pc_name(),
+            "version": crate::core::APP_VERSION,
         })
     }
 

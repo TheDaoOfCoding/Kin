@@ -3,7 +3,9 @@
 // queued one. The backend (src-tauri/src/history.rs) owns the list and never has a sensitive text or an automatic clipboard sync in it.
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { button, el, flash, historyErrorText, size, when } from "./dom";
+import { actionButton, el, flash, historyErrorText, size, when } from "./dom";
+import { emptyArt, icon } from "./icons";
+import { mountShell } from "./shell";
 
 type Item = {
   id: string;
@@ -29,23 +31,26 @@ type Item = {
   canRetry: boolean;
   canCancel: boolean;
 };
-type View = { items: Item[]; cap: number; phone: string | null; connected: boolean; queued: number };
+type View = { items: Item[]; cap: number; phone: string | null; connected: boolean; queued: number; pcName: string; version: string };
 
-const STATUS: Record<Item["status"], string> = { queued: "Queued", active: "In progress", done: "Done", failed: "Failed", canceled: "Canceled" };
+/** The word on an item's chip: what happened to it, in the direction it went. */
+function statusWord(i: Item): string {
+  if (i.status === "done") return i.direction === "out" ? "Sent" : "Received";
+  return { queued: "Waiting", active: "In progress", failed: "Failed", canceled: "Canceled" }[i.status];
+}
 
 function title(i: Item): string {
-  if (i.kind === "text" && i.isAlert) return `Alert: ${i.title ? `${i.title} — ` : ""}${i.text ?? "(alert)"}`;
-  if (i.kind === "text") return i.isLink && i.title ? `${i.title} — ${i.text ?? ""}` : (i.text ?? "(text)");
+  if (i.kind === "text" && i.isAlert) return `Alert: ${i.title ? `${i.title}: ` : ""}${i.text ?? "(alert)"}`;
+  if (i.kind === "text") return i.isLink && i.title ? `${i.title}: ${i.text ?? ""}` : (i.text ?? "(text)");
   if (i.files <= 1) return i.names[0] ?? "1 file";
   return `${i.files} files`;
 }
 
 export function startHistoryWindow(root: HTMLElement): void {
-  root.className = "list";
-  const head = el("p", { className: "hint" });
+  const shell = mountShell(root, "history");
   const note = el("p", { className: "flash" });
-  const list = el("div", { className: "items" });
-  root.append(el("h1", {}, "History"), head, list, note);
+  const list = el("div", { className: "items card" });
+  shell.body.append(list, note);
 
   const act = async (p: Promise<unknown>, done?: string) => {
     try {
@@ -72,16 +77,22 @@ export function startHistoryWindow(root: HTMLElement): void {
   };
 
   const row = (i: Item): HTMLElement => {
-    const arrow = el("span", { className: "dir", title: i.direction === "out" ? "Sent to the phone" : "Received from the phone" }, i.direction === "out" ? "↑" : "↓");
-    const name = el("span", { className: `name ${i.kind === "text" ? "text" : ""}` }, title(i));
-    const bits = [when(i.createdMs), STATUS[i.status], size(i.totalBytes)];
+    const out = i.direction === "out";
+    const failed = i.status === "failed";
+    const lead = el("span", { className: `av ${failed ? "err" : i.kind === "text" ? "lilac" : "sage"}` }, icon(i.kind === "text" ? "chat" : "file"));
+    const name = el("b", { className: i.kind === "text" ? "text" : "", title: title(i) }, title(i));
+    const bits = [when(i.createdMs), size(i.totalBytes)];
     if (i.error) bits.push(historyErrorText(i.error));
     if (i.retryOf) bits.push("retry");
-    const meta = el("div", { className: "meta" }, ...bits.map((b, n) => el("span", { className: n === 1 ? `chip ${i.status}` : "" }, b)));
+    const meta = el("small", failed ? { className: "err-t" } : {}, icon(out ? "up" : "down"), bits.join(" · "));
+    const chip =
+      i.status === "done"
+        ? el("span", { className: "chip ok" }, icon("check"), statusWord(i))
+        : el("span", { className: `chip ${i.status === "canceled" || i.status === "queued" ? "neutral" : "warn"}` }, statusWord(i));
     const buttons = el("div", { className: "buttons" });
-    if (i.canRetry) buttons.append(once(button("Retry", () => {}, "small"), `retry:${i.id}`, () => invoke<string>("history_retry", { id: i.id }), "Queued again."));
-    if (i.canCancel) buttons.append(once(button("Cancel", () => {}, "secondary small"), `cancel:${i.id}`, () => invoke("history_cancel", { id: i.id })));
-    const line = el("div", { className: `item ${i.status}${i.canOpen ? " clickable" : ""}` }, arrow, el("div", { className: "body" }, name, meta), buttons);
+    if (i.canRetry) buttons.append(once(actionButton("retry", "Retry", () => {}, "soft sm"), `retry:${i.id}`, () => invoke<string>("history_retry", { id: i.id }), "Queued again."));
+    if (i.canCancel) buttons.append(once(actionButton(null, "Cancel", () => {}, "plain sm"), `cancel:${i.id}`, () => invoke("history_cancel", { id: i.id })));
+    const line = el("div", { className: `prow ${i.status}${i.canOpen ? " clickable" : ""}` }, lead, el("div", { className: "grow" }, name, meta), chip, buttons);
     if (i.canOpen) {
       line.title = i.opensText ? (i.isLink ? "Click to copy this link" : "Click to copy this text") : "Click to open";
       line.addEventListener("click", (e) => {
@@ -94,8 +105,10 @@ export function startHistoryWindow(root: HTMLElement): void {
 
   const draw = (view: View) => {
     const who = view.phone ? (view.connected ? `${view.phone} is connected.` : `${view.phone} is not connected.`) : "No phone is paired.";
-    head.textContent = `${who}${view.queued ? ` ${view.queued} waiting to be sent.` : ""} The newest ${view.cap} items are kept in this list.`;
-    if (view.items.length === 0) list.replaceChildren(el("p", { className: "empty" }, "Nothing has been sent or received yet."));
+    shell.setPc(view.pcName, view.version);
+    shell.sub.textContent = `${who}${view.queued ? ` ${view.queued} waiting to be sent.` : ""} The newest ${view.cap} items are kept in this list.`;
+    list.classList.toggle("is-empty", view.items.length === 0);
+    if (view.items.length === 0) list.replaceChildren(el("div", { className: "empty" }, emptyArt("history"), el("b", {}, "Nothing here yet"), el("p", {}, "Things you send and receive will show up here, newest first.")));
     else list.replaceChildren(...view.items.map(row));
   };
 

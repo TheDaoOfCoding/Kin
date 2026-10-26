@@ -2,6 +2,7 @@
 // a button to remove the device. The backend (src-tauri/src/core.rs, `PairingView`) owns the state. This only draws it.
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { pairArt } from "./icons";
 
 type Device = { deviceId: string; name: string; platform: string };
 type View = {
@@ -20,7 +21,7 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, props: Partial<HTMLEl
 }
 
 function button(label: string, onClick: () => void, secondary = false): HTMLButtonElement {
-  const b = el("button", { type: "button", className: secondary ? "secondary" : "" }, label);
+  const b = el("button", { type: "button", className: `btn ${secondary ? "plain" : "primary"}` }, label);
   b.addEventListener("click", onClick);
   return b;
 }
@@ -41,7 +42,8 @@ export function startPairingWindow(root: HTMLElement): void {
 
   const draw = (view: View) => {
     window.clearInterval(timer);
-    root.replaceChildren();
+    root.className = "pairing";
+    root.replaceChildren(pairArt("pair-art"));
 
     if ((view.status === "paired" || view.status === "removed") && view.device) {
       const d = view.device;

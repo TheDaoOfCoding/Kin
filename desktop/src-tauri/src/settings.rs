@@ -101,6 +101,57 @@ fn common_shortcut(mods: Modifiers, key: &str) -> Option<String> {
 
 pub const FILE_NAME: &str = "settings.json";
 
+/// The look of the windows (the Appearance setting): the skin changes the colours, shapes and whether the pictures are illustrations or plain icons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Skin {
+    Warm,
+    Simple,
+}
+
+impl Skin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Skin::Warm => "warm",
+            Skin::Simple => "simple",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Skin> {
+        match text {
+            "warm" => Some(Skin::Warm),
+            "simple" => Some(Skin::Simple),
+            _ => None,
+        }
+    }
+}
+
+/// Light or dark: `System` follows Windows (the page reads `prefers-color-scheme`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Theme {
+    System,
+    Light,
+    Dark,
+}
+
+impl Theme {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Theme::System => "system",
+            Theme::Light => "light",
+            Theme::Dark => "dark",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Theme> {
+        match text {
+            "system" => Some(Theme::System),
+            "light" => Some(Theme::Light),
+            "dark" => Some(Theme::Dark),
+            _ => None,
+        }
+    }
+}
+
 /// The longest device name that is kept (protocol.md: a name longer than 64 characters is cut for display, so the settings keep 64).
 pub const MAX_DEVICE_NAME_CHARS: usize = 64;
 
@@ -160,6 +211,10 @@ pub struct Settings {
     pub pause: Option<PauseState>,
     /// The per-peer overrides of the features (design section 4). Empty, and with no UI in 2B.4.
     pub feature_overrides: Overrides,
+    /// Appearance, skin: Warm (the default) or Simple. Applied live to every open window.
+    pub skin: Skin,
+    /// Appearance, theme: System (the default), Light or Dark.
+    pub theme: Theme,
 }
 
 impl Default for Settings {
@@ -186,6 +241,8 @@ impl Default for Settings {
             hold_toasts_on_phone_dnd: true,
             pause: None,
             feature_overrides: Overrides::new(),
+            skin: Skin::Warm,
+            theme: Theme::System,
         }
     }
 }
@@ -280,6 +337,20 @@ impl Settings {
             Some(v @ Value::Object(_)) => settings.feature_overrides = crate::features::overrides_from_json(v),
             Some(_) => problems.push("featureOverrides must be an object".to_string()),
         }
+        match obj.get("skin") {
+            None | Some(Value::Null) => {}
+            Some(v) => match v.as_str().and_then(Skin::parse) {
+                Some(skin) => settings.skin = skin,
+                None => problems.push("skin must be \"warm\" or \"simple\"".to_string()),
+            },
+        }
+        match obj.get("theme") {
+            None | Some(Value::Null) => {}
+            Some(v) => match v.as_str().and_then(Theme::parse) {
+                Some(theme) => settings.theme = theme,
+                None => problems.push("theme must be \"system\", \"light\" or \"dark\"".to_string()),
+            },
+        }
         (settings, problems)
     }
 
@@ -306,6 +377,8 @@ impl Settings {
             "holdToastsOnPhoneDnd": self.hold_toasts_on_phone_dnd,
             "pause": self.pause.map(|p| p.to_json()),
             "featureOverrides": crate::features::overrides_to_json(&self.feature_overrides),
+            "skin": self.skin.as_str(),
+            "theme": self.theme.as_str(),
         })
     }
 
@@ -345,6 +418,20 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_appearance_is_warm_and_system_by_default_and_a_wrong_value_keeps_the_default() {
+        let d = Settings::default();
+        assert_eq!((d.skin, d.theme), (Skin::Warm, Theme::System));
+        let (s, problems) = Settings::from_json(r#"{ "skin": "simple", "theme": "dark" }"#);
+        assert_eq!((s.skin, s.theme), (Skin::Simple, Theme::Dark));
+        assert!(problems.is_empty());
+        let (s, problems) = Settings::from_json(r#"{ "skin": "neon", "theme": 3 }"#);
+        assert_eq!((s.skin, s.theme), (Skin::Warm, Theme::System));
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert_eq!(d.to_json()["skin"], "warm");
+        assert_eq!(d.to_json()["theme"], "system");
+    }
 
     #[test]
     fn the_media_switches_are_off_by_default_and_a_wrong_type_keeps_the_default() {
@@ -566,6 +653,8 @@ mod tests {
             hold_toasts_on_phone_dnd: false,
             pause: Some(PauseState::Until(1_760_000_000_000)),
             feature_overrides: crate::features::overrides_from_json(&json!({ "dev-a": { "clipboard.sync": false } })),
+            skin: Skin::Simple,
+            theme: Theme::Dark,
         };
         s.save(dir.path()).unwrap();
         assert_eq!(Settings::load(dir.path()), s);
