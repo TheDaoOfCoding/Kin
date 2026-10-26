@@ -4,7 +4,10 @@
 // The backend (src-tauri/src/prefs.rs, app.rs) saves each change at once and applies it.
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { effectiveMode, type Skin, type Theme } from "./appearance";
 import { button, el, flash, sensitiveWhilePausedText } from "./dom";
+import { icon } from "./icons";
+import { mountShell } from "./shell";
 
 type Device = { deviceId: string; name: string; platform: string; connected: boolean };
 type Mirror = {
@@ -68,6 +71,8 @@ type View = {
   autoClipboardSync: boolean;
   imagesToClipboard: boolean;
   openLinksAutomatically: boolean;
+  skin: Skin;
+  theme: Theme;
   mirror: Mirror;
   media: Media;
   presence: Presence;
@@ -104,7 +109,7 @@ export function accelerator(e: KeyboardEvent): string | null {
 }
 
 function section(heading: string, ...children: (Node | string)[]): HTMLElement {
-  return el("section", {}, el("h2", {}, heading), ...children);
+  return el("section", {}, el("h3", { className: "slabel" }, heading), el("div", { className: "card rows" }, ...children));
 }
 
 /** "62% charging", "14%": the battery as a person reads it. */
@@ -127,10 +132,11 @@ export function unlinkText(name: string, connected: boolean): string {
 }
 
 export function startSettingsWindow(root: HTMLElement): void {
-  root.className = "list settings";
+  const shell = mountShell(root, "settings");
+  shell.sub.textContent = "Make Kin look and work the way you like.";
   const note = el("p", { className: "flash" });
-  const body = el("div", {});
-  root.append(el("h1", {}, "Settings"), body, note);
+  const body = el("div", { className: "settings" });
+  shell.body.append(body, note);
   // The device whose "Unlink" confirmation is open. The tray's "Unlink phone…" opens the window with `#unlink=<deviceId>`, or tells an open one with an event.
   let unlinkOpen: string | null = unlinkFromHash(window.location.hash);
 
@@ -178,7 +184,60 @@ export function startSettingsWindow(root: HTMLElement): void {
     return out;
   };
 
+  /** The Appearance card: the skin (two pictures to pick from) and the theme. The change is saved and shown in every open window at once. */
+  const appearanceSection = (v: View): HTMLElement => {
+    let skin = v.skin;
+    let theme = v.theme;
+    const skinOptions: { skin: Skin; name: string; hint: string; preview: HTMLElement }[] = (["warm", "simple"] as const).map((k) => {
+      const preview = el("span", { className: "sp" }, el("span", { className: "sp-hero" }, el("span", { className: "dot" })), el("span", { className: "sp-cta" }), el("span", { className: "sp-tints" }, ...["lilac", "honey", "sage", "peach"].map((t) => el("i", { className: t }))));
+      preview.dataset.skin = k;
+      return { skin: k, name: k === "warm" ? "Warm" : "Simple", hint: k === "warm" ? "Friendly, the default" : "Plain and quiet", preview };
+    });
+    const themeOptions: { theme: Theme; name: string; icon: string }[] = [
+      { theme: "system", name: "System", icon: "auto" },
+      { theme: "light", name: "Light", icon: "sun" },
+      { theme: "dark", name: "Dark", icon: "moon" },
+    ];
+    const skinButtons = skinOptions.map((o) => {
+      const b = el("button", { type: "button", className: "skin-opt", role: "radio" as string }, o.preview, el("span", { className: "lab" }, el("span", { className: "radio" }), el("span", {}, el("b", {}, o.name), el("small", {}, o.hint))));
+      b.addEventListener("click", () => choose(o.skin, theme));
+      return b;
+    });
+    const themeButtons = themeOptions.map((o) => {
+      const b = el("button", { type: "button", role: "radio" as string }, icon(o.icon), o.name);
+      b.addEventListener("click", () => choose(skin, o.theme));
+      return b;
+    });
+    // The little pictures of the skins show the mode the windows are in now.
+    const mark = () => {
+      skinButtons.forEach((b, n) => b.setAttribute("aria-checked", String(skinOptions[n].skin === skin)));
+      themeButtons.forEach((b, n) => b.setAttribute("aria-checked", String(themeOptions[n].theme === theme)));
+      skinOptions.forEach((o) => (o.preview.dataset.mode = effectiveMode(theme)));
+    };
+    const choose = (nextSkin: Skin, nextTheme: Theme) => {
+      skin = nextSkin;
+      theme = nextTheme;
+      mark();
+      void call("set_appearance", { skin, theme });
+    };
+    mark();
+    return el(
+      "section",
+      {},
+      el("h3", { className: "slabel" }, "Appearance"),
+      el(
+        "div",
+        { className: "card appear" },
+        el("div", { className: "lbl" }, "Skin"),
+        el("div", { className: "skins", role: "radiogroup", ariaLabel: "Skin" }, ...skinButtons),
+        el("div", { className: "lbl" }, "Theme"),
+        el("div", { className: "themes", role: "radiogroup", ariaLabel: "Theme" }, ...themeButtons),
+      ),
+    );
+  };
+
   const draw = (v: View) => {
+    shell.setPc(v.deviceName, v.version);
     // device name
     const name = el("input", { type: "text", value: v.customDeviceName ?? "", placeholder: v.defaultDeviceName, maxLength: 64 });
     const saveName = async () => {
@@ -305,6 +364,7 @@ export function startSettingsWindow(root: HTMLElement): void {
     const startHint = v.startWithWindowsIsReal ? "Kin starts when you sign in and waits in the tray." : "Developer run: a file stands in for Windows' startup list, which is never changed.";
 
     body.replaceChildren(
+      appearanceSection(v),
       section("This PC", el("label", { className: "field" }, "Device name", name), el("p", { className: "hint" }, `Shown on your phone, and sent when it connects. Empty means ${v.defaultDeviceName}.`)),
       section(
         "Clipboard and photos",
@@ -365,5 +425,7 @@ export function startSettingsWindow(root: HTMLElement): void {
     // Don't redraw while a field has the focus: that would throw away what is being typed.
     if (!document.activeElement || document.activeElement === document.body) void refresh();
   });
+  // The look was changed (here, or by a script): the pictures and the choices follow.
+  void listen("appearance-changed", () => void refresh());
   void refresh();
 }

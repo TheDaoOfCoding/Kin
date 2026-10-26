@@ -3,5 +3,5 @@
   "identifier": "pairing-window",
   "description": "The pairing window: it listens for the app's events and may call only its own commands, nothing else",
   "windows": ["pairing"],
-  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten", "allow-pairing-view", "allow-new-pairing", "allow-copy-pairing-link", "allow-remove-device", "allow-close-window"]
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten", "allow-pairing-view", "allow-new-pairing", "allow-copy-pairing-link", "allow-remove-device", "allow-appearance-view", "allow-close-window"]
 }

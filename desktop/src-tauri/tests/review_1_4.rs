@@ -533,8 +533,11 @@ fn every_window_may_call_exactly_the_commands_its_page_calls_and_nothing_else() 
             }
         }
         assert!(!permissions.iter().any(|p| p.starts_with("core:default") || p == "core:event:default"), "{window}: no core:default");
-        // what the page calls
-        let page = read(&format!("../src/{window}.ts"));
+        // what the page calls: its own file, the look every window takes (`appearance.ts`), and, for the three windows that share the sidebar, `shell.ts`
+        let mut page = read(&format!("../src/{window}.ts")) + &read("../src/appearance.ts");
+        if ["drop", "history", "settings"].contains(&window) {
+            page += &read("../src/shell.ts");
+        }
         let mut called = std::collections::BTreeSet::new();
         for part in page.split("\"").skip(1).step_by(2) {
             if manifest.contains(part) {
@@ -565,8 +568,8 @@ fn every_command_checks_the_label_of_the_window_that_called_it() {
         commands += 1;
     }
     assert_eq!(
-        commands, 34,
-        "the 34 commands of the app (2B.3 added set_media_option and media_command, 2B.4 set_pause, ring_phone and set_presence_option, 2B.5 set_focus_option)"
+        commands, 37,
+        "the 37 commands of the app (2B.3 added set_media_option and media_command, 2B.4 set_pause, ring_phone and set_presence_option, 2B.5 set_focus_option, the new look send_text, appearance_view and set_appearance)"
     );
 }
 

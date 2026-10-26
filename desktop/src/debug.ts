@@ -30,7 +30,7 @@ function latency(label: string, l: Latency): HTMLElement {
 }
 
 export function startDebugWindow(root: HTMLElement): void {
-  root.className = "list debug";
+  root.className = "debug";
   const note = el("p", { className: "flash" });
   const body = el("div", {});
   root.append(el("h1", {}, "Debug"), body, note);

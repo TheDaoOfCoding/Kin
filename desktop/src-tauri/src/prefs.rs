@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::core::{Core, Event, lock};
-use crate::settings::{Settings, clean_device_name};
+use crate::settings::{Settings, Skin, Theme, clean_device_name};
 
 /// A folder that files can be received into: it exists (or can be made) and a file can be written there. Returns the reason if not.
 pub fn check_received_folder(path: &Path) -> Result<(), String> {
@@ -86,6 +86,30 @@ impl Core {
         }
     }
 
+    /// The Appearance setting: `(skin, theme)` as the words the pages use (`warm` or `simple`, `system`, `light` or `dark`).
+    pub fn appearance(&self) -> (&'static str, &'static str) {
+        let s = lock(&self.settings);
+        (s.skin.as_str(), s.theme.as_str())
+    }
+
+    /// Saves the skin and the theme at once. A word that is not one of them is refused and nothing changes. The caller tells the open windows.
+    pub fn set_appearance(&self, skin: &str, theme: &str) -> Result<(), String> {
+        let skin = Skin::parse(skin).ok_or_else(|| format!("no such skin: {skin}"))?;
+        let theme = Theme::parse(theme).ok_or_else(|| format!("no such theme: {theme}"))?;
+        let changed = {
+            let mut s = lock(&self.settings);
+            let changed = s.skin != skin || s.theme != theme;
+            s.skin = skin;
+            s.theme = theme;
+            changed
+        };
+        if changed {
+            log::info!("appearance: {} skin, {} theme", skin.as_str(), theme.as_str());
+            self.save_settings("appearance");
+        }
+        Ok(())
+    }
+
     /// Remembers the hotkey after the window has registered it (the registration itself needs the app, see `ui::set_hotkey`).
     pub fn store_hotkey(&self, accelerator: &str) {
         lock(&self.settings).hotkey = accelerator.to_string();
@@ -104,6 +128,8 @@ impl Core {
             "autoClipboardSync": s.auto_clipboard_sync,
             "imagesToClipboard": s.images_to_clipboard,
             "openLinksAutomatically": s.open_links_automatically,
+            "skin": s.skin.as_str(),
+            "theme": s.theme.as_str(),
             "mirror": self.mirror_view(),
             "media": self.media_view(),
             "presence": self.presence_panel(),

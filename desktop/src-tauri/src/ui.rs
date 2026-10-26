@@ -1,7 +1,7 @@
 //! Windows and the commands the web UI calls. A window is created when it is opened and **destroyed** when it is closed
 //! (windows.md): an open WebView2 costs tens of MB, and destroying it keeps the idle memory low.
 //!
-//! There are five windows: the pairing window, (1.3) the drop window, which the tray's left click opens: a target for files
+//! There are five windows (the drop, history and settings windows share one sidebar, so "Home", "History" and "Settings" are one place to the person; see `open_window`): the pairing window, (1.3) the drop window, which the tray's left click opens: a target for files
 //! dragged from Explorer (Windows doesn't support dropping on a tray icon), a button that opens the file dialog, and the progress of
 //! the transfers with a Cancel button, and (1.4) the history, settings and debug windows. They are all the same page (`index.html`), told
 //! apart by the `?w=` of their URL.
@@ -14,6 +14,10 @@ use crate::core::PairingView;
 
 pub const PAIRING_WINDOW: &str = "pairing";
 pub const DROP_WINDOW: &str = "drop";
+
+/// The drop (Home), history and settings windows are the three places of one sidebar, so they open at one size.
+const MAIN_SIZE: (f64, f64) = (960.0, 640.0);
+const MAIN_MIN: (f64, f64) = (760.0, 520.0);
 
 /// Defence in depth for the capabilities (`capabilities/<window>.json`, which already give each window only its own commands): a command also
 /// checks the label of the window that called it. A page that got into the wrong window (or a capability file that was edited too widely) still
@@ -53,7 +57,7 @@ pub fn open_pairing_window(app: &AppHandle, fresh: bool) {
             &app,
             WebviewWindowBuilder::new(&app, PAIRING_WINDOW, WebviewUrl::App("index.html".into()))
                 .title("Pair new phone")
-                .inner_size(380.0, 620.0)
+                .inner_size(420.0, 740.0)
                 .resizable(false)
                 .center(),
         )
@@ -95,8 +99,8 @@ pub fn open_drop_window(app: &AppHandle) {
             &app,
             WebviewWindowBuilder::new(&app, DROP_WINDOW, WebviewUrl::App("index.html?w=drop".into()))
                 .title("Send to phone")
-                .inner_size(400.0, 520.0)
-                .min_inner_size(360.0, 360.0)
+                .inner_size(MAIN_SIZE.0, MAIN_SIZE.1)
+                .min_inner_size(MAIN_MIN.0, MAIN_MIN.1)
                 .center(),
         )
         .build();
@@ -251,11 +255,30 @@ pub const DEBUG_WINDOW: &str = "debug";
 
 /// Opens a window of the page `index.html?w=<label>`, or brings it to the front. It is destroyed when it is closed, like the others.
 fn open_page(app: &AppHandle, label: &'static str, title: &'static str, size: (f64, f64), min: (f64, f64)) {
-    open_page_at(app, label, title, size, min, None);
+    open_page_at(app, label, title, size, min, None, None);
+}
+
+/// Where a window that takes the place of another opens: its position and size in logical pixels.
+type Placement = (f64, f64, f64, f64);
+
+/// Where `window` is, so that the window that replaces it can open in the same place and size.
+fn placement_of(window: &WebviewWindow) -> Option<Placement> {
+    let scale = window.scale_factor().ok()?;
+    let at = window.outer_position().ok()?;
+    let size = window.inner_size().ok()?;
+    Some((f64::from(at.x) / scale, f64::from(at.y) / scale, f64::from(size.width) / scale, f64::from(size.height) / scale))
 }
 
 /// Like [`open_page`], with a `#fragment` for the page to read when it starts (`#unlink=<deviceId>`).
-fn open_page_at(app: &AppHandle, label: &'static str, title: &'static str, size: (f64, f64), min: (f64, f64), fragment: Option<String>) {
+fn open_page_at(
+    app: &AppHandle,
+    label: &'static str,
+    title: &'static str,
+    size: (f64, f64),
+    min: (f64, f64),
+    fragment: Option<String>,
+    replacing: Option<(WebviewWindow, Placement)>,
+) {
     let state = app.state::<AppState>();
     if state.core.config.dev_no_windows {
         log::info!("{label} window skipped (--dev-no-windows)");
@@ -272,27 +295,29 @@ fn open_page_at(app: &AppHandle, label: &'static str, title: &'static str, size:
             Some(f) => format!("index.html?w={label}#{f}"),
             None => format!("index.html?w={label}"),
         };
-        let built = with_instance_data(
-            &app,
-            WebviewWindowBuilder::new(&app, label, WebviewUrl::App(url.into()))
-                .title(title)
-                .inner_size(size.0, size.1)
-                .min_inner_size(min.0, min.1)
-                .center(),
-        )
-        .build();
-        if let Err(e) = built {
-            log::error!("opening the {label} window failed: {e}");
+        let builder = WebviewWindowBuilder::new(&app, label, WebviewUrl::App(url.into())).title(title).min_inner_size(min.0, min.1);
+        let builder = match &replacing {
+            Some((_, (x, y, w, h))) => builder.position(*x, *y).inner_size(*w, *h),
+            None => builder.inner_size(size.0, size.1).center(),
+        };
+        match with_instance_data(&app, builder).build() {
+            // The sidebar took the person here: the window they were in goes, so it feels like one window changing its page.
+            Ok(_) => {
+                if let Some((old, _)) = replacing {
+                    let _ = old.destroy();
+                }
+            }
+            Err(e) => log::error!("opening the {label} window failed: {e}"),
         }
     });
 }
 
 pub fn open_history_window(app: &AppHandle) {
-    open_page(app, HISTORY_WINDOW, "History", (560.0, 600.0), (420.0, 320.0));
+    open_page(app, HISTORY_WINDOW, "History", MAIN_SIZE, MAIN_MIN);
 }
 
 pub fn open_settings_window(app: &AppHandle) {
-    open_page(app, SETTINGS_WINDOW, "Settings", (480.0, 780.0), (420.0, 420.0));
+    open_page(app, SETTINGS_WINDOW, "Settings", MAIN_SIZE, MAIN_MIN);
 }
 
 /// The tray's "Unlink phone...": the Settings window with the confirmation for this phone already open (`#unlink=<deviceId>`). A window that is open already is
@@ -303,7 +328,7 @@ pub fn open_unlink(app: &AppHandle, device_id: &str) {
         let _ = app.emit_to(SETTINGS_WINDOW, "unlink-requested", device_id.to_string());
         return;
     }
-    open_page_at(app, SETTINGS_WINDOW, "Settings", (480.0, 780.0), (420.0, 420.0), Some(format!("unlink={device_id}")));
+    open_page_at(app, SETTINGS_WINDOW, "Settings", MAIN_SIZE, MAIN_MIN, Some(format!("unlink={device_id}")), None);
 }
 
 pub fn open_debug_window(app: &AppHandle) {
@@ -683,15 +708,98 @@ fn save_file_dialog(owner: Option<isize>, default_name: &str) -> crate::Result<O
     }
 }
 
-/// The Settings window's "Debug…" button (and a way for any window to open another).
+/// The sidebar of the drop, history and settings windows (`drop` is Home) and the Settings window's "Debug…" button. `drop`, `history` and `settings` take the place
+/// of the window that asked (same position and size; if the target is open already it is brought to the front and the asking window goes), `debug` opens beside it.
 #[tauri::command]
 pub fn open_window(window: WebviewWindow, app: AppHandle, name: String) -> Result<(), String> {
-    only(&window, &[SETTINGS_WINDOW], "open_window")?;
-    match name.as_str() {
-        "history" => open_history_window(&app),
-        "settings" => open_settings_window(&app),
-        "debug" => open_debug_window(&app),
-        other => log::warn!("no window called {other:?}"),
+    only(&window, &[DROP_WINDOW, HISTORY_WINDOW, SETTINGS_WINDOW], "open_window")?;
+    let (label, title) = match name.as_str() {
+        "debug" => {
+            open_debug_window(&app);
+            return Ok(());
+        }
+        // The sidebar's "Pair a phone": a new pairing, in the pairing window (the sidebar window stays).
+        "pairing" => {
+            open_pairing_window(&app, true);
+            return Ok(());
+        }
+        "drop" => (DROP_WINDOW, "Send to phone"),
+        "history" => (HISTORY_WINDOW, "History"),
+        "settings" => (SETTINGS_WINDOW, "Settings"),
+        other => {
+            log::warn!("no window called {other:?}");
+            return Ok(());
+        }
+    };
+    if window.label() == label {
+        return Ok(());
+    }
+    if let Some(open) = app.get_webview_window(label) {
+        let _ = open.show();
+        let _ = open.set_focus();
+        let _ = window.destroy();
+        return Ok(());
+    }
+    let state = app.state::<AppState>();
+    if state.core.config.dev_no_windows {
+        return Ok(());
+    }
+    match placement_of(&window) {
+        Some(at) => open_page_at(&app, label, title, MAIN_SIZE, MAIN_MIN, None, Some((window, at))),
+        None => open_page(&app, label, title, MAIN_SIZE, MAIN_MIN),
     }
     Ok(())
+}
+
+// ----- the look (Appearance) and sending a typed text -----------------------------------------------------------------------
+
+/// The skin and the theme that every window shows. Every window reads it when it opens, and hears `appearance-changed` after that.
+#[tauri::command]
+pub fn appearance_view(window: WebviewWindow, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    only(&window, &[PAIRING_WINDOW, DROP_WINDOW, HISTORY_WINDOW, SETTINGS_WINDOW, DEBUG_WINDOW], "appearance_view")?;
+    Ok(appearance_json(&state.core))
+}
+
+fn appearance_json(core: &crate::core::Core) -> serde_json::Value {
+    let (skin, theme) = core.appearance();
+    serde_json::json!({ "skin": skin, "theme": theme })
+}
+
+/// Saves the Appearance setting and tells every open window, so they change at once.
+pub fn set_appearance_and_tell(app: &AppHandle, core: &crate::core::Core, skin: &str, theme: &str) -> Result<(), String> {
+    core.set_appearance(skin, theme)?;
+    let _ = app.emit("appearance-changed", appearance_json(core));
+    Ok(())
+}
+
+/// The Appearance choice of the Settings window (the skin and the theme together).
+#[tauri::command]
+pub fn set_appearance(
+    window: WebviewWindow,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    skin: String,
+    theme: String,
+) -> Result<(), String> {
+    only(&window, &[SETTINGS_WINDOW], "set_appearance")?;
+    set_appearance_and_tell(&app, &state.core, &skin, &theme)
+}
+
+/// The Send menu's "Text": a typed note or link goes to the phone the way the hotkey's text does (`Core::deliver`: stored in the queue first, a `text` message with
+/// `isUrl` set for a web address, a file over 128 KiB). The answer is the line the window shows.
+#[tauri::command]
+pub async fn send_text(window: WebviewWindow, state: State<'_, AppState>, text: String) -> Result<String, String> {
+    only(&window, &[DROP_WINDOW], "send_text")?;
+    use crate::sync::{Kind, SendResult, Tap};
+    if text.trim().is_empty() {
+        return Err("Type something to send.".to_string());
+    }
+    let tap = Tap::now();
+    match state.core.deliver(Kind::Text, text, false, "window", tap, true).await {
+        SendResult::Acked { .. } => Ok("Sent.".to_string()),
+        SendResult::PhoneOffline | SendResult::NoReply => Ok("Saved. It goes out when your phone is back.".to_string()),
+        SendResult::NoPhonePaired => Err("No phone is paired yet.".to_string()),
+        SendResult::Rejected(code) => Err(format!("Your phone didn't take it ({}).", code.replace('_', " "))),
+        SendResult::TooLarge { .. } => Err("That text is too big to send.".to_string()),
+    }
 }
