@@ -20,6 +20,7 @@ object AppCatalog {
         "com.google.android.apps.messaging", "com.samsung.android.messaging",
         "com.viber.voip", "jp.naver.line.android", "com.tencent.mm", "com.discord",
         "com.Slack", "com.microsoft.teams", "com.skype.raider", "com.google.android.apps.dynamite",
+        "com.instagram.android", "com.snapchat.android", "com.twitter.android",
     )
 
     /** Authenticators, password managers, wallets and payments: off, with a warning, and always mirrored without a preview. */

@@ -5,20 +5,22 @@ object DndText {
     const val FOLLOW_TITLE = "Silence this phone while my PC is in Focus"
     const val FOLLOW_DESCRIPTION =
         "When Windows Focus or Do Not Disturb is on, Kin turns Do Not Disturb on here too, and turns it off again when your PC leaves Focus. " +
-            "Kin only adds silence: if you are already in Do Not Disturb it changes nothing, and if you turn it off yourself it stays off until the next time. Off by default."
+            "Kin only adds silence: if you turn it off yourself, it stays off until the next time. " +
+            "Kin needs Do Not Disturb access for this. It can turn Do Not Disturb on and off, and it cannot read your notifications."
 
     const val SHARE_TITLE = "Tell my PC when this phone is on Do Not Disturb"
     const val SHARE_DESCRIPTION =
-        "Your PC shows \"Phone: Do Not Disturb\" and holds its own optional pop-ups while it lasts. Only your paired PC sees it; Kin keeps no history. Needs no special access. Off by default."
+        "Your PC shows \"Phone: Do Not Disturb\" and holds its own optional pop-ups while it lasts. Only your paired PC sees it, and Kin keeps no history. It needs no special access."
 
+    const val LEVEL_TITLE = "How much"
     const val PRIORITY_LABEL = "Priority only"
-    const val PRIORITY_NOTE = "Your own exceptions still ring (calls and messages from starred contacts, alarms)."
     const val ALARMS_LABEL = "Alarms only"
-    const val ALARMS_NOTE = "Only alarms make a sound. Kin never uses total silence: that would mute your alarm and \"Ring my phone\"."
+    const val LEVEL_HELP =
+        "Priority only: your own exceptions still ring (calls and messages from starred contacts, alarms). " +
+            "Alarms only: only alarms make a sound. Kin never uses total silence, because that would mute your alarm and \"Ring my phone\"."
 
     const val ACCESS_TITLE = "Do Not Disturb access"
     const val ACCESS_NEEDED = "Kin needs Do Not Disturb access to do this."
-    const val ACCESS_EXPLANATION = "Kin can turn Do Not Disturb on and off. It cannot read your notifications."
     const val ACCESS_BUTTON = "Allow Do Not Disturb access"
 
     const val UPDATE_PC = "Update Kin on your PC to use this."

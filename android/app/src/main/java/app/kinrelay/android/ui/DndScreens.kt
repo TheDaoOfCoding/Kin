@@ -45,18 +45,17 @@ fun DndSettingsCard(graph: AppGraph, context: Context, modifier: Modifier = Modi
     KinCard(modifier = modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("Focus and Do Not Disturb", style = MaterialTheme.typography.titleMedium)
-            SettingSwitch(DndText.FOLLOW_TITLE, DndText.FOLLOW_DESCRIPTION, view.followOn) { on ->
+            SettingSwitch(DndText.FOLLOW_TITLE, view.followOn, help = DndText.FOLLOW_DESCRIPTION) { on ->
                 scope.launch { graph.dndStore.setFollow(on) }
                 // The access is asked for here, when the user turns the feature on and none exists yet (never at start-up).
                 if (on && !view.access) openAccessScreen(context)
             }
             if (view.followOn) {
-                Text("How much", style = MaterialTheme.typography.titleSmall)
-                LevelRow(DndText.PRIORITY_LABEL, DndText.PRIORITY_NOTE, view.followFilter != DndWire.ALARMS) { scope.launch { graph.dndStore.setFollowFilter(DndWire.PRIORITY) } }
-                LevelRow(DndText.ALARMS_LABEL, DndText.ALARMS_NOTE, view.followFilter == DndWire.ALARMS) { scope.launch { graph.dndStore.setFollowFilter(DndWire.ALARMS) } }
-                Text(DndText.access(view.access, view.holding), style = MaterialTheme.typography.bodySmall, color = if (view.access) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.error)
+                TitleWithHelp(DndText.LEVEL_TITLE, DndText.LEVEL_HELP)
+                LevelRow(DndText.PRIORITY_LABEL, view.followFilter != DndWire.ALARMS) { scope.launch { graph.dndStore.setFollowFilter(DndWire.PRIORITY) } }
+                LevelRow(DndText.ALARMS_LABEL, view.followFilter == DndWire.ALARMS) { scope.launch { graph.dndStore.setFollowFilter(DndWire.ALARMS) } }
                 if (!view.access) {
-                    Text(DndText.ACCESS_EXPLANATION, style = MaterialTheme.typography.bodySmall)
+                    Text(DndText.access(false, view.holding), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
                     OutlinedButton(onClick = { openAccessScreen(context) }, modifier = Modifier.fillMaxWidth()) { Text(DndText.ACCESS_BUTTON) }
                 }
                 if (needsUpdate) Text(DndText.UPDATE_PC, style = MaterialTheme.typography.bodySmall)
@@ -65,21 +64,18 @@ fun DndSettingsCard(graph: AppGraph, context: Context, modifier: Modifier = Modi
                 // The level actually held (the record), not the "How much" setting, which may have changed since the request.
                 Text(DndText.holding(view.route, view.heldFilter), style = MaterialTheme.typography.bodyMedium)
                 OutlinedButton(onClick = { graph.dnd.releaseNow() }, modifier = Modifier.fillMaxWidth()) { Text("Release now") }
+                Text(DndText.FORCE_STOP_NOTE, style = MaterialTheme.typography.bodySmall)
             }
-            if (view.followOn || view.holding) Text(DndText.FORCE_STOP_NOTE, style = MaterialTheme.typography.bodySmall)
-            SettingSwitch(DndText.SHARE_TITLE, DndText.SHARE_DESCRIPTION, view.shareOn) { on -> scope.launch { graph.dndStore.setShare(on) } }
+            SettingSwitch(DndText.SHARE_TITLE, view.shareOn, help = DndText.SHARE_DESCRIPTION) { on -> scope.launch { graph.dndStore.setShare(on) } }
         }
     }
 }
 
 @Composable
-private fun LevelRow(label: String, note: String, selected: Boolean, onSelect: () -> Unit) {
+private fun LevelRow(label: String, selected: Boolean, onSelect: () -> Unit) {
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
         RadioButton(selected = selected, onClick = onSelect)
-        Column(modifier = Modifier.weight(1f)) {
-            Text(label, style = MaterialTheme.typography.bodyLarge)
-            Text(note, style = MaterialTheme.typography.bodySmall)
-        }
+        Text(label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
     }
 }
 

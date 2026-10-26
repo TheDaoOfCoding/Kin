@@ -305,16 +305,31 @@ class MediaLogicTest {
     @Test
     fun theMediaCardSaysWhatIsWrong() {
         val on = MediaUi(policy = MediaPolicy(share = true, show = true), connected = true, peerListsMedia = true, pcName = "Desk PC", notificationsAllowed = true)
-        assertEquals("Off", MediaUiText.shareLine(MediaUi(), true))
+        // A line appears only for something to act on or wait for: the switch itself says on and off.
+        assertNull(MediaUiText.shareLine(MediaUi(), true))
         assertEquals("Paused: Kin doesn't have notification access", MediaUiText.shareLine(on, access = false))
-        assertEquals("On. Waiting for Desk PC", MediaUiText.shareLine(on.copy(connected = false), true))
-        assertEquals("On. Desk PC needs Kin 0.2.0 to show media", MediaUiText.shareLine(on.copy(peerListsMedia = false), true))
-        assertEquals("On. Desk PC isn't showing your media: turn it on in Kin on your PC", MediaUiText.shareLine(on.copy(peerStatus = MediaStatus(show = false, share = false)), true))
-        assertTrue(MediaUiText.shareLine(on.copy(peerStatus = MediaStatus(show = true, share = false)), true).startsWith("On. Desk PC can show"))
-        assertEquals("On. Desk PC isn't sharing its media: turn it on in Kin on your PC", MediaUiText.showLine(on.copy(peerStatus = MediaStatus(show = false, share = false))))
-        assertEquals("On, but notifications are off for Kin, so Android can't show it", MediaUiText.showLine(on.copy(peerStatus = MediaStatus(show = false, share = true), notificationsAllowed = false)))
-        assertEquals("On. Showing Desk PC's media", MediaUiText.showLine(on.copy(peerStatus = MediaStatus(show = false, share = true), showing = true)))
+        assertEquals("Waiting for Desk PC", MediaUiText.shareLine(on.copy(connected = false), true))
+        assertEquals("Desk PC needs Kin 0.2.0 to show media", MediaUiText.shareLine(on.copy(peerListsMedia = false), true))
+        assertEquals("Desk PC isn't showing your media: turn it on in Kin on your PC", MediaUiText.shareLine(on.copy(peerStatus = MediaStatus(show = false, share = false)), true))
+        assertNull(MediaUiText.shareLine(on.copy(peerStatus = MediaStatus(show = true, share = false)), true))
+        assertNull(MediaUiText.showLine(MediaUi()))
+        assertEquals("Desk PC isn't sharing its media: turn it on in Kin on your PC", MediaUiText.showLine(on.copy(peerStatus = MediaStatus(show = false, share = false))))
+        assertEquals("Notifications are off for Kin, so Android can't show it", MediaUiText.showLine(on.copy(peerStatus = MediaStatus(show = false, share = true), notificationsAllowed = false)))
+        assertEquals("Showing Desk PC's media", MediaUiText.showLine(on.copy(peerStatus = MediaStatus(show = false, share = true), showing = true)))
+        assertNull(MediaUiText.showLine(on.copy(peerStatus = MediaStatus(show = false, share = true))))
+        assertEquals("Desk PC is playing", MediaUiText.homeLine(on.copy(showing = true, pcPlaying = true), true))
+        assertEquals("Desk PC has media paused", MediaUiText.homeLine(on.copy(showing = true, pcPlaying = false), true))
         assertNull(MediaUiText.homeLine(MediaUi(), true))
+    }
+
+    @Test
+    fun thePlayPauseButtonSendsPauseWhilePlayingElsePlayOrTheSourcesToggle() {
+        assertEquals(MediaCmdKind.PAUSE, MediaMapping.playPauseCommand(true, setOf(MediaAction.PLAY, MediaAction.PAUSE)))
+        assertEquals(MediaCmdKind.PLAY, MediaMapping.playPauseCommand(false, setOf(MediaAction.PLAY, MediaAction.PAUSE)))
+        assertEquals(MediaCmdKind.TOGGLE, MediaMapping.playPauseCommand(true, setOf(MediaAction.TOGGLE)))
+        assertEquals(MediaCmdKind.TOGGLE, MediaMapping.playPauseCommand(false, setOf(MediaAction.TOGGLE)))
+        assertNull(MediaMapping.playPauseCommand(true, setOf(MediaAction.NEXT)))
+        assertNull(MediaMapping.playPauseCommand(false, emptySet()))
     }
 
     // ---- 4.6: the media notifications are never mirrored as notifications

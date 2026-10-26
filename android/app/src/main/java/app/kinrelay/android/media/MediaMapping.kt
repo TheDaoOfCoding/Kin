@@ -101,6 +101,10 @@ object MediaMapping {
         else -> null
     }
 
+    /** What the one play/pause button of the Home card sends: pause while [playing], else play; the source's `toggle` when that is all it lists (null: nothing is offered). */
+    fun playPauseCommand(playing: Boolean, actions: Set<MediaAction>): MediaCmdKind? =
+        if (playing) pauseOrToggle(actions) else playOrToggle(actions)
+
     /** The second line a phone viewer shows: `<artist> · <PC name>` (3.11), the PC name alone when there is no artist. */
     fun deviceLine(artist: String?, deviceName: String): String =
         if (artist.isNullOrEmpty()) deviceName else "$artist \u00B7 $deviceName"

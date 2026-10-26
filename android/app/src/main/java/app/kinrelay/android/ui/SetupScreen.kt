@@ -49,11 +49,7 @@ fun SetupScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         Text(if (firstTime) "Keep Kin connected" else "Fix connection reliability", style = MaterialTheme.typography.headlineMedium)
-        Text(
-            "Phones stop apps that run in the background to save battery. Kin has to stay connected to your PC to receive from it, " +
-                "so these few settings matter. Each step shows whether it's done.",
-            style = MaterialTheme.typography.bodyLarge,
-        )
+        Text("Phones stop background apps to save battery, so Kin needs these few settings to stay connected.", style = MaterialTheme.typography.bodyLarge)
 
         if (permissions.notificationsExist) {
             StepCard(

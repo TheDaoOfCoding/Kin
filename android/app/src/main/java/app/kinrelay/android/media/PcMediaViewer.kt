@@ -41,6 +41,10 @@ class PcMediaViewer(
     /** The PC's session as the model holds it. Readable from any thread (the buttons run on the main thread). */
     val current: MediaState? get() = model.current
 
+    /** What the Home card shows of the PC's session now (title, art, state, offered buttons), or null without one. */
+    @Synchronized
+    fun currentView(): PcMediaView? = model.view(deviceName(), clock.elapsedMillis())
+
     /** The PC's volume, known with or without a session. */
     val volume: MediaVolume? get() = model.volume
 

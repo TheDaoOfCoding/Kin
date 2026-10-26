@@ -30,6 +30,7 @@ object KinIcons {
     val Folder: ImageVector by lazy { icon("Folder", line("M3 7.5A2.5 2.5 0 0 1 5.5 5H9l2 2.5h7.5A2.5 2.5 0 0 1 21 10v7.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5v-10z")) }
     val Check: ImageVector by lazy { icon("Check", line("m5 12.5 4.5 4.5L19 7.5")) }
     val Alert: ImageVector by lazy { icon("Alert", line("M3.5 12A8.5 8.5 0 1 0 20.5 12A8.5 8.5 0 1 0 3.5 12Z"), line("M12 7.8v4.9"), line("M12 16.2h.01")) }
+    val Help: ImageVector by lazy { icon("Help", line("M3.5 12A8.5 8.5 0 1 0 20.5 12A8.5 8.5 0 1 0 3.5 12Z"), line("M9.6 9.7a2.4 2.4 0 1 1 3.5 2.1c-.7.4-1.1.9-1.1 1.7"), line("M12 16.8h.01")) }
     val Info: ImageVector by lazy { icon("Info", line("M3.5 12A8.5 8.5 0 1 0 20.5 12A8.5 8.5 0 1 0 3.5 12Z"), line("M12 11v5.2"), line("M12 7.8h.01")) }
     val Retry: ImageVector by lazy { icon("Retry", line("M20.5 12a8.5 8.5 0 1 1-2.6-6.1l2.6 2.6"), line("M20.5 4v4.5H16")) }
     val Home: ImageVector by lazy { icon("Home", line("M3.5 10.2 12 3.5l8.5 6.7V19a1.5 1.5 0 0 1-1.5 1.5h-4v-6H9v6H5A1.5 1.5 0 0 1 3.5 19v-8.8z")) }

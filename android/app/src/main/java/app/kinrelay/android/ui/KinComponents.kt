@@ -18,18 +18,22 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.selection.selectable
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.SwitchColors
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -258,6 +262,38 @@ fun kinSwitchColors(): SwitchColors {
         checkedThumbColor = c.switchKnob, checkedTrackColor = c.primaryEdge, checkedBorderColor = Color.Transparent,
         uncheckedThumbColor = c.switchKnob, uncheckedTrackColor = c.surfaceContainerHigh, uncheckedBorderColor = c.outline,
     )
+}
+
+/**
+ * A small "?" next to a title. Tapping it opens [text] in a compact dialog headed [title], so a setting shows only its name and its control and the
+ * explanation is one tap away.
+ */
+@Composable
+fun HelpButton(title: String, text: String, modifier: Modifier = Modifier) {
+    var open by remember { mutableStateOf(false) }
+    Box(
+        modifier.size(32.dp).clip(KinTheme.style.full).clickable(role = Role.Button, onClick = { open = true }),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(KinIcons.Help, contentDescription = "About $title", tint = KinTheme.colors.onSurfaceSubtle, modifier = Modifier.size(18.dp))
+    }
+    if (open) {
+        AlertDialog(
+            onDismissRequest = { open = false },
+            title = { Text(title, style = MaterialTheme.typography.titleMedium) },
+            text = { Text(text, style = MaterialTheme.typography.bodyMedium) },
+            confirmButton = { TextButton(onClick = { open = false }) { Text("Got it", color = KinTheme.colors.primaryText) } },
+        )
+    }
+}
+
+/** A setting's title, with its "?" beside it when there is something to explain. */
+@Composable
+fun TitleWithHelp(title: String, help: String?, modifier: Modifier = Modifier, style: androidx.compose.ui.text.TextStyle = MaterialTheme.typography.titleSmall) {
+    Row(modifier, horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(title, style = style, modifier = Modifier.weight(1f, fill = false))
+        if (help != null) HelpButton(title, help)
+    }
 }
 
 /** One of a few exclusive choices, drawn as a row of pills in a tray (the Theme choice). */

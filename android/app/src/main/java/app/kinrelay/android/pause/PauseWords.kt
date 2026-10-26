@@ -27,6 +27,9 @@ object PauseWords {
         return "Until " + if (words == "until resumed") "resumed" else words
     }
 
+    /** "Paused until 18:30", "Paused until resumed": the one-row Pause card while a pause is on, from [untilSentence]'s "Until 18:30". */
+    fun pausedLine(untilSentence: String): String = "Paused " + untilSentence.replaceFirstChar(Char::lowercase)
+
     fun choiceLabel(choice: PauseChoice): String = when (choice) {
         PauseChoice.HOUR -> "1 hour"
         PauseChoice.TOMORROW -> "Until tomorrow"

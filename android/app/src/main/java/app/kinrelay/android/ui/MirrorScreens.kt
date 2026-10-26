@@ -212,8 +212,7 @@ fun MirrorSetupScreen(
             1 -> Column(modifier = Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text("Show notifications on your PC", style = MaterialTheme.typography.headlineMedium)
                 Text(
-                    "Notifications from the apps you pick appear on your PC's screen, and nowhere else. Kin keeps none of it: nothing is stored on this phone, " +
-                        "and your PC shows it as a Windows notification only. You can reply and dismiss from the PC. It's off until you finish these steps.",
+                    "Notifications from the apps you pick appear on your PC's screen, and nowhere else. Kin stores none of it, and you can reply and dismiss from the PC. It's off until you finish these steps.",
                     style = MaterialTheme.typography.bodyLarge,
                 )
                 Text("A mirrored notification's text lives in Windows' Action Center until it expires or you clear it.", style = MaterialTheme.typography.bodyMedium)
@@ -228,7 +227,7 @@ fun MirrorSetupScreen(
             }
             2 -> {
                 Text("Which apps?", style = MaterialTheme.typography.headlineMedium)
-                Text("Messaging apps are ticked for you. Nothing is read before you give access, and nothing from an app that isn't ticked is ever read. You can change this any time.", style = MaterialTheme.typography.bodyMedium)
+                Text("Messaging apps are ticked for you. Nothing from an app that isn't ticked is ever read. You can change this any time.", style = MaterialTheme.typography.bodyMedium)
                 if (apps == null || allowed == null) {
                     Text("Loading apps…")
                 } else {
@@ -307,44 +306,34 @@ fun MirrorSettingsCard(
     KinCard(modifier = modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Show notifications on your PC", style = MaterialTheme.typography.titleMedium)
-            Text(
-                "Notifications from the apps you pick appear on your PC and nowhere else. Kin stores none of their content.",
-                style = MaterialTheme.typography.bodySmall,
-            )
-            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("Mirror notifications", style = MaterialTheme.typography.bodyLarge)
-                    Text(mirrorStatusLine(policy, permissions.notificationAccess, pcAccepts), style = MaterialTheme.typography.bodySmall)
-                }
-                Switch(
-                    checked = policy.enabled,
-                    onCheckedChange = { on ->
-                        if (on && (!permissions.notificationAccess || policy.allowed.isEmpty())) onOpenSetup() else scope.launch { graph.mirror.store.setEnabled(on) }
-                    },
-                )
+            SettingSwitch(
+                "Mirror notifications", policy.enabled,
+                help = "Notifications from the apps you pick appear on your PC and nowhere else. Kin stores none of their content. " +
+                    "To stop Android sharing notifications with Kin at all, turn Kin off in the system's Notification access list." +
+                    if (RedactionMatcher.codesHidden(Build.VERSION.SDK_INT)) " Android hides verification codes from apps like Kin, so your PC says \"Code hidden by Android\"." else "",
+                note = mirrorNote(policy, permissions.notificationAccess, pcAccepts),
+            ) { on ->
+                if (on && (!permissions.notificationAccess || policy.allowed.isEmpty())) onOpenSetup() else scope.launch { graph.mirror.store.setEnabled(on) }
             }
             if (!permissions.notificationAccess) {
                 OutlinedButton(onClick = onOpenSetup, modifier = Modifier.fillMaxWidth()) { Text("Set up notification access") }
             } else if (policy.enabled) {
-                Text("To stop Android from sharing notifications with Kin altogether, turn Kin off in the system's Notification access list.", style = MaterialTheme.typography.bodySmall)
                 OutlinedButton(onClick = { RestrictedSettings.openNotificationAccess(context) }, modifier = Modifier.fillMaxWidth()) { Text("Open notification access") }
             }
             OutlinedButton(onClick = onOpenApps, modifier = Modifier.fillMaxWidth()) { Text("Apps (${policy.allowed.size} allowed)") }
-            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("Dismiss on the phone too", style = MaterialTheme.typography.bodyLarge)
-                    Text("When you close a mirrored notification on your PC, it is dismissed here as well.", style = MaterialTheme.typography.bodySmall)
-                }
-                Switch(checked = policy.dismissOnPhone, onCheckedChange = { scope.launch { graph.mirror.store.setDismissOnPhone(it) } })
-            }
-            if (RedactionMatcher.codesHidden(Build.VERSION.SDK_INT)) {
-                Text("Android hides verification codes from apps like Kin, so your PC says \"Code hidden by Android\".", style = MaterialTheme.typography.bodySmall)
-            }
+            SettingSwitch(
+                "Dismiss on the phone too", policy.dismissOnPhone,
+                help = "When you close a mirrored notification on your PC, it is dismissed here as well.",
+            ) { scope.launch { graph.mirror.store.setDismissOnPhone(it) } }
         }
     }
 }
 
-/** What the Settings card says under the switch (the PC side is told by `notif.status`; this is the phone's own view). */
+/** What Settings says under the "Mirror notifications" switch: only a problem or a wait (null when it is off or all is well: the switch and Home say so). */
+internal fun mirrorNote(policy: MirrorPolicy, access: Boolean, pcAccepts: Boolean): String? =
+    if (!policy.enabled || (access && policy.allowed.isNotEmpty() && pcAccepts)) null else mirrorStatusLine(policy, access, pcAccepts)
+
+/** What Home says about mirroring (the PC side is told by `notif.status`; this is the phone's own view). */
 internal fun mirrorStatusLine(policy: MirrorPolicy, access: Boolean, pcAccepts: Boolean): String = when {
     !policy.enabled -> "Off"
     !access -> "Paused: Kin doesn't have notification access"

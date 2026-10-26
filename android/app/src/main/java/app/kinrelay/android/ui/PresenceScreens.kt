@@ -6,12 +6,14 @@ import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -24,7 +26,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.net.toUri
 import app.kinrelay.android.AppGraph
@@ -38,13 +42,18 @@ import kotlinx.coroutines.launch
 import app.kinrelay.android.ui.theme.KinIcons
 import app.kinrelay.android.ui.theme.KinTint
 import app.kinrelay.android.ui.theme.KinTheme
-import androidx.compose.foundation.layout.FlowRow
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import app.kinrelay.android.ui.theme.tint
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.runtime.CompositionLocalProvider
 
+/** What the "?" of the Pause card says: the long explanation the card itself no longer carries. */
+private const val PAUSE_HELP =
+    "Stops everything automatic (clipboard sync, mirroring, media, screenshots) for a while. " +
+        "What you send yourself still arrives, quietly, in the history. Ringing still works."
+
 /**
- * The Pause card (design 5.3): the three choices and Resume, with the end of the pause, how many things arrived quietly meanwhile, and what the PC says about its own pause. Used on Home and
+ * The Pause card (design 5.3) as one row: the pause icon, "Pause Kin", a "?" and one "Pause" button that opens the three choices. While paused the row says when it ends
+ * ("Paused until 18:30") and its button is "Resume"; how many things arrived quietly meanwhile, and what the PC says about its own pause, show as small lines under it. Used on Home and
  * by the tile's long-press screen ([app.kinrelay.android.pause.PauseSettingsActivity]).
  */
 @Composable
@@ -55,30 +64,35 @@ fun PauseCard(graph: AppGraph, context: Context, modifier: Modifier = Modifier) 
     LaunchedEffect(Unit) { graph.pause.refresh() }
     val view = graph.pause.viewNow()
     val peer by graph.presence.view.collectAsState()
-    FeatureCard(KinTint.HONEY, KinIcons.Pausec, "Pause Kin", modifier) { small ->
-        if (view.paused) {
-            Text(PauseSupport.sentence(context, view.state), style = MaterialTheme.typography.bodyLarge)
-            PauseWords.receivedWhilePaused(view.receivedWhilePaused)?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = small) }
-            Text(
-                "Clipboard sync, notification mirroring, media and screenshots are off. Text, links and files you send still arrive here, quietly, in the history. Ringing still works.",
-                style = MaterialTheme.typography.bodySmall, color = small,
-            )
-            KinButton("Resume", { scope.launch { graph.pause.resume() } }, style = KinButtonStyle.WARN, icon = KinIcons.Play, block = true)
-        } else {
-            Text(
-                "Stops everything automatic (clipboard sync, mirroring, media, screenshots) for a while. What you send yourself still arrives, quietly.",
-                style = MaterialTheme.typography.bodySmall, color = small,
-            )
-        }
-        @OptIn(ExperimentalLayoutApi::class)
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            PauseChoice.entries.forEach { choice ->
-                KinButton(PauseWords.choiceLabel(choice), { scope.launch { graph.pause.set(choice) } }, style = KinButtonStyle.PLAIN, small = true)
+    var menu by remember { mutableStateOf(false) }
+    val small = KinTheme.colors.tint(KinTint.HONEY).onContainer
+    KinCard(modifier.fillMaxWidth(), tint = KinTint.HONEY) {
+        Column(Modifier.padding(start = 14.dp, top = 10.dp, end = 10.dp, bottom = 10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                TintSlot(KinIcons.Pausec, KinTint.HONEY, onCard = true)
+                TitleWithHelp(
+                    if (view.paused) PauseWords.pausedLine(PauseSupport.sentence(context, view.state)) else "Pause Kin",
+                    PAUSE_HELP, Modifier.weight(1f),
+                    style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                )
+                if (view.paused) {
+                    KinButton("Resume", { scope.launch { graph.pause.resume() } }, style = KinButtonStyle.WARN, small = true)
+                } else {
+                    Box {
+                        KinButton("Pause", { menu = true }, style = KinButtonStyle.PLAIN, small = true)
+                        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                            PauseChoice.entries.forEach { choice ->
+                                DropdownMenuItem(text = { Text(PauseWords.choiceLabel(choice)) }, onClick = { menu = false; scope.launch { graph.pause.set(choice) } })
+                            }
+                        }
+                    }
+                }
             }
-        }
-        if (peer.connected && peer.peerPaused) {
-            val until = peer.peerPausedUntilWall?.let { PauseSupport.time(context, it) }
-            Text(if (peer.peerPausedUntilResumed || until == null) "Paused on the PC" else "Paused on the PC until $until", style = MaterialTheme.typography.bodySmall, color = small)
+            if (view.paused) PauseWords.receivedWhilePaused(view.receivedWhilePaused)?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = small) }
+            if (peer.connected && peer.peerPaused) {
+                val until = peer.peerPausedUntilWall?.let { PauseSupport.time(context, it) }
+                Text(if (peer.peerPausedUntilResumed || until == null) "Paused on the PC" else "Paused on the PC until $until", style = MaterialTheme.typography.bodySmall, color = small)
+            }
         }
     }
 }
@@ -141,41 +155,32 @@ fun PresenceSettingsCard(graph: AppGraph, context: Context, modifier: Modifier =
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("Status, pause and ring", style = MaterialTheme.typography.titleMedium)
             SettingSwitch(
-                "Share this phone's battery with your PC",
-                "Your PC's tray shows the level and whether it is charging, and warns you when it is low. Only your paired PC sees it; Kin keeps no history of it.",
-                share,
+                "Share this phone's battery with your PC", share,
+                help = "Your PC's tray shows the level and whether it is charging, and warns you when it is low. Only your paired PC sees it. Kin keeps no history of it.",
             ) { scope.launch { graph.presenceStore.setShare(it) } }
             SettingSwitch(
-                "Show your PC's status here",
-                "A laptop's battery and whether Kin is paused on the PC show in the Kin notification and on Home.",
-                show,
+                "Show your PC's status here", show,
+                help = "A laptop's battery and whether Kin is paused on the PC show in the Kin notification and on Home.",
             ) { scope.launch { graph.presenceStore.setShow(it) } }
-            Text("Pause", style = MaterialTheme.typography.titleSmall)
-            Text(
-                "Pause Kin from the quick settings tile, the notification (\"Pause 1 h\") or Home: 1 hour, until tomorrow 08:00, or until you resume.",
-                style = MaterialTheme.typography.bodySmall,
-            )
+            TitleWithHelp("Pause", "Pause Kin from the quick settings tile, the notification or Home: 1 hour, until tomorrow 08:00, or until you resume.")
             OutlinedButton(
                 onClick = { if (!PauseSupport.requestAddTile(context)) tileHint = true },
                 modifier = Modifier.fillMaxWidth(),
             ) { Text("Add the Pause tile") }
             if (tileHint) Text("Swipe down twice, tap the pencil (edit), and drag \"Pause Kin\" in.", style = MaterialTheme.typography.bodySmall)
-            Text("Ring my phone", style = MaterialTheme.typography.titleSmall)
             SettingSwitch(
-                "Let my PC ring this phone",
-                "Your PC can play a loud ring on the alarm volume, even when the phone is silent, to help you find it. It stops by itself after 30 seconds, and the Stop button is always there. It works while Kin is paused.",
-                ringAllow,
+                "Let my PC ring this phone", ringAllow,
+                help = "Your PC can play a loud ring on the alarm volume, even when the phone is silent, to help you find it. It stops by itself after 30 seconds, and the Stop button is always there. It works while Kin is paused.",
             ) { scope.launch { graph.presenceStore.setRingAllow(it) } }
             if (ringAllow) {
                 SettingSwitch(
-                    "Ring at maximum volume",
-                    "On: the alarm volume is raised for the ring and put back afterwards. Off: it uses your alarm volume.",
-                    ringLoud,
+                    "Ring at maximum volume", ringLoud,
+                    help = "The alarm volume is raised for the ring and put back afterwards. Without this, the ring uses your alarm volume.",
                 ) { scope.launch { graph.presenceStore.setRingLoud(it) } }
                 if (!graph.ring.canFullScreen()) {
-                    Text(
-                        "On a locked phone Android shows the ring as a notification with a Stop button. To show the full Stop screen instead, allow full-screen notifications for Kin.",
-                        style = MaterialTheme.typography.bodySmall,
+                    TitleWithHelp(
+                        "Full Stop screen",
+                        "On a locked phone Android shows the ring as a notification with a Stop button. Allow full-screen notifications for Kin to show the full Stop screen instead.",
                     )
                     OutlinedButton(
                         onClick = {
@@ -235,34 +240,26 @@ fun ShotsSettingsCard(graph: AppGraph, context: Context, permissions: Permission
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("Screenshots", style = MaterialTheme.typography.titleMedium)
             SettingSwitch(
-                "Send screenshots to your PC",
-                "Kin watches for new screenshots and sends only ones taken after you turn this on, to your PC only. A screenshot waits 5 seconds with a Cancel button before it leaves the phone. " +
-                    "On the PC it goes to Downloads\\Kin and onto the clipboard (kept out of Windows clipboard history). It can't see apps that save screenshots somewhere else.",
-                ui.screenshots,
+                "Send screenshots to your PC", ui.screenshots,
+                help = "Kin sends only screenshots taken after you turn this on, to your PC only. Each one waits 5 seconds with a Cancel button before it leaves the phone. " +
+                    "On the PC it goes to Downloads\\Kin and onto the clipboard (kept out of Windows clipboard history). Apps that save screenshots somewhere else aren't seen.",
             ) { on ->
                 if (on) pendingScreenshots = true else scope.launch { graph.shots.turnOff(screenshots = false, camera = null) }
             }
             SettingSwitch(
-                "Also send new camera photos",
-                "Photos you take from now on go to Downloads\\Kin on your PC, never onto its clipboard.",
-                ui.camera,
+                "Also send new camera photos", ui.camera,
+                help = "Photos you take from now on go to Downloads\\Kin on your PC, never onto its clipboard.",
             ) { on ->
                 if (on) pendingScreenshots = false else scope.launch { graph.shots.turnOff(screenshots = null, camera = false) }
             }
             if (ui.needsAccess) {
                 Text("Needs access to all photos", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.error)
-                Text(
-                    "Android gave Kin no access or only selected photos, which can't work in the background. Allow \"All photos\" for Kin.",
-                    style = MaterialTheme.typography.bodySmall,
-                )
+                Text("Android gave Kin no access or only selected photos. Allow \"All photos\" for Kin.", style = MaterialTheme.typography.bodySmall)
                 OutlinedButton(onClick = { app.kinrelay.android.setup.SetupActions.openAppDetails(context) }, modifier = Modifier.fillMaxWidth()) { Text("Open Kin's settings") }
             }
             if (ui.needsNotifications) {
                 Text("Needs notifications", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.error)
-                Text(
-                    "Kin can't show the 5-second \"Sending screenshot\" notification with its Cancel button, so it sends nothing. Allow Kin's notifications, including the File transfers channel.",
-                    style = MaterialTheme.typography.bodySmall,
-                )
+                Text("Allow Kin's notifications, including File transfers, so the 5-second Cancel can show.", style = MaterialTheme.typography.bodySmall)
                 OutlinedButton(onClick = { app.kinrelay.android.setup.SetupActions.openNotificationSettings(context) }, modifier = Modifier.fillMaxWidth()) { Text("Open notification settings") }
             }
             if (peer.connected && !peer.peerListsPresence) {

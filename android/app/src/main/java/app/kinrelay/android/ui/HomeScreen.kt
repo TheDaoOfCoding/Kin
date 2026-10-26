@@ -23,7 +23,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -50,6 +49,7 @@ import app.kinrelay.android.data.DeviceEntity
 import app.kinrelay.android.history.HistoryItem
 import app.kinrelay.android.link.LinkState
 import app.kinrelay.android.pairing.PairingUiState
+import app.kinrelay.android.pause.PauseWords
 import app.kinrelay.android.ui.theme.ArtSlot
 import app.kinrelay.android.ui.theme.KinIcons
 import app.kinrelay.android.ui.theme.KinLogo
@@ -160,28 +160,14 @@ fun HomeScreen(
     }
 }
 
-/** The logo and name on the left, and "On your Wi-Fi only" on the right: what the app promises, always in view. */
+/** The logo and name. The right side is left empty on purpose (the "On your Wi-Fi only" chip was cluttering the page). */
 @Composable
 private fun AppBar() {
     val colors = KinTheme.colors
-    val look = KinTheme.style
     Row(Modifier.fillMaxWidth().heightIn(min = 52.dp).padding(top = 6.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
             KinLogo()
             Text("Kin", style = MaterialTheme.typography.titleLarge, color = colors.onSurface)
-        }
-        Row(
-            Modifier
-                .heightIn(min = 32.dp)
-                .shadow(look.cardElevation, look.full, clip = false, ambientColor = look.shadowColor, spotColor = look.shadowColor)
-                .clip(look.full)
-                .background(colors.surface)
-                .border(BorderStroke(1.dp, colors.outlineVariant), look.full)
-                .padding(start = 10.dp, end = 12.dp),
-            horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Icon(KinIcons.Shield, contentDescription = null, tint = colors.primaryText, modifier = Modifier.size(16.dp))
-            Text("On your Wi-Fi only", style = MaterialTheme.typography.labelMedium, color = colors.onSurfaceVariant)
         }
     }
 }
@@ -208,7 +194,7 @@ private fun StatusCard(pcName: String, state: LinkState, pausedText: String?, st
         Column(Modifier.weight(1f)) {
             Text("Paired with", style = MaterialTheme.typography.labelMedium, color = colors.onSurfaceVariant)
             Text(pcName, style = MaterialTheme.typography.headlineSmall, color = colors.onSurface, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 1.dp, bottom = 8.dp))
-            StatePill(face, pausedText?.let { "Paused " + it.replaceFirstChar(Char::lowercase) } ?: UiText.pill(state))
+            StatePill(face, pausedText?.let(PauseWords::pausedLine) ?: UiText.pill(state))
             if (detail != null) Text(detail, style = MaterialTheme.typography.bodySmall, color = colors.onSurfaceVariant, modifier = Modifier.padding(top = 8.dp))
             CompositionLocalProvider(LocalContentColor provides colors.onSurfaceVariant) {
                 Column(Modifier.padding(top = 6.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) { statusLine() }

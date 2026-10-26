@@ -17,6 +17,15 @@ class CatalogAndRedactionTest {
     }
 
     @Test
+    fun theSocialAppsAreMessagingToo() {
+        for (pkg in listOf("com.instagram.android", "com.snapchat.android", "com.twitter.android")) {
+            assertTrue(pkg, pkg in AppCatalog.MESSAGING)
+            assertEquals(pkg, AppClass.MESSAGING, AppCatalog.classify(pkg, "Whatever"))
+            assertFalse(pkg, AppCatalog.isFlagged(pkg, null))
+        }
+    }
+
+    @Test
     fun theFlaggedTableAndTheWordsFlagAnApp() {
         for (pkg in listOf("com.google.android.apps.authenticator2", "com.azure.authenticator", "com.bitwarden.authenticator", "com.agilebits.onepassword", "proton.android.pass", "com.paypal.android.p2pmobile", "com.coinbase.android")) {
             assertEquals(pkg, AppClass.FLAGGED, AppCatalog.classify(pkg, "Whatever"))

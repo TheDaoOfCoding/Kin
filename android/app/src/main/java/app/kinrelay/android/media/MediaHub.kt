@@ -38,6 +38,18 @@ data class MediaUi(
     /** The PC's volume as its source reports it (the slider on Home), and whether its media is playing: the words on Home say "playing", never the title. */
     val pcVolume: MediaVolume? = null,
     val pcPlaying: Boolean = false,
+    /** What the PC plays, for the Home card's row: only while its media is shown on this phone. */
+    val pcNow: PcNowPlaying? = null,
+)
+
+/** The PC's current session as the Home card draws it. [art] is the JPEG or PNG bytes the source sent, or null (the card draws its own picture). */
+class PcNowPlaying(
+    val title: String,
+    val art: ByteArray?,
+    val playing: Boolean,
+    val canPlayPause: Boolean,
+    val canPrev: Boolean,
+    val canNext: Boolean,
 )
 
 /**
@@ -354,7 +366,27 @@ class MediaHub(private val graph: AppGraph) {
             // The PC's volume is the device's, not the session's: the slider is there whenever it is known, with or without a session.
             pcVolume = if (policy.show) viewer.volume else null,
             pcPlaying = policy.show && viewer.current?.state == PlayState.PLAYING,
+            pcNow = if (policy.show) viewer.currentView()?.let(::nowPlaying) else null,
         )
+    }
+
+    private fun nowPlaying(view: PcMediaView): PcNowPlaying {
+        val playing = view.state == PlayState.PLAYING
+        return PcNowPlaying(
+            title = view.titleLine, art = view.art, playing = playing,
+            canPlayPause = MediaMapping.playPauseCommand(playing, view.actions) != null,
+            canPrev = MediaAction.PREV in view.actions,
+            canNext = MediaAction.NEXT in view.actions,
+        )
+    }
+
+    /** The Home card's previous and next: the same `media.cmd` as the notification's buttons. */
+    fun pcTransport(kind: MediaCmdKind) = sendCommand(MediaCmd(kind, sid = viewer.current?.sid))
+
+    /** The Home card's play/pause button: pause while the PC plays, else play. */
+    fun pcPlayPause() {
+        val current = viewer.current ?: return
+        MediaMapping.playPauseCommand(current.state == PlayState.PLAYING, current.actions.toSet())?.let { sendCommand(MediaCmd(it, sid = current.sid)) }
     }
 
     /** The volume slider of the Home card: one `media.cmd volume` with the level, coalesced (trailing 150 ms, last wins). */

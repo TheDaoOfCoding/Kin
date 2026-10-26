@@ -101,7 +101,7 @@ class HistoryViewTest {
     @Test
     fun noUserVisibleStringOfTheNewScreensHasAnEmDash() {
         val dir = java.io.File("src/main/java/app/kinrelay/android/ui")
-        val files = listOf("HomeScreen", "HistoryScreen", "OnboardingScreen", "SettingsScreen", "KinComponents", "HistoryView", "DebugScreen", "UiText")
+        val files = listOf("HomeScreen", "HistoryScreen", "OnboardingScreen", "SettingsScreen", "KinComponents", "HistoryView", "DebugScreen", "UiText", "MediaScreens", "MirrorScreens", "PresenceScreens", "DndScreens")
         for (name in files) {
             // A dash in a comment is fine; one in a string literal reaches the user.
             val strings = java.io.File(dir, "$name.kt").readLines().filterNot { it.trim().startsWith("//") || it.trim().startsWith("*") || it.trim().startsWith("/**") }

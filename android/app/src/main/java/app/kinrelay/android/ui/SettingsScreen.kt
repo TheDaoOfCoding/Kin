@@ -56,13 +56,16 @@ import app.kinrelay.android.ui.theme.lipBehind
 import app.kinrelay.android.ui.theme.tint
 import kotlinx.coroutines.launch
 
-/** A setting with a switch, a title and a line that says what each position does. */
+/**
+ * A setting with a switch and a short title. [help] is the explanation, behind a small "?" next to the title; [note] is a line of live state
+ * under the title, only for something the user must act on or wait for (the switch already shows on and off).
+ */
 @Composable
-internal fun SettingSwitch(title: String, description: String, checked: Boolean, onChecked: (Boolean) -> Unit) {
+internal fun SettingSwitch(title: String, checked: Boolean, help: String? = null, note: String? = null, onChecked: (Boolean) -> Unit) {
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
         Column(modifier = Modifier.weight(1f)) {
-            Text(title, style = MaterialTheme.typography.titleSmall)
-            Text(description, style = MaterialTheme.typography.bodySmall, color = KinTheme.colors.onSurfaceVariant)
+            TitleWithHelp(title, help)
+            if (note != null) Text(note, style = MaterialTheme.typography.bodySmall, color = KinTheme.colors.onSurfaceVariant)
         }
         Switch(checked = checked, onCheckedChange = onChecked, colors = kinSwitchColors())
     }
@@ -107,7 +110,7 @@ fun SettingsScreen(
 ) {
     val scope = rememberCoroutineScope()
     var name by rememberSaveable(deviceName) { mutableStateOf(deviceName) }
-    var saved by remember { mutableStateOf(false) }
+    var justSaved by remember { mutableStateOf(false) }
     var confirmUnpair by remember { mutableStateOf(false) }
     Column(
         modifier = modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp),
@@ -120,20 +123,18 @@ fun SettingsScreen(
 
         KinCard(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Device name", style = MaterialTheme.typography.titleMedium)
-                Text("This is how your PC shows this phone. It is sent each time Kin connects, so a change takes effect at the next connection.", style = MaterialTheme.typography.bodySmall, color = KinTheme.colors.onSurfaceVariant)
-                OutlinedTextField(value = name, onValueChange = { name = it; saved = false }, label = { Text("Name (empty: $systemName)") }, singleLine = true, shape = KinTheme.style.shapes.small, modifier = Modifier.fillMaxWidth())
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    KinButton("Save", { scope.launch { onSaveName(name); saved = true } }, enabled = name.trim() != deviceName)
-                    if (saved) Text("Saved.", style = MaterialTheme.typography.bodyMedium)
-                }
+                TitleWithHelp("Device name", "This is how your PC shows this phone. A change takes effect the next time Kin connects.", style = MaterialTheme.typography.titleMedium)
+                OutlinedTextField(value = name, onValueChange = { name = it; justSaved = false }, label = { Text("Name (empty: $systemName)") }, singleLine = true, shape = KinTheme.style.shapes.small, modifier = Modifier.fillMaxWidth())
+                // Nothing to save, so no button; after a save it stays as a disabled "Saved" until the next edit.
+                val save = nameSaveState(name, deviceName, justSaved)
+                save.label?.let { KinButton(it, { scope.launch { onSaveName(name); justSaved = true } }, enabled = save == NameSaveState.SAVE) }
             }
         }
 
         KinCard(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Connection", style = MaterialTheme.typography.titleMedium)
-                Text("If your PC stops receiving, or Kin disconnects when the screen is off, check the notification, Nearby devices and battery settings again.", style = MaterialTheme.typography.bodySmall, color = KinTheme.colors.onSurfaceVariant)
+                Text("If your PC stops receiving, check these settings again.", style = MaterialTheme.typography.bodySmall, color = KinTheme.colors.onSurfaceVariant)
                 KinButton("Fix connection reliability", onOpenSetup, block = true)
             }
         }
@@ -141,7 +142,7 @@ fun SettingsScreen(
         KinCard(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Notifications", style = MaterialTheme.typography.titleMedium)
-                Text("Kin has a few channels, so you can choose the sound and the importance of each.", style = MaterialTheme.typography.bodySmall, color = KinTheme.colors.onSurfaceVariant)
+                Text("Choose the sound and importance of each kind.", style = MaterialTheme.typography.bodySmall, color = KinTheme.colors.onSurfaceVariant)
                 KinButton("Notification settings", { SetupActions.openNotificationSettings(context) }, style = KinButtonStyle.PLAIN, block = true)
                 KinButton("Connection status", { SetupActions.openChannelSettings(context, NotificationChannels.LINK) }, style = KinButtonStyle.PLAIN, block = true)
                 KinButton("Arrivals: text, files, pings", { SetupActions.openChannelSettings(context, NotificationChannels.ARRIVALS) }, style = KinButtonStyle.PLAIN, block = true)
@@ -162,32 +163,22 @@ fun SettingsScreen(
 
         KinCard(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Links and text from your PC", style = MaterialTheme.typography.titleMedium)
-                Text(
-                    "A link from your PC opens with one tap on its notification: in the app that owns it (YouTube for a YouTube link), or your browser. " +
-                        "Kin never opens a link or copies it by itself; the notification has a Copy link button.",
-                    style = MaterialTheme.typography.bodySmall, color = KinTheme.colors.onSurfaceVariant,
+                TitleWithHelp(
+                    "Links and text from your PC",
+                    "A link from your PC opens with one tap on its notification. Kin never opens or copies one by itself.",
+                    style = MaterialTheme.typography.titleMedium,
                 )
                 SettingSwitch(
                     "Show link previews on the lock screen",
-                    "Off: a locked phone shows only \"Link from your PC\", without the page title or address (when Android is set to hide sensitive notification content on the lock screen, which is the system setting that decides). On: it shows both.",
-                    showLinkPreviewsOnLockScreen, onShowLinkPreviewsOnLockScreen,
+                    showLinkPreviewsOnLockScreen,
+                    help = "Without this, a locked phone shows only \"Link from your PC\", with no page title or address. Android's own lock-screen setting for sensitive notifications can hide them too.",
+                    onChecked = onShowLinkPreviewsOnLockScreen,
                 )
                 SettingSwitch(
                     "Copy received text automatically",
-                    "On: a text you send from the PC is on this phone's clipboard when it arrives. Off: the notification has a Copy button instead.",
-                    copyReceivedTextAutomatically, onCopyReceivedTextAutomatically,
-                )
-            }
-        }
-
-        KinCard(modifier = Modifier.fillMaxWidth()) {
-            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Clipboard", style = MaterialTheme.typography.titleMedium)
-                Text(
-                    "Text you copy on the PC reaches this phone's clipboard by itself. Sending this phone's clipboard to the PC is manual (the quick tile, " +
-                        "or the notification button), because Android doesn't let apps read the clipboard in the background.",
-                    style = MaterialTheme.typography.bodySmall, color = KinTheme.colors.onSurfaceVariant,
+                    copyReceivedTextAutomatically,
+                    help = "Text you send from your PC goes straight to this phone's clipboard. Without this, the notification has a Copy button.",
+                    onChecked = onCopyReceivedTextAutomatically,
                 )
             }
         }
