@@ -250,12 +250,12 @@ fun GroupLabel(text: String, modifier: Modifier = Modifier) {
     Text(text, style = MaterialTheme.typography.labelLarge, color = KinTheme.colors.onSurfaceVariant, modifier = modifier.padding(start = 6.dp, top = 4.dp))
 }
 
-/** The switch of the design: the apricot (or teal) track when on, the knob colour of the skin. */
+/** The switch of the design: the darker apricot (or teal) track when on, so the track clears 3:1 on a white card; the knob colour of the skin. */
 @Composable
 fun kinSwitchColors(): SwitchColors {
     val c = KinTheme.colors
     return SwitchDefaults.colors(
-        checkedThumbColor = c.switchKnob, checkedTrackColor = c.primary, checkedBorderColor = Color.Transparent,
+        checkedThumbColor = c.switchKnob, checkedTrackColor = c.primaryEdge, checkedBorderColor = Color.Transparent,
         uncheckedThumbColor = c.switchKnob, uncheckedTrackColor = c.surfaceContainerHigh, uncheckedBorderColor = c.outline,
     )
 }

@@ -502,6 +502,8 @@ class TextFlowTest {
         // The user selected the text and chose "Send to PC": that is an explicit act, not a possible loop.
         assertTrue(h.sendText("same text", SendSource.PROCESS_TEXT) is SendOutcome.Delivered)
         assertTrue(h.sendText("same text", SendSource.SHARE) is SendOutcome.Delivered)
+        // Text typed in the app's Send sheet is explicit too.
+        assertTrue(h.sendText("same text", SendSource.TYPED) is SendOutcome.Delivered)
     }
 
     @Test
