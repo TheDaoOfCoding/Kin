@@ -35,7 +35,7 @@ data class MediaUi(
     val showing: Boolean = false,
     val notificationsAllowed: Boolean = true,
     val pcName: String? = null,
-    /** The PC's volume as its source reports it (the slider on Home), and whether its media is playing: the words on Home say "playing", never the title. */
+    /** The PC's volume as its source reports it (the slider on Home), and whether its media is playing: and the Home card shows the title and art while the app is open (Sam, 2026-10-26). */
     val pcVolume: MediaVolume? = null,
     val pcPlaying: Boolean = false,
     /** What the PC plays, for the Home card's row: only while its media is shown on this phone. */
@@ -383,10 +383,13 @@ class MediaHub(private val graph: AppGraph) {
     /** The Home card's previous and next: the same `media.cmd` as the notification's buttons. */
     fun pcTransport(kind: MediaCmdKind) = sendCommand(MediaCmd(kind, sid = viewer.current?.sid))
 
-    /** The Home card's play/pause button: pause while the PC plays, else play. */
-    fun pcPlayPause() {
+    /**
+     * The Home card's play/pause button: pause when the button shows Pause, else play. [showsPlaying] is what the button draws (the view's
+     * state, which can read "paused" a few seconds past a track's end while the raw state still says playing), so a tap does what it shows.
+     */
+    fun pcPlayPause(showsPlaying: Boolean) {
         val current = viewer.current ?: return
-        MediaMapping.playPauseCommand(current.state == PlayState.PLAYING, current.actions.toSet())?.let { sendCommand(MediaCmd(it, sid = current.sid)) }
+        MediaMapping.playPauseCommand(showsPlaying, current.actions.toSet())?.let { sendCommand(MediaCmd(it, sid = current.sid)) }
     }
 
     /** The volume slider of the Home card: one `media.cmd volume` with the level, coalesced (trailing 150 ms, last wins). */

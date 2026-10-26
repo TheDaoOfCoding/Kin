@@ -129,7 +129,7 @@ fun MediaHomeCard(graph: AppGraph, permissions: PermissionSnapshot, modifier: Mo
                         Text("on ${ui.pcName ?: "your PC"}", style = MaterialTheme.typography.bodySmall, color = KinTheme.colors.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                     TransportButton(KinIcons.Prev, "Previous", now.canPrev) { graph.media.pcTransport(MediaCmdKind.PREV) }
-                    TransportButton(if (now.playing) KinIcons.Pause else KinIcons.Play, if (now.playing) "Pause" else "Play", now.canPlayPause, main = true) { graph.media.pcPlayPause() }
+                    TransportButton(if (now.playing) KinIcons.Pause else KinIcons.Play, if (now.playing) "Pause" else "Play", now.canPlayPause, main = true) { graph.media.pcPlayPause(now.playing) }
                     TransportButton(KinIcons.Next, "Next", now.canNext) { graph.media.pcTransport(MediaCmdKind.NEXT) }
                 }
             } else {
