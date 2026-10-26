@@ -86,7 +86,10 @@ class SendPlanTest {
         assertEquals("Text, links, files or photos", SendPlan.buttonSubtitle(connected))
         assertEquals("It will wait until your PC is back", SendPlan.buttonSubtitle(LinkState.Connecting()))
         assertEquals("It will wait until your PC is back", SendPlan.buttonSubtitle(LinkState.NotOnWifi))
+        assertEquals("It will wait, see the card above", SendPlan.buttonSubtitle(LinkState.PairAgain))
+        assertEquals("Not connected, check the PC card on Home", SendPlan.sheetStatus(LinkState.UpdateApp))
         assertEquals("Connected, it arrives in a moment", SendPlan.sheetStatus(connected))
-        assertEquals("Not connected yet, it will wait", SendPlan.sheetStatus(LinkState.Stopped))
+        assertEquals("Not connected yet, it will wait", SendPlan.sheetStatus(LinkState.Connecting()))
+        assertEquals("Not connected, check the PC card on Home", SendPlan.sheetStatus(LinkState.Stopped))
     }
 }

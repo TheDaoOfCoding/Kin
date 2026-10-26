@@ -10,6 +10,8 @@ export type Appearance = { skin: Skin; theme: Theme };
 
 const dark = window.matchMedia("(prefers-color-scheme: dark)");
 let current: Appearance = { skin: "warm", theme: "system" };
+// The last look any window showed: a new window paints it at once instead of flashing the default until `appearance_view` answers.
+const CACHE_KEY = "kin.appearance";
 
 /** The mode a theme shows now: Light and Dark are themselves, System is what Windows is set to. */
 export function effectiveMode(theme: Theme): "light" | "dark" {
@@ -23,11 +25,22 @@ export function applyAppearance(next: Partial<Appearance> | null | undefined): v
   const root = document.documentElement;
   root.dataset.skin = skin;
   root.dataset.mode = effectiveMode(theme);
+  try {
+    localStorage.setItem(CACHE_KEY, JSON.stringify(current));
+  } catch {
+    // No storage: the window still gets the saved look from the backend, after a moment of the default.
+  }
 }
 
-/** Shows the default look at once, then the saved one as soon as the backend answers. */
+/** Shows the last known look at once (or the default), then the saved one as soon as the backend answers. */
 export function startAppearance(): void {
-  applyAppearance(current);
+  let cached: Partial<Appearance> | null = null;
+  try {
+    cached = JSON.parse(localStorage.getItem(CACHE_KEY) ?? "null");
+  } catch {
+    cached = null;
+  }
+  applyAppearance(cached ?? current);
   dark.addEventListener("change", () => applyAppearance(current));
   void invoke<Appearance>("appearance_view").then(applyAppearance, () => {});
   void listen<Appearance>("appearance-changed", (event) => applyAppearance(event.payload));

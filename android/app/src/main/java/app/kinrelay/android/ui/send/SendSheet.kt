@@ -16,7 +16,11 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -46,8 +50,12 @@ fun SendSheet(
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val scope = rememberCoroutineScope()
+    // One tile per sheet: a second tap during the hide animation would paste twice or open a second picker.
+    var acting by remember { mutableStateOf(false) }
     // Slide the sheet away first, then do what the tile says (a picker or the text box opens over the app, not over a half-closed sheet).
     fun choose(action: () -> Unit) {
+        if (acting) return
+        acting = true
         scope.launch { sheetState.hide() }.invokeOnCompletion {
             onDismiss()
             action()

@@ -1,9 +1,7 @@
 package app.kinrelay.android.ui.send
 
-import android.content.ClipboardManager
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -17,7 +15,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -27,11 +24,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
@@ -47,7 +42,8 @@ fun TextComposeSheet(pcName: String, onDismiss: () -> Unit, onSend: (String) -> 
     val scope = rememberCoroutineScope()
     var text by rememberSaveable { mutableStateOf("") }
     val focus = remember { FocusRequester() }
-    val context = LocalContext.current
+    // One send per sheet: a second tap during the hide animation would queue the same text again.
+    var sending by remember { mutableStateOf(false) }
     // The keyboard comes up with the sheet: the user opened it to type.
     LaunchedEffect(Unit) { focus.requestFocus() }
     fun close(then: () -> Unit = {}) {
@@ -72,23 +68,21 @@ fun TextComposeSheet(pcName: String, onDismiss: () -> Unit, onSend: (String) -> 
                 shape = MaterialTheme.shapes.large,
                 keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
             )
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    "Just one link? It is sent as a link.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
-                )
-                // Read only on this tap (never when the sheet opens), so Android shows its "pasted from" notice only when the user asked.
-                TextButton(onClick = {
-                    val clip = context.getSystemService(ClipboardManager::class.java)?.primaryClip
-                    val pasted = clip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(context)?.toString()
-                    if (!pasted.isNullOrEmpty()) text = if (text.isEmpty()) pasted else text + pasted
-                }) { Text("Paste") }
-            }
+            Text(
+                "Just one link? It is sent as a link.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 4.dp),
+            )
             Button(
-                onClick = { val toSend = text; close { onSend(toSend) } },
-                enabled = SendPlan.typed(text) !is SendPlan.Typed.Empty,
+                onClick = {
+                    if (!sending) {
+                        sending = true
+                        val toSend = text
+                        close { onSend(toSend) }
+                    }
+                },
+                enabled = !sending && SendPlan.typed(text) !is SendPlan.Typed.Empty,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Icon(SendIcons.Send, contentDescription = null, modifier = Modifier.size(18.dp))

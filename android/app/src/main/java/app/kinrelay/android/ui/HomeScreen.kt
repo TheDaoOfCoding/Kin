@@ -59,6 +59,15 @@ import app.kinrelay.android.ui.theme.PairArt
 import kotlinx.coroutines.launch
 
 /** Which face the status card shows: asleep while the user's Pause is on, happy while connected, looking around otherwise. */
+/**
+ * The Pause words the PC card shows, or null when the link has a problem the user must see: Pause leaves the link alone, so a PC that
+ * forgot the phone, a version mismatch or a lost Wi-Fi still happen while paused, and they win over the sleeping face.
+ */
+fun pauseOnCard(state: LinkState, pausedText: String?): String? = when (state) {
+    LinkState.PairAgain, LinkState.UpdateApp, LinkState.Replaced, LinkState.NotOnWifi, LinkState.PermissionNeeded -> null
+    else -> pausedText
+}
+
 fun linkLook(state: LinkState, paused: Boolean): LinkLook = when {
     paused -> LinkLook.PAUSED
     state is LinkState.Connected -> LinkLook.CONNECTED
@@ -121,7 +130,7 @@ fun HomeScreen(
         }
         if (identityProblem != null) IdentityProblemCard(identityProblem)
         if (!localNetworkAllowed) LocalNetworkCard(onAllowLocalNetwork)
-        StatusCard(pc.name, state, pausedText, statusLine, onReconnect)
+        StatusCard(pc.name, state, pauseOnCard(state, pausedText), statusLine, onReconnect)
         if (state is LinkState.PairAgain) KinButton("Remove this PC", { confirmRemove = true }, style = KinButtonStyle.PLAIN, icon = KinIcons.Unlink, block = true)
         sendButton()
         mirrorCard()

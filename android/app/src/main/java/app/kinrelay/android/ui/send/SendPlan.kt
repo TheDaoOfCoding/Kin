@@ -42,10 +42,19 @@ object SendPlan {
     fun connected(state: LinkState): Boolean = state is LinkState.Connected
 
     /** The line under "Send" on the Home button. */
-    fun buttonSubtitle(state: LinkState): String =
-        if (connected(state)) "Text, links, files or photos" else "It will wait until your PC is back"
+    fun buttonSubtitle(state: LinkState): String = when {
+        connected(state) -> "Text, links, files or photos"
+        stuck(state) -> "It will wait, see the card above"
+        else -> "It will wait until your PC is back"
+    }
 
     /** The line under the sheet's title. */
-    fun sheetStatus(state: LinkState): String =
-        if (connected(state)) "Connected, it arrives in a moment" else "Not connected yet, it will wait"
+    fun sheetStatus(state: LinkState): String = when {
+        connected(state) -> "Connected, it arrives in a moment"
+        stuck(state) -> "Not connected, check the PC card on Home"
+        else -> "Not connected yet, it will wait"
+    }
+
+    /** States that don't clear by themselves (pair again, update, Kin stopped): "until your PC is back" would promise too much. */
+    private fun stuck(state: LinkState): Boolean = state is LinkState.PairAgain || state is LinkState.UpdateApp || state is LinkState.Stopped
 }
