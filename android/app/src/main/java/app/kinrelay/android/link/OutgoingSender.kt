@@ -18,6 +18,7 @@ enum class SendSource(val stored: String) {
     SHARE_LINK(TextSource.SHARE_LINK),
     PROCESS_TEXT(TextSource.PROCESS_TEXT),
     CLIPBOARD(TextSource.CLIPBOARD),
+    TYPED(TextSource.TYPED),
     DEBUG(TextSource.DEBUG),
 }
 

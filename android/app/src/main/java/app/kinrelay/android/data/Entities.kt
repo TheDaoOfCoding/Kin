@@ -126,6 +126,9 @@ object TextSource {
     const val CLIPBOARD = "clipboard"
     const val DEBUG = "debug"
 
+    /** Typed (or pasted into the box) in the app's own Send sheet: a text or, when it is exactly one web link, a `link`; the row's kind says which. */
+    const val TYPED = "typed"
+
     /** A link shared to Kin (the share sheet): sent as a `link`. */
     const val SHARE_LINK = "share_link"
 

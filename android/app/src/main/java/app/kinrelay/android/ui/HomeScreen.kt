@@ -60,6 +60,8 @@ fun HomeScreen(
     pauseCard: @Composable () -> Unit = {},
     /** "Needs access to all photos" (2B.4): only while auto-send is on and the access is missing. */
     shotsCard: @Composable () -> Unit = {},
+    /** The in-app Send button, right under the PC card. */
+    sendButton: @Composable () -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
     var pinging by remember { mutableStateOf(false) }
@@ -91,6 +93,7 @@ fun HomeScreen(
                 Text("This phone: ${phoneShortId?.let(DeviceIds::display) ?: "…"}", style = MaterialTheme.typography.bodySmall)
             }
         }
+        sendButton()
         pauseCard()
         shotsCard()
         mirrorCard()

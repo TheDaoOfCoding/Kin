@@ -247,7 +247,7 @@ All debug-only, protected by the `DUMP` permission. Nothing here prints a text: 
 
 ```
 adb shell am broadcast -a app.kinrelay.android.debug.TEXTS  -n app.kinrelay.android/.debug.DebugCommandReceiver
-#   CMD TEXT <id> <up|down> <queued|active|done|failed|canceled> attempts=N src=<share|process_text|clipboard|debug|pc> sensitive=<bool> bytes=N err=<code> bodyKept=<bool>
+#   CMD TEXT <id> <up|down> <queued|active|done|failed|canceled> attempts=N src=<share|share_link|process_text|clipboard|typed|debug|pc> sensitive=<bool> bytes=N err=<code> bodyKept=<bool>
 adb shell am broadcast -a app.kinrelay.android.debug.CANCEL_TEXT -n app.kinrelay.android/.debug.DebugCommandReceiver --es id <message id>   # only a queued text is canceled
 adb shell am broadcast -a app.kinrelay.android.debug.RETRY_TEXT  -n app.kinrelay.android/.debug.DebugCommandReceiver --es id <message id>   # a failed text goes out again as a new message
 adb shell am broadcast -a app.kinrelay.android.debug.FLUSH       -n app.kinrelay.android/.debug.DebugCommandReceiver                         # flush the queue now (what the hello does)

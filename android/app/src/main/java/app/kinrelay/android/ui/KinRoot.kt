@@ -260,6 +260,7 @@ fun KinRoot(
                     statusLine = { PcStatusLine(graph, context) },
                     pauseCard = { PauseCard(graph, context) },
                     shotsCard = { ShotsHomeCard(graph, context, permissions) },
+                    sendButton = { app.kinrelay.android.ui.send.SendButton(graph, context, pc.name, linkState) },
                 )
             }
         }
