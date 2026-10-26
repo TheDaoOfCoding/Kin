@@ -5,7 +5,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { effectiveMode, type Skin, type Theme } from "./appearance";
-import { button, el, flash, sensitiveWhilePausedText } from "./dom";
+import { button, el, flash, helpButton, sensitiveWhilePausedText } from "./dom";
 import { icon } from "./icons";
 import { mountShell } from "./shell";
 
@@ -108,8 +108,20 @@ export function accelerator(e: KeyboardEvent): string | null {
   return [...mods, key].join("+");
 }
 
+/** A card with a heading. `help` puts a "?" next to the heading for what the whole card does. */
+function sectionWithHelp(heading: string, help: string | null, ...children: (Node | string)[]): HTMLElement {
+  return el("section", {}, el("h3", { className: "slabel" }, heading, ...(help ? [helpButton(help, heading)] : [])), el("div", { className: "card rows" }, ...children));
+}
+
 function section(heading: string, ...children: (Node | string)[]): HTMLElement {
-  return el("section", {}, el("h3", { className: "slabel" }, heading), el("div", { className: "card rows" }, ...children));
+  return sectionWithHelp(heading, null, ...children);
+}
+
+let controlCount = 0;
+
+/** The title of a setting, with a "?" for its explanation when it has one. The title is the label of the control `controlId`, so a click on the words works the control. */
+function titled(title: string, help: string | null, controlId: string): HTMLElement {
+  return el("span", { className: "tl" }, el("label", { htmlFor: controlId }, title), ...(help ? [helpButton(help, title)] : []));
 }
 
 /** "62% charging", "14%": the battery as a person reads it. */
@@ -139,6 +151,8 @@ export function startSettingsWindow(root: HTMLElement): void {
   shell.body.append(body, note);
   // The device whose "Unlink" confirmation is open. The tray's "Unlink phone…" opens the window with `#unlink=<deviceId>`, or tells an open one with an event.
   let unlinkOpen: string | null = unlinkFromHash(window.location.hash);
+  // The device name was just saved: its button reads "Saved" until the name is edited again.
+  let nameSaved = false;
 
   const call = async (command: string, args: Record<string, unknown> = {}): Promise<boolean> => {
     try {
@@ -150,10 +164,12 @@ export function startSettingsWindow(root: HTMLElement): void {
     }
   };
 
-  const toggle = (label: string, hint: string, value: boolean, onChange: (on: boolean) => void, disabled = false): HTMLElement => {
-    const box = el("input", { type: "checkbox", checked: value, disabled });
+  /** A switch with a short title; `help` is what the "?" next to the title says. */
+  const toggle = (label: string, help: string | null, value: boolean, onChange: (on: boolean) => void, disabled = false): HTMLElement => {
+    const id = `switch-${++controlCount}`;
+    const box = el("input", { type: "checkbox", id, checked: value, disabled });
     box.addEventListener("change", () => onChange(box.checked));
-    return el("label", { className: "toggle" }, box, el("span", {}, el("strong", {}, label), el("small", {}, hint)));
+    return el("div", { className: "toggle" }, box, titled(label, help, id));
   };
 
   const mirrorOption = (name: string) => (on: boolean) => void call("set_mirror_option", { name, on }).then(() => refresh());
@@ -163,13 +179,13 @@ export function startSettingsWindow(root: HTMLElement): void {
     const out: HTMLElement[] = [];
     if (m.unavailable) out.push(el("p", { className: "hint bad" }, `Not available in this copy of Kin: ${m.unavailable}.`));
     for (const p of m.phones) out.push(el("p", { className: "hint" }, `${p.name}: ${p.status}`));
-    if (m.enabled && m.running && !m.activator && !m.textOnly) out.push(el("p", { className: "hint bad" }, "Replying and buttons need a part of Windows that did not start here, so notifications show text only."));
+    if (m.enabled && m.running && !m.activator && !m.textOnly) out.push(el("p", { className: "hint bad" }, "Reply and buttons aren't available here, so notifications show text only."));
     if (!m.enabled) return out;
     out.push(
-      toggle("Closing a phone notification here also dismisses it on the phone", "Only pressing the X of a notification does this, never a notification that timed out or was replaced.", m.dismissToPhone, mirrorOption("dismissToPhone")),
-      toggle("Hide notification content", "Every phone notification says \"Private notification\". Notifications of banking, authenticator and password apps always do.", m.hideContent, mirrorOption("hideContent")),
-      toggle("Play a sound for phone notifications", "Off: they appear quietly, because your phone has made its own sound.", m.sound, mirrorOption("sound")),
-      toggle("Text only (no reply box, no buttons)", "For a Windows where the reply box and the buttons do not work.", m.textOnly, mirrorOption("textOnly")),
+      toggle("Dismiss on the phone too", "Closing a notification here with its X also dismisses it on the phone. A notification that timed out or was replaced never does.", m.dismissToPhone, mirrorOption("dismissToPhone")),
+      toggle("Hide notification content", "Every phone notification just says 'Private notification'. Banking, authenticator and password apps are always hidden.", m.hideContent, mirrorOption("hideContent")),
+      toggle("Play a sound", "Switch it off if your phone already makes its own sound. Notifications then appear quietly.", m.sound, mirrorOption("sound")),
+      toggle("Text only", "No reply box and no buttons. For a Windows where they don't work.", m.textOnly, mirrorOption("textOnly")),
     );
     return out;
   };
@@ -177,9 +193,9 @@ export function startSettingsWindow(root: HTMLElement): void {
   /** What belongs under the two media switches: where it can't run, and what each phone says. */
   const mediaDetails = (m: Media): HTMLElement[] => {
     const out: HTMLElement[] = [];
-    if (m.mode === "test") out.push(el("p", { className: "hint" }, "This copy of Kin is a test run: it reads and controls no media of yours and never changes the PC's volume, and it never shows Playing."));
+    if (m.mode === "test") out.push(el("p", { className: "hint" }, "Test run: this copy reads no media and never changes the PC's volume."));
     if (m.share && m.readerUnavailable) out.push(el("p", { className: "hint bad" }, `The PC's media can't be read here: ${m.readerUnavailable}.`));
-    if (m.show && m.flyoutUnavailable) out.push(el("p", { className: "hint bad" }, `${m.flyoutUnavailable}. The tray menu and the panel of the window you open with a click on the tray icon still work.`));
+    if (m.show && m.flyoutUnavailable) out.push(el("p", { className: "hint bad" }, `${m.flyoutUnavailable}. The tray menu and tray panel still work.`));
     for (const p of m.phones) out.push(el("p", { className: "hint" }, `${p.name}: ${p.status}`));
     return out;
   };
@@ -239,22 +255,36 @@ export function startSettingsWindow(root: HTMLElement): void {
   const draw = (v: View) => {
     shell.setPc(v.deviceName, v.version);
     // device name
-    const name = el("input", { type: "text", value: v.customDeviceName ?? "", placeholder: v.defaultDeviceName, maxLength: 64 });
+    const name = el("input", { type: "text", id: "device-name", value: v.customDeviceName ?? "", placeholder: v.defaultDeviceName, maxLength: 64 });
+    // "Save" shows when the name differs from the saved one; after a save it stays as a disabled "Saved" until the next edit.
+    let savedName = v.customDeviceName ?? "";
+    const saveButton = button("Save", () => void saveName(), "small");
+    const showSave = () => {
+      const changed = name.value.trim() !== savedName;
+      saveButton.hidden = !changed && !nameSaved;
+      saveButton.disabled = !changed;
+      saveButton.textContent = changed ? "Save" : "Saved";
+    };
     const saveName = async () => {
-      if (name.value.trim() === (v.customDeviceName ?? "")) return;
-      const ok = await call("set_device_name", { name: name.value });
-      if (ok) flash(note, "Name saved. The phone is told now.");
+      if (name.value.trim() === savedName) return;
+      nameSaved = await call("set_device_name", { name: name.value });
+      if (nameSaved) savedName = name.value.trim();
+      showSave();
       void refresh();
     };
-    name.addEventListener("change", () => void saveName());
+    name.addEventListener("input", () => {
+      nameSaved = false;
+      showSave();
+    });
     name.addEventListener("keydown", (e) => {
       if (e.key === "Enter") void saveName();
     });
+    showSave();
 
     // hotkey
     const key = el("input", { type: "text", readOnly: true, value: v.hotkey.accelerator || "(off)", className: "key" });
     let pending: string | null = null;
-    const hotkeyMsg = el("p", { className: `hint ${v.hotkey.error ? "bad" : ""}` }, v.hotkey.error ?? (v.hotkey.registered ? "Registered. Click the box and press a new combination." : v.hotkey.accelerator ? "Not registered." : "Turned off."));
+    const hotkeyMsg = el("p", { className: `hint ${v.hotkey.error ? "bad" : ""}` }, v.hotkey.error ?? (v.hotkey.registered ? "Click the box and press a new combination." : v.hotkey.accelerator ? "Not registered." : "Turned off."));
     key.addEventListener("keydown", (e) => {
       if (["Control", "Shift", "Alt", "Meta"].includes(e.key)) return;
       e.preventDefault();
@@ -318,7 +348,7 @@ export function startSettingsWindow(root: HTMLElement): void {
           const lost = el(
             "p",
             { className: "hint" },
-            "Lost your phone? Unlink it here: it stops working at once, even if it is offline. If it is connected you can ring it first. ",
+            "Lost your phone? Ring it, or unlink it to cut it off at once. ",
             here ? ringButton() : "",
           );
           return el("div", { className: "device" }, el("span", {}, `${d.name} `, el("small", {}, d.connected ? "connected" : "offline"), ...details), unlinkOpen === d.deviceId ? confirm : unlink, lost);
@@ -326,21 +356,19 @@ export function startSettingsWindow(root: HTMLElement): void {
       : [el("p", { className: "hint" }, "No phone is paired.")];
 
     const choice = (label: string, which: string) => button(label, () => void call("set_pause", { choice: which }).then(() => refresh()), "small");
-    const pauseSection = section(
+    const pauseSection = sectionWithHelp(
       "Pause",
-      el("p", { className: "hint" }, "While paused Kin sends and shows nothing by itself: no automatic clipboard, phone notifications, media or screenshots. Things you send by hand still arrive, quietly, in the history. Ringing your phone still works."),
+      "While paused, Kin sends and shows nothing on its own: no clipboard sync, phone notifications, media or screenshots. Things you send by hand still arrive, quietly, in History. Ringing your phone still works.",
       p.pause.on
         ? el("p", {}, el("strong", {}, `Paused ${p.pause.text ?? ""}. `), button("Resume Kin", () => void call("set_pause", { choice: "resume" }).then(() => refresh()), "small"), p.pause.quietArrivals ? el("small", { className: "hint" }, ` ${p.pause.quietArrivals} received while paused`) : "", p.pause.quietSensitive ? el("small", { className: "hint" }, ` ${sensitiveWhilePausedText(p.pause.quietSensitive)}`) : "")
         : el("div", { className: "row left" }, choice("Pause for 1 hour", "1h"), choice("Until tomorrow", "tomorrow"), choice("Until I resume", "resumed")),
       ...(v.devices.length && !p.phone.knowsPause && p.phone.connected ? [el("p", { className: "hint bad" }, `${p.phone.name ?? "The phone"} doesn't know about pausing: update Kin there.`)] : []),
     );
-    const shareBox = el("input", { type: "checkbox", checked: p.shareBattery && p.hasBattery, disabled: !p.hasBattery });
-    shareBox.addEventListener("change", () => void call("set_presence_option", { name: "shareBattery", on: shareBox.checked }));
     const presenceSection = section(
       "Phone battery",
-      toggle("Show my phone's battery here", "In the tray icon's tooltip and the panel. When the phone is offline the last level it told is shown with the time.", p.showPhone, (on) => void call("set_presence_option", { name: "showPhone", on })),
-      toggle("Warn me when the phone's battery is low", "One notice when it drops to 15 % or less and is not charging.", p.lowBatteryNudge, (on) => void call("set_presence_option", { name: "lowBatteryNudge", on })),
-      el("label", { className: "toggle" }, shareBox, el("span", {}, el("strong", {}, "Share this PC's battery with the phone"), el("small", {}, p.hasBattery ? "The phone's notification and home screen show it." : "No battery: this PC is not a laptop."))),
+      toggle("Show my phone's battery here", "Shown in the tray icon's tooltip and the panel. When the phone is offline, the last level it reported is shown with the time.", p.showPhone, (on) => void call("set_presence_option", { name: "showPhone", on })),
+      toggle("Warn me when it's low", "One notice when the phone's battery drops to 15% or less and it isn't charging.", p.lowBatteryNudge, (on) => void call("set_presence_option", { name: "lowBatteryNudge", on })),
+      toggle("Share this PC's battery", p.hasBattery ? "The phone's notification and home screen show this PC's battery." : "This PC has no battery, so there is nothing to share.", p.shareBattery && p.hasBattery, (on) => void call("set_presence_option", { name: "shareBattery", on }), !p.hasBattery),
     );
 
     const f = p.focus;
@@ -353,11 +381,11 @@ export function startSettingsWindow(root: HTMLElement): void {
     if (p.phone.dnd) focusNotes.push(el("p", { className: "hint" }, `Phone: ${p.phone.dnd}.`));
     const focusSection = section(
       "Focus and Do Not Disturb",
-      toggle("Silence my phone while this PC is in Focus", "Kin reads whether Windows Focus or Do Not Disturb is on. It does not change them. Your phone then turns on its own Do Not Disturb if you allowed that in Kin there, and turns it off again when your PC leaves Focus. Priority only by default.", f.share, (on) => void call("set_focus_option", { name: "focusShare", on }), phoneLacksPresence && !f.share),
-      toggle("Also when I'm presenting or playing full screen", "A full-screen program or a presentation counts as Focus. Off by default: a game is not always \"don't disturb me\" for the phone.", f.alsoPresenting, (on) => void call("set_focus_option", { name: "focusAlsoPresenting", on })),
-      toggle("Hold Kin's own notices while my phone is in Do Not Disturb", "The low-battery notice and similar notices from Kin wait. Phone notifications shown here and the answers to what you do are never held.", f.holdToasts, (on) => void call("set_focus_option", { name: "holdToasts", on })),
+      toggle("Silence my phone during Focus", "Kin reads whether Windows Focus or Do Not Disturb is on, and never changes them. Your phone then turns on its own Do Not Disturb (if you allowed that in Kin there) and turns it off when your PC leaves Focus. By default only priority notifications come through.", f.share, (on) => void call("set_focus_option", { name: "focusShare", on }), phoneLacksPresence && !f.share),
+      toggle("Count full screen as Focus", "A full-screen program or a presentation counts as Focus. This is off by default, because a game isn't always a reason to silence your phone.", f.alsoPresenting, (on) => void call("set_focus_option", { name: "focusAlsoPresenting", on })),
+      toggle("Hold Kin's own notices during Do Not Disturb", "While your phone is in Do Not Disturb, Kin's own notices (like the low-battery one) wait. Phone notifications shown here and answers to what you do are never held.", f.holdToasts, (on) => void call("set_focus_option", { name: "holdToasts", on })),
       ...focusNotes,
-      el("p", { className: "hint" }, "Tell me when it's done: from a script run Kin.exe --notify \"Build finished\" (add --title, --ttl 2h or --device). Your phone shows it as a notification from this PC."),
+      el("p", { className: "hint" }, "From a script: Kin.exe --notify 'Build finished' (also --title, --ttl 2h, --device). Your phone shows it as a notification."),
     );
 
     const folder = el("code", { className: "path" }, v.receivedFolder);
@@ -365,25 +393,25 @@ export function startSettingsWindow(root: HTMLElement): void {
 
     body.replaceChildren(
       appearanceSection(v),
-      section("This PC", el("label", { className: "field" }, "Device name", name), el("p", { className: "hint" }, `Shown on your phone, and sent when it connects. Empty means ${v.defaultDeviceName}.`)),
+      section("This PC", el("div", { className: "field" }, titled("Device name", `This is the name your phone shows for this PC. Leave it empty to use ${v.defaultDeviceName}.`, "device-name"), el("div", { className: "namerow" }, name, saveButton))),
       section(
         "Clipboard and photos",
-        toggle("Send the clipboard to the phone automatically", "Text you copy goes to the phone. Passwords from a password manager never do.", v.autoClipboardSync, (on) => void call("set_auto_clipboard_sync", { on })),
-        toggle("Put photos from the phone on the clipboard", "A single image also goes to the clipboard, so Ctrl+V pastes it.", v.imagesToClipboard, (on) => void call("set_images_to_clipboard", { on })),
+        toggle("Send my clipboard to the phone", "Text you copy goes to the phone. Passwords from a password manager are never sent.", v.autoClipboardSync, (on) => void call("set_auto_clipboard_sync", { on })),
+        toggle("Put phone photos on the clipboard", "A single photo from your phone is also copied, so Ctrl+V pastes it.", v.imagesToClipboard, (on) => void call("set_images_to_clipboard", { on })),
       ),
       section(
         "Links",
-        toggle("Open links from the phone automatically", "A web page you share from the phone opens in your default browser. Off: a notice with Open and Copy buttons. In a fullscreen game or a presentation a link is never opened by itself.", v.openLinksAutomatically, (on) => void call("set_open_links_automatically", { on })),
+        toggle("Open phone links automatically", "A page you share from your phone opens in your default browser. Otherwise you get a notice with Open and Copy buttons. During a full-screen game or a presentation a link never opens by itself.", v.openLinksAutomatically, (on) => void call("set_open_links_automatically", { on })),
       ),
       section(
         "Phone notifications",
-        toggle("Show phone notifications on this PC", "Notifications of the apps you chose in Kin on your phone appear here as Windows notifications, with the reply box and buttons the app offers. The text stays in Windows' Action Center until it expires or you clear it. Needs Kin 0.2.0 on your phone.", v.mirror.enabled, (on) => void invoke("set_mirror_notifications", { on }).then(() => refresh(), (e) => flash(note, String(e), true))),
+        toggle("Show phone notifications here", "Notifications from the apps you chose in Kin on your phone appear as Windows notifications, with the reply box and buttons the app offers. They stay in the Action Center until they expire or you clear them. Needs Kin 0.2.0 on your phone.", v.mirror.enabled, (on) => void invoke("set_mirror_notifications", { on }).then(() => refresh(), (e) => flash(note, String(e), true))),
         ...mirrorDetails(v.mirror),
       ),
       section(
         "Media",
-        toggle("Show the phone's media on this PC", "What plays on your phone appears in the Windows media flyout (volume keys menu) with its buttons, and in the panel of the tray icon. The title is only shown there. Needs Kin 0.2.0 on your phone, with sharing turned on.", v.media.show, (on) => void invoke("set_media_option", { name: "show", on }).then(() => refresh(), (e) => flash(note, String(e), true))),
-        toggle("Share this PC's media with the phone", "What plays on this PC appears in your phone's media controls, and the phone's buttons can pause, skip and change the PC's volume. Nothing is stored.", v.media.share, (on) => void invoke("set_media_option", { name: "share", on }).then(() => refresh(), (e) => flash(note, String(e), true))),
+        toggle("Show the phone's media here", "What plays on your phone appears in the Windows media flyout (the volume keys menu) with its buttons, and in the tray panel. Only the title is shown. Needs Kin 0.2.0 on your phone, with sharing on.", v.media.show, (on) => void invoke("set_media_option", { name: "show", on }).then(() => refresh(), (e) => flash(note, String(e), true))),
+        toggle("Share this PC's media", "What plays on this PC shows in your phone's media controls, and its buttons can pause, skip and change the PC's volume. Nothing is stored.", v.media.share, (on) => void invoke("set_media_option", { name: "share", on }).then(() => refresh(), (e) => flash(note, String(e), true))),
         ...mediaDetails(v.media),
       ),
       section(
@@ -393,7 +421,7 @@ export function startSettingsWindow(root: HTMLElement): void {
       ),
       section(
         "Hotkey",
-        el("p", { className: "hint" }, "Sends the text on the clipboard to the phone."),
+        el("p", { className: "hint" }, "Sends the clipboard text to your phone."),
         key,
         hotkeyMsg,
         el("div", { className: "row left" }, button("Set", () => void setHotkey(pending ?? v.hotkey.accelerator), "small"), button("Turn off", () => void setHotkey(""), "secondary small"), button(`Default (${v.defaultHotkey})`, () => void setHotkey(v.defaultHotkey), "secondary small")),

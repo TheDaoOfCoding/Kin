@@ -22,6 +22,56 @@ export function actionButton(iconName: string | null, label: string, onClick: ()
   return b;
 }
 
+let helpCount = 0;
+let closeOpenHelp: (() => void) | null = null;
+
+/** A small "?" button that opens a popover with `text`. A click opens it; a click outside, Esc or tabbing away closes it. One is open at a time. `about` names the setting for screen readers. */
+export function helpButton(text: string, about: string): HTMLElement {
+  const id = `help-${++helpCount}`;
+  const pop = el("div", { className: "pop", id, tabIndex: -1, hidden: true }, text);
+  pop.setAttribute("role", "note");
+  const btn = el("button", { type: "button", className: "helpbtn" }, "?");
+  btn.setAttribute("aria-label", `About ${about}`);
+  btn.setAttribute("aria-expanded", "false");
+  btn.setAttribute("aria-controls", id);
+  const wrap = el("span", { className: "help" }, btn, pop);
+
+  const away = (e: Event) => {
+    if (!wrap.isConnected || !wrap.contains(e.target as Node)) close();
+  };
+  const esc = (e: KeyboardEvent) => {
+    if (e.key !== "Escape") return;
+    e.stopPropagation();
+    close();
+    btn.focus();
+  };
+  const close = () => {
+    pop.hidden = true;
+    btn.setAttribute("aria-expanded", "false");
+    document.removeEventListener("pointerdown", away, true);
+    document.removeEventListener("keydown", esc, true);
+    if (closeOpenHelp === close) closeOpenHelp = null;
+  };
+  const open = () => {
+    closeOpenHelp?.();
+    pop.classList.remove("end", "up");
+    pop.hidden = false;
+    // Keep the popover inside the window: open to the left or above when it would run out.
+    const r = pop.getBoundingClientRect();
+    if (r.right > window.innerWidth - 8) pop.classList.add("end");
+    if (r.bottom > window.innerHeight - 8 && btn.getBoundingClientRect().top > r.height + 16) pop.classList.add("up");
+    btn.setAttribute("aria-expanded", "true");
+    document.addEventListener("pointerdown", away, true);
+    document.addEventListener("keydown", esc, true);
+    closeOpenHelp = close;
+  };
+  btn.addEventListener("click", () => (pop.hidden ? open() : close()));
+  wrap.addEventListener("focusout", (e) => {
+    if (!pop.hidden && !wrap.contains(e.relatedTarget as Node | null)) close();
+  });
+  return wrap;
+}
+
 export function size(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   const units = ["KB", "MB", "GB", "TB"];
