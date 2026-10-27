@@ -85,7 +85,10 @@ fun HistoryScreen(
                 if (HistoryView.byDay(query.sort)) {
                     groups(HistoryView.group(shown, nowMillis), nowMillis, onOpen, onRetry, onCancel)
                 } else {
-                    item(key = "all") { KinCard { Rows(shown, nowMillis, onOpen, onRetry, onCancel) } }
+                    // Cards of a few rows each, so the list composes only what is on screen (one card of up to 500 rows would build them all at once).
+                    shown.chunked(ROWS_PER_CARD).forEachIndexed { index, chunk ->
+                        item(key = "all:$index") { KinCard { Rows(chunk, nowMillis, onOpen, onRetry, onCancel) } }
+                    }
                 }
                 item { Spacer(Modifier.height(bottomPadding)) }
             }
@@ -126,6 +129,9 @@ private fun ChipsRow(query: HistoryQuery, onChange: (HistoryQuery) -> Unit) {
         }
     }
 }
+
+/** How many rows one card holds when Name or Size sorts the list into one run of rows. */
+private const val ROWS_PER_CARD = 20
 
 private fun LazyListScope.groups(
     groups: List<HistoryGroup>,
