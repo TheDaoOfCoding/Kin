@@ -35,6 +35,12 @@ data class HistoryItem(
     val canCancel: Boolean,
     /** A failed upload or text that a user Retry already sent again as a new item (the new one is its own row; this one stays as it ended). */
     val retried: Boolean,
+    /** Every file name of a transfer, in order (empty for a text). The Filter searches and sorts on these; [title] keeps only the first two. */
+    val names: List<String> = emptyList(),
+    /** The [HistoryType]s of the item: one per kind of file in a transfer, or [HistoryType.TEXT] or [HistoryType.LINK] for a text. */
+    val types: Set<HistoryType> = emptySet(),
+    /** A text item that is a link: its kind is `link`, or the text was marked as an address. */
+    val isLink: Boolean = false,
 )
 
 /** Builds the history from what is stored: both directions, newest first, never a sensitive text, never an automatic clipboard sync, capped. */
@@ -70,7 +76,8 @@ object HistoryBuilder {
     private fun fileItem(t: TransferEntity, files: List<TransferFileEntity>): HistoryItem {
         val outgoing = t.direction == TransferDirection.UP
         val status = status(t.status, t.errorCode)
-        val names = files.sortedBy { it.ordinal }.map { it.finalName ?: it.name }
+        val sorted = files.sortedBy { it.ordinal }
+        val names = sorted.map { it.finalName ?: it.name }
         val title = when {
             names.isEmpty() -> "Files"
             names.size == 1 -> names[0]
@@ -86,6 +93,7 @@ object HistoryBuilder {
             canRetry = outgoing && t.status == TransferStatus.FAILED && !retried && t.errorCode !in SOURCE_GONE,
             canCancel = t.status == TransferStatus.QUEUED || t.status == TransferStatus.ACTIVE,
             retried = retried,
+            names = names, types = sorted.mapTo(HashSet()) { HistoryTypes.classify(it.finalName ?: it.name, it.mime) },
         )
     }
 
@@ -93,6 +101,7 @@ object HistoryBuilder {
         val outgoing = x.direction == TransferDirection.UP
         val status = status(x.status, x.errorCode)
         val failedLike = x.status == TransferStatus.FAILED || x.status == TransferStatus.CANCELED
+        val isLink = x.kind == TextKind.LINK || x.isUrl
         return HistoryItem(
             key = "x:${x.id}", id = x.id, isText = true, outgoing = outgoing, status = status, timeMillis = x.createdAtMillis,
             title = rowTitle(x), sizeBytes = x.byteSize, errorCode = x.errorCode.takeIf { failedLike }, errorMessage = x.message.takeIf { failedLike },
@@ -100,6 +109,7 @@ object HistoryBuilder {
             canRetry = outgoing && x.status == TransferStatus.FAILED && x.body != null && x.retriedAs == null,
             canCancel = outgoing && x.status == TransferStatus.QUEUED,
             retried = outgoing && x.retriedAs != null,
+            types = setOf(if (isLink) HistoryType.LINK else HistoryType.TEXT), isLink = isLink,
         )
     }
 
