@@ -175,7 +175,9 @@ class LinkLoop(
             } else {
                 log.i("link", "probe not answered: the connection was dead; reconnecting now")
                 backoff.reset()
-                wake.trySend(Unit)
+                // Only a loop that is (about to be) looking for the PC is woken: a connection that ended as replaced or "update the app" waits for the user.
+                val now = mutableState.value
+                if (now is LinkState.Connected || now is LinkState.Connecting) wake.trySend(Unit)
             }
         }
     }
@@ -304,8 +306,9 @@ class LinkLoop(
             if (stable) backoff.reset()
             when (action) {
                 CloseAction.RECONNECT_WITH_BACKOFF -> if (!stable) waitBeforeRetry()
-                CloseAction.RECONNECT_ON_USER_ACTION -> { mutableState.value = LinkState.Replaced; wake.receive() }
-                CloseAction.STOP_UPDATE_APP -> { mutableState.value = LinkState.UpdateApp; wake.receive() }
+                // A wake left from before (a probe that found this connection dead) is not the user's answer to this state: drop it first.
+                CloseAction.RECONNECT_ON_USER_ACTION -> { mutableState.value = LinkState.Replaced; wake.tryReceive(); wake.receive() }
+                CloseAction.STOP_UPDATE_APP -> { mutableState.value = LinkState.UpdateApp; wake.tryReceive(); wake.receive() }
                 CloseAction.STOP_PAIR_AGAIN -> { mutableState.value = LinkState.PairAgain; awaitCancellation() }
             }
         }

@@ -497,6 +497,28 @@ class LinkLoopTest {
     }
 
     @Test
+    fun aProbeThatFailsAfterTheConnectionWasReplacedLeavesTheLoopWaitingForTheUser() = runTest {
+        val env = Env(this)
+        val loop = connectedLoop(env)
+        val session = env.sessions.single()
+        val gate = CompletableDeferred<Unit>()
+        session.probeGate = gate
+        session.probeAnswers = false
+        loop.userAction()
+        runCurrent()
+        // While the probe waits, another phone takes this PC's place (4001); then the probe gives up.
+        session.ended.complete(end(4001, helloFor = 10_000))
+        runCurrent()
+        assertEquals(LinkState.Replaced, loop.state.value)
+        gate.complete(Unit)
+        runCurrent()
+        advance(60_000)
+        assertEquals(LinkState.Replaced, loop.state.value)
+        assertEquals("replaced: only the user wakes it", 1, env.sessions.size)
+        loop.stop("test")
+    }
+
+    @Test
     fun aUserActionWhileConnectingKeepsTodaysBehaviourAndProbesNothing() = runTest {
         // A connection is open but the PC's hello hasn't been accepted: Connecting, so a user action only resets the backoff and wakes the loop.
         val env = Env(this).apply { winners = setOf(known) }
