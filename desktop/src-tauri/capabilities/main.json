@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "The main window (Home, History and Settings, swapped in place): it listens for the app's events and may call only its own commands, nothing else",
+  "windows": ["main"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten", "allow-drop-view", "allow-send-files", "allow-pick-files", "allow-send-text", "allow-cancel-transfer", "allow-media-command", "allow-set-pause", "allow-ring-phone", "allow-history-view", "allow-history-open", "allow-history-cancel", "allow-history-retry", "allow-settings-view", "allow-set-device-name", "allow-set-auto-clipboard-sync", "allow-set-images-to-clipboard", "allow-set-open-links-automatically", "allow-set-mirror-notifications", "allow-set-mirror-option", "allow-set-media-option", "allow-set-presence-option", "allow-set-focus-option", "allow-choose-received-folder", "allow-reset-received-folder", "allow-set-hotkey", "allow-set-start-with-windows", "allow-remove-device", "allow-open-window", "allow-appearance-view", "allow-set-appearance", "allow-close-window"]
+}

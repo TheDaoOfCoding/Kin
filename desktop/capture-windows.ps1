@@ -1,14 +1,15 @@
-# Screenshots of the 1.4 windows (history, settings, debug, drop, pairing) from the real Kin.exe, as small PNGs.
+# Screenshots of the windows of Kin (the main window on its three pages Home, History and Settings, the debug window and the pairing window) from the real Kin.exe, as small PNGs.
 #
 #   cd desktop; powershell -ExecutionPolicy Bypass -File capture-windows.ps1 [-Out <folder>] [-Width 560] [-UpdateScreens]
 #
 # It starts Kin.exe in developer mode (loopback only, throwaway profile and received folder, toasts only logged), gives it a fake phone and a
 # few transfers so the windows have something to show (a text each way, a file each way, one failed send, one text waiting in the queue), opens
-# each window, and captures its visible frame (the screen is used: the window is brought to the front, so don't touch the mouse for a minute).
+# the main window (titled "Kin"; --drop, --history and --settings switch its page in place) and the other windows, and captures each visible frame (the screen is used: the window
+# is brought to the front, so don't touch the mouse for a minute).
 # The real clipboard is saved first and put back at the end (clipboard-backup.ps1). Everything it started is stopped and deleted.
 # The QR code of the pairing window holds the address of the PC, so Kin gets --dev-qr-address 10.0.2.2 (the emulator's name for the PC, not a real
 # address): without it the picture would carry the LAN address of the PC it was taken on.
-# The windows are destroyed again after each picture, and the memory of Kin.exe is measured before and after (the idle-memory claim of 1.4).
+# The main window is destroyed again after its three pictures (and the other windows after theirs), and the memory of Kin.exe is measured before and after (the idle-memory claim of 1.4).
 # Without -Out and -UpdateScreens the pictures go to an ignored folder in the temp area: a run never overwrites the kept pictures of
 # notes\screens (and an -Out that points there is redirected the same way) unless -UpdateScreens says so.
 param([string]$Out = '', [int]$Width = 560, [switch]$UpdateScreens)
@@ -76,11 +77,12 @@ function New-Phone([string[]]$PhoneArgs, [int]$Seconds = 120) {
 }
 function Phone-Log($phone) { (Get-Content -LiteralPath $phone.Log -Raw -ErrorAction SilentlyContinue) }
 function Make-File([string]$path, [int]$bytes) { $b = New-Object byte[] $bytes; (New-Object Random 7).NextBytes($b); [IO.File]::WriteAllBytes($path, $b) }
-function Shot([string]$title, [string]$file) {
+function Shot([string]$title, [string]$file, [int]$SwitchWaitMs = 0) {
     $h = [IntPtr]::Zero
     $found = Wait-Until { $w = Get-DevKinProcesses | Where-Object { $_.MainWindowTitle -eq $title } | Select-Object -First 1; if ($w) { $script:h = $w.MainWindowHandle; $true } else { $false } } 15
     if (-not $found) { throw "no window titled $title" }
     if ($title -ne 'Pair new phone') { Close-Window 'Pair new phone' }   # a pairing opens its "New device paired" notice: keep it out of the picture
+    Start-Sleep -Milliseconds $SwitchWaitMs   # a window that is open already is told to switch its page: let the page switch before the picture
     [void][W32]::ShowWindow($script:h, 9); [void][W32]::SetForegroundWindow($script:h)
     Start-Sleep -Milliseconds 2200
     $r = New-Object W32+RECT
@@ -157,7 +159,15 @@ try {
     Say 'windows (one at a time: a window is opened, photographed and closed)'
     # the "New device paired" notice that every pairing opens must not be in front of the pictures
     Close-Window 'Pair new phone'
-    foreach ($s in @(@('--history', 'History', '01-history.png'), @('--settings', 'Settings', '02-settings.png'), @('--debug-window', 'Debug', '03-debug.png'), @('--drop', 'Send to phone', '04-drop.png'), @('--pair', 'Pair new phone', '05-pairing.png'))) {
+    # The main window: one window, three pages. The first command builds it (on that page); the next two tell the open window to switch.
+    $first = $true
+    foreach ($s in @(@('--history', '01-history.png'), @('--settings', '02-settings.png'), @('--drop', '04-drop.png'))) {
+        Invoke-Kin $s[0]
+        Shot 'Kin' $s[1] $(if ($first) { 0 } else { 1200 })
+        $first = $false
+    }
+    Close-Window 'Kin'
+    foreach ($s in @(@('--debug-window', 'Debug', '03-debug.png'), @('--pair', 'Pair new phone', '05-pairing.png'))) {
         Invoke-Kin $s[0]
         Shot $s[1] $s[2]
         Close-Window $s[1]

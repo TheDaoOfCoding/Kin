@@ -516,7 +516,7 @@ fn every_window_may_call_exactly_the_commands_its_page_calls_and_nothing_else() 
     assert_eq!(manifest, registered, "build.rs (AppManifest) and generate_handler! in app.rs list the same commands");
 
     let mut allowed_anywhere = std::collections::BTreeSet::new();
-    for window in ["pairing", "drop", "history", "settings", "debug"] {
+    for window in ["pairing", "main", "debug"] {
         let cap: Value = serde_json::from_str(&read(&format!("capabilities/{window}.json"))).unwrap();
         assert_eq!(cap["windows"], json!([window]), "{window}: the capability is for that one window");
         let permissions: Vec<String> = cap["permissions"].as_array().unwrap().iter().map(|p| p.as_str().unwrap().to_string()).collect();
@@ -533,11 +533,19 @@ fn every_window_may_call_exactly_the_commands_its_page_calls_and_nothing_else() 
             }
         }
         assert!(!permissions.iter().any(|p| p.starts_with("core:default") || p == "core:event:default"), "{window}: no core:default");
-        // what the page calls: its own file, the look every window takes (`appearance.ts`), and, for the three windows that share the sidebar, `shell.ts`
-        let mut page = read(&format!("../src/{window}.ts")) + &read("../src/appearance.ts");
-        if ["drop", "history", "settings"].contains(&window) {
-            page += &read("../src/shell.ts");
-        }
+        // what the page calls: for Pairing and Debug their own file and the look every window takes (`appearance.ts`); for the main window every
+        // source file except those two (Home, History and Settings, the shell and whatever files they grow, so a new file needs no edit here)
+        let page = if window == "main" {
+            let mut files: Vec<_> = std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../src"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .filter(|n| n.ends_with(".ts") && n != "pairing.ts" && n != "debug.ts")
+                .collect();
+            files.sort();
+            files.iter().map(|n| read(&format!("../src/{n}"))).collect::<String>()
+        } else {
+            read(&format!("../src/{window}.ts")) + &read("../src/appearance.ts")
+        };
         let mut called = std::collections::BTreeSet::new();
         for part in page.split("\"").skip(1).step_by(2) {
             if manifest.contains(part) {
@@ -552,6 +560,82 @@ fn every_window_may_call_exactly_the_commands_its_page_calls_and_nothing_else() 
     }
     assert_eq!(allowed_anywhere, manifest, "every command is allowed for some window, and no window has a command that isn't one");
     assert!(!Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities/default.json").exists(), "the catch-all capability is gone");
+}
+
+#[test]
+fn the_old_windows_capabilities_are_gone_and_pairing_and_debug_hold_exactly_their_commands() {
+    for gone in ["drop", "history", "settings"] {
+        assert!(
+            !Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("capabilities/{gone}.json")).exists(),
+            "{gone}.json is gone: its commands are the main window's"
+        );
+    }
+    let permissions = |window: &str| -> Vec<String> {
+        let cap: Value = serde_json::from_str(&read(&format!("capabilities/{window}.json"))).unwrap();
+        cap["permissions"].as_array().unwrap().iter().map(|p| p.as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(
+        permissions("pairing"),
+        [
+            "core:event:allow-listen",
+            "core:event:allow-unlisten",
+            "allow-pairing-view",
+            "allow-new-pairing",
+            "allow-copy-pairing-link",
+            "allow-remove-device",
+            "allow-appearance-view",
+            "allow-close-window"
+        ]
+    );
+    assert_eq!(
+        permissions("debug"),
+        [
+            "core:event:allow-listen",
+            "core:event:allow-unlisten",
+            "allow-debug-view",
+            "allow-debug-ping",
+            "allow-export-logs",
+            "allow-appearance-view",
+            "allow-close-window"
+        ]
+    );
+}
+
+#[test]
+fn each_commands_only_list_names_exactly_the_windows_it_is_for() {
+    let ui = read("src/ui.rs");
+    let label = |constant: &str| match constant {
+        "PAIRING_WINDOW" => "pairing",
+        "MAIN_WINDOW" => "main",
+        "DEBUG_WINDOW" => "debug",
+        other => panic!("an only(...) list names {other}, which is not a window that exists"),
+    };
+    // Every command is for the main window alone unless it is listed here.
+    let exceptions: std::collections::BTreeMap<&str, Vec<&str>> = [
+        ("pairing_view", vec!["pairing"]),
+        ("new_pairing", vec!["pairing"]),
+        ("copy_pairing_link", vec!["pairing"]),
+        ("remove_device", vec!["main", "pairing"]),
+        ("close_window", vec!["debug", "main", "pairing"]),
+        ("appearance_view", vec!["debug", "main", "pairing"]),
+        ("debug_view", vec!["debug"]),
+        ("debug_ping", vec!["debug"]),
+        ("export_logs", vec!["debug"]),
+    ]
+    .into_iter()
+    .collect();
+    let mut seen = 0;
+    for chunk in ui.split("#[tauri::command]").skip(1) {
+        let name = chunk.split("fn ").nth(1).unwrap().split('(').next().unwrap().trim();
+        let call = &chunk[chunk.find("only(&window, &[").unwrap() + "only(&window, &[".len()..];
+        let list = &call[..call.find(']').unwrap()];
+        let mut labels: Vec<&str> = list.split(',').map(str::trim).filter(|c| !c.is_empty()).map(label).collect();
+        labels.sort_unstable();
+        let expected = exceptions.get(name).cloned().unwrap_or_else(|| vec!["main"]);
+        assert_eq!(labels, expected, "{name}: the windows its only(...) list names");
+        seen += 1;
+    }
+    assert_eq!(seen, 37, "every command was checked");
 }
 
 #[test]

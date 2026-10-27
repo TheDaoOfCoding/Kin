@@ -1,10 +1,10 @@
 //! Windows and the commands the web UI calls. A window is created when it is opened and **destroyed** when it is closed
 //! (windows.md): an open WebView2 costs tens of MB, and destroying it keeps the idle memory low.
 //!
-//! There are five windows (the drop, history and settings windows share one sidebar, so "Home", "History" and "Settings" are one place to the person; see `open_window`): the pairing window, (1.3) the drop window, which the tray's left click opens: a target for files
-//! dragged from Explorer (Windows doesn't support dropping on a tray icon), a button that opens the file dialog, and the progress of
-//! the transfers with a Cancel button, and (1.4) the history, settings and debug windows. They are all the same page (`index.html`), told
-//! apart by the `?w=` of their URL.
+//! There are three windows: the pairing window, the debug window and the **main window** (`main`), which holds three pages that its sidebar swaps in
+//! place: Home (1.3: a target for files dragged from Explorer, since Windows doesn't support dropping on a tray icon, a button that opens the file
+//! dialog and the progress of the transfers with a Cancel button), History and Settings (1.4). They are all the same page (`index.html`), told apart
+//! by the `?w=` of their URL; the main window also reads `&page=` (see [`main_url`]).
 use std::path::PathBuf;
 
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
@@ -13,9 +13,10 @@ use crate::app::AppState;
 use crate::core::PairingView;
 
 pub const PAIRING_WINDOW: &str = "pairing";
-pub const DROP_WINDOW: &str = "drop";
+pub const MAIN_WINDOW: &str = "main";
+pub const DEBUG_WINDOW: &str = "debug";
 
-/// The drop (Home), history and settings windows are the three places of one sidebar, so they open at one size.
+/// Home, History and Settings are the three pages of the main window, so it opens at one size.
 const MAIN_SIZE: (f64, f64) = (960.0, 640.0);
 const MAIN_MIN: (f64, f64) = (760.0, 520.0);
 
@@ -81,43 +82,14 @@ fn with_instance_data<'a>(
     }
 }
 
-/// Opens the drop window, or brings it to the front.
-pub fn open_drop_window(app: &AppHandle) {
-    let state = app.state::<AppState>();
-    if state.core.config.dev_no_windows {
-        log::info!("drop window skipped (--dev-no-windows)");
-        return;
-    }
-    if let Some(window) = app.get_webview_window(DROP_WINDOW) {
-        let _ = window.show();
-        let _ = window.set_focus();
-        return;
-    }
-    let app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let built = with_instance_data(
-            &app,
-            WebviewWindowBuilder::new(&app, DROP_WINDOW, WebviewUrl::App("index.html?w=drop".into()))
-                .title("Send to phone")
-                .inner_size(MAIN_SIZE.0, MAIN_SIZE.1)
-                .min_inner_size(MAIN_MIN.0, MAIN_MIN.1)
-                .center(),
-        )
-        .build();
-        if let Err(e) = built {
-            log::error!("opening the drop window failed: {e}");
-        }
-    });
-}
-
 /// Tells the pairing window (if open) that there is something new to show.
 pub fn pairing_changed(app: &AppHandle) {
     let _ = app.emit_to(PAIRING_WINDOW, "pairing-changed", ());
 }
 
-/// Tells the drop window (if open) that a transfer moved on.
+/// Tells the main window (if open) that a transfer moved on.
 pub fn transfers_changed(app: &AppHandle) {
-    let _ = app.emit_to(DROP_WINDOW, "transfers-changed", ());
+    let _ = app.emit_to(MAIN_WINDOW, "transfers-changed", ());
 }
 
 /// What the window shows. If nobody started a pairing yet (the window was opened some other way), this starts one.
@@ -144,32 +116,32 @@ pub async fn copy_pairing_link(window: WebviewWindow, state: State<'_, AppState>
 /// The "Remove this device" button of the "New device paired" notice.
 #[tauri::command]
 pub async fn remove_device(window: WebviewWindow, state: State<'_, AppState>, device_id: String) -> Result<(), String> {
-    only(&window, &[PAIRING_WINDOW, SETTINGS_WINDOW], "remove_device")?;
+    only(&window, &[PAIRING_WINDOW, MAIN_WINDOW], "remove_device")?;
     state.core.remove_device(&device_id).await.map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// Closes (destroys) the window that asked.
 #[tauri::command]
 pub fn close_window(window: WebviewWindow) -> Result<(), String> {
-    only(&window, &[PAIRING_WINDOW, DROP_WINDOW, HISTORY_WINDOW, SETTINGS_WINDOW, DEBUG_WINDOW], "close_window")?;
+    only(&window, &[PAIRING_WINDOW, MAIN_WINDOW, DEBUG_WINDOW], "close_window")?;
     let _ = window.destroy();
     Ok(())
 }
 
-// ----- the drop window --------------------------------------------------------------------------------------------------
+// ----- Home (the drop target)
 
-/// The state of the drop window: the phone, the transfers that are going and the ones that finished lately.
+/// The state of the Home page: the phone, the transfers that are going and the ones that finished lately.
 #[tauri::command]
 pub fn drop_view(window: WebviewWindow, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    only(&window, &[DROP_WINDOW], "drop_view")?;
+    only(&window, &[MAIN_WINDOW], "drop_view")?;
     Ok(state.core.drop_view())
 }
 
 /// Files that were dropped on the window (the page gets their paths from the drag-and-drop event).
 #[tauri::command]
 pub async fn send_files(window: WebviewWindow, state: State<'_, AppState>, paths: Vec<String>) -> Result<(), String> {
-    only(&window, &[DROP_WINDOW], "send_files")?;
-    log::info!("the drop window got {} dropped path(s)", paths.len());
+    only(&window, &[MAIN_WINDOW], "send_files")?;
+    log::info!("the main window got {} dropped path(s)", paths.len());
     let core = state.core.clone();
     let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
     tauri::async_runtime::spawn(async move {
@@ -181,14 +153,14 @@ pub async fn send_files(window: WebviewWindow, state: State<'_, AppState>, paths
 /// "Choose files…": the file dialog of Windows, then the same as a drop.
 #[tauri::command]
 pub async fn pick_files(window: WebviewWindow, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    only(&window, &[DROP_WINDOW], "pick_files")?;
+    only(&window, &[MAIN_WINDOW], "pick_files")?;
     pick_and_send(&app, state.core.clone());
     Ok(())
 }
 
-/// The tray's "Send files…" and the drop window's button: ask which files, and send them.
+/// The tray's "Send files…" and the Home page's button: ask which files, and send them.
 pub fn pick_and_send(app: &AppHandle, core: std::sync::Arc<crate::core::Core>) {
-    let owner = app.get_webview_window(DROP_WINDOW).and_then(|w| w.hwnd().ok()).map(|h| h.0 as isize);
+    let owner = app.get_webview_window(MAIN_WINDOW).and_then(|w| w.hwnd().ok()).map(|h| h.0 as isize);
     // The dialog blocks its thread until it is closed, so it gets a thread of its own.
     tauri::async_runtime::spawn_blocking(move || match pick_files_dialog(owner) {
         Ok(paths) if !paths.is_empty() => {
@@ -203,7 +175,7 @@ pub fn pick_and_send(app: &AppHandle, core: std::sync::Arc<crate::core::Core>) {
 
 #[tauri::command]
 pub async fn cancel_transfer(window: WebviewWindow, state: State<'_, AppState>, id: String) -> Result<bool, String> {
-    only(&window, &[DROP_WINDOW], "cancel_transfer")?;
+    only(&window, &[MAIN_WINDOW], "cancel_transfer")?;
     Ok(state.core.cancel_transfer(&id).await)
 }
 
@@ -247,131 +219,141 @@ fn pick_files_dialog(owner: Option<isize>) -> crate::Result<Vec<PathBuf>> {
     }
 }
 
-// ----- the history, settings and debug windows (1.4) -----------------------------------------------------------------------
+// ----- the main window and the debug window ---------------------------------------------------------------------------------
 
-pub const HISTORY_WINDOW: &str = "history";
-pub const SETTINGS_WINDOW: &str = "settings";
-pub const DEBUG_WINDOW: &str = "debug";
-
-/// Opens a window of the page `index.html?w=<label>`, or brings it to the front. It is destroyed when it is closed, like the others.
-fn open_page(app: &AppHandle, label: &'static str, title: &'static str, size: (f64, f64), min: (f64, f64)) {
-    open_page_at(app, label, title, size, min, None, None);
+/// The three pages of the main window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MainPage {
+    Home,
+    History,
+    Settings,
 }
 
-/// Where a window that takes the place of another opens: its position and size in logical pixels.
-type Placement = (f64, f64, f64, f64);
+impl MainPage {
+    /// The name the page and the `navigate` event use.
+    pub fn name(self) -> &'static str {
+        match self {
+            MainPage::Home => "home",
+            MainPage::History => "history",
+            MainPage::Settings => "settings",
+        }
+    }
 
-/// Where `window` is, so that the window that replaces it can open in the same place and size.
-fn placement_of(window: &WebviewWindow) -> Option<Placement> {
-    let scale = window.scale_factor().ok()?;
-    let at = window.outer_position().ok()?;
-    let size = window.inner_size().ok()?;
-    Some((f64::from(at.x) / scale, f64::from(at.y) / scale, f64::from(size.width) / scale, f64::from(size.height) / scale))
+    pub fn parse(name: &str) -> Option<MainPage> {
+        match name {
+            "home" => Some(MainPage::Home),
+            "history" => Some(MainPage::History),
+            "settings" => Some(MainPage::Settings),
+            _ => None,
+        }
+    }
 }
 
-/// Like [`open_page`], with a `#fragment` for the page to read when it starts (`#unlink=<deviceId>`).
-fn open_page_at(
-    app: &AppHandle,
-    label: &'static str,
-    title: &'static str,
-    size: (f64, f64),
-    min: (f64, f64),
-    fragment: Option<String>,
-    replacing: Option<(WebviewWindow, Placement)>,
-) {
+/// The URL the main window is built with: `index.html?w=main&page=<page>`, plus `#unlink=<deviceId>` for the tray's "Unlink phone..." (the page reads it
+/// when it starts).
+fn main_url(page: MainPage, unlink: Option<&str>) -> String {
+    match unlink {
+        Some(device_id) => format!("index.html?w={MAIN_WINDOW}&page={}#unlink={device_id}", page.name()),
+        None => format!("index.html?w={MAIN_WINDOW}&page={}", page.name()),
+    }
+}
+
+/// Opens the main window on `page`, or brings it to the front and tells it to show `page` (`navigate`). `unlink` is the tray's "Unlink phone...": the
+/// Settings page with the confirmation for that phone already open (a window that is open already is told with `unlink-requested`, since its page has
+/// been read). A `navigate` sent while the window is still being built is lost (the page is not listening yet), as `unlink-requested` is.
+pub fn open_main(app: &AppHandle, page: MainPage, unlink: Option<&str>) {
     let state = app.state::<AppState>();
     if state.core.config.dev_no_windows {
-        log::info!("{label} window skipped (--dev-no-windows)");
+        log::info!("main window skipped (--dev-no-windows)");
         return;
     }
-    if let Some(window) = app.get_webview_window(label) {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+        let _ = app.emit_to(MAIN_WINDOW, "navigate", serde_json::json!({ "page": page.name() }));
+        if let Some(device_id) = unlink {
+            let _ = app.emit_to(MAIN_WINDOW, "unlink-requested", device_id.to_string());
+        }
+        return;
+    }
+    let url = main_url(page, unlink);
+    // Building a window blocks until the main thread has made it, so don't do it on the main thread.
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let builder = WebviewWindowBuilder::new(&app, MAIN_WINDOW, WebviewUrl::App(url.into()))
+            .title("Kin")
+            .inner_size(MAIN_SIZE.0, MAIN_SIZE.1)
+            .min_inner_size(MAIN_MIN.0, MAIN_MIN.1)
+            .center();
+        if let Err(e) = with_instance_data(&app, builder).build() {
+            log::error!("opening the main window failed: {e}");
+        }
+    });
+}
+
+/// Opens the debug window (`index.html?w=debug`), or brings it to the front. It is destroyed when it is closed, like the others.
+pub fn open_debug_window(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if state.core.config.dev_no_windows {
+        log::info!("debug window skipped (--dev-no-windows)");
+        return;
+    }
+    if let Some(window) = app.get_webview_window(DEBUG_WINDOW) {
         let _ = window.show();
         let _ = window.set_focus();
         return;
     }
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let url = match &fragment {
-            Some(f) => format!("index.html?w={label}#{f}"),
-            None => format!("index.html?w={label}"),
-        };
-        let builder = WebviewWindowBuilder::new(&app, label, WebviewUrl::App(url.into())).title(title).min_inner_size(min.0, min.1);
-        let builder = match &replacing {
-            Some((_, (x, y, w, h))) => builder.position(*x, *y).inner_size(*w, *h),
-            None => builder.inner_size(size.0, size.1).center(),
-        };
-        match with_instance_data(&app, builder).build() {
-            // The sidebar took the person here: the window they were in goes, so it feels like one window changing its page.
-            Ok(_) => {
-                if let Some((old, _)) = replacing {
-                    let _ = old.destroy();
-                }
-            }
-            Err(e) => log::error!("opening the {label} window failed: {e}"),
+        let builder = WebviewWindowBuilder::new(&app, DEBUG_WINDOW, WebviewUrl::App(format!("index.html?w={DEBUG_WINDOW}").into()))
+            .title("Debug")
+            .inner_size(620.0, 680.0)
+            .min_inner_size(460.0, 380.0)
+            .center();
+        if let Err(e) = with_instance_data(&app, builder).build() {
+            log::error!("opening the debug window failed: {e}");
         }
     });
 }
 
-pub fn open_history_window(app: &AppHandle) {
-    open_page(app, HISTORY_WINDOW, "History", MAIN_SIZE, MAIN_MIN);
-}
-
-pub fn open_settings_window(app: &AppHandle) {
-    open_page(app, SETTINGS_WINDOW, "Settings", MAIN_SIZE, MAIN_MIN);
-}
-
-/// The tray's "Unlink phone...": the Settings window with the confirmation for this phone already open (`#unlink=<deviceId>`). A window that is open already is
-/// told with an event, since its page has been read.
-pub fn open_unlink(app: &AppHandle, device_id: &str) {
-    if app.get_webview_window(SETTINGS_WINDOW).is_some() {
-        open_settings_window(app);
-        let _ = app.emit_to(SETTINGS_WINDOW, "unlink-requested", device_id.to_string());
-        return;
-    }
-    open_page_at(app, SETTINGS_WINDOW, "Settings", MAIN_SIZE, MAIN_MIN, Some(format!("unlink={device_id}")), None);
-}
-
-pub fn open_debug_window(app: &AppHandle) {
-    open_page(app, DEBUG_WINDOW, "Debug", (620.0, 680.0), (460.0, 380.0));
-}
-
-/// Tells the windows that show lists that something changed.
+/// Tells the main window that something changed in the lists its pages show.
 pub fn lists_changed(app: &AppHandle) {
-    let _ = app.emit_to(HISTORY_WINDOW, "history-changed", ());
-    let _ = app.emit_to(SETTINGS_WINDOW, "settings-changed", ());
-    // The media strip of the drop window follows the phone's session and the PC's own.
-    let _ = app.emit_to(DROP_WINDOW, "media-changed", ());
+    let _ = app.emit_to(MAIN_WINDOW, "history-changed", ());
+    let _ = app.emit_to(MAIN_WINDOW, "settings-changed", ());
+    // The media strip of Home follows the phone's session and the PC's own.
+    let _ = app.emit_to(MAIN_WINDOW, "media-changed", ());
 }
 
-// ----- the history window
+// ----- the history page
 
 #[tauri::command]
 pub fn history_view(window: WebviewWindow, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    only(&window, &[HISTORY_WINDOW], "history_view")?;
+    only(&window, &[MAIN_WINDOW], "history_view")?;
     Ok(state.core.history_view())
 }
 
 /// A click on an item: a file opens (or is shown in its folder), a text is copied. The answer is a short line for the window.
 #[tauri::command]
 pub async fn history_open(window: WebviewWindow, state: State<'_, AppState>, id: String) -> Result<String, String> {
-    only(&window, &[HISTORY_WINDOW], "history_open")?;
+    only(&window, &[MAIN_WINDOW], "history_open")?;
     state.core.history_open(&id).await
 }
 
 #[tauri::command]
 pub async fn history_cancel(window: WebviewWindow, state: State<'_, AppState>, id: String) -> Result<bool, String> {
-    only(&window, &[HISTORY_WINDOW], "history_cancel")?;
+    only(&window, &[MAIN_WINDOW], "history_cancel")?;
     Ok(state.core.history_cancel(&id).await)
 }
 
 /// Retry on a failed item that this PC sent: a new item, a new ID.
 #[tauri::command]
 pub async fn history_retry(window: WebviewWindow, state: State<'_, AppState>, id: String) -> Result<String, String> {
-    only(&window, &[HISTORY_WINDOW], "history_retry")?;
+    only(&window, &[MAIN_WINDOW], "history_retry")?;
     state.core.retry_item(&id).await
 }
 
-// ----- the settings window
+// ----- the settings page
 
 fn settings_json(state: &AppState) -> serde_json::Value {
     let start = state.autostart.is_enabled().ok();
@@ -382,26 +364,26 @@ fn settings_json(state: &AppState) -> serde_json::Value {
 
 #[tauri::command]
 pub fn settings_view(window: WebviewWindow, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    only(&window, &[SETTINGS_WINDOW], "settings_view")?;
+    only(&window, &[MAIN_WINDOW], "settings_view")?;
     Ok(settings_json(&state))
 }
 
 #[tauri::command]
 pub fn set_device_name(window: WebviewWindow, state: State<'_, AppState>, name: String) -> Result<String, String> {
-    only(&window, &[SETTINGS_WINDOW], "set_device_name")?;
+    only(&window, &[MAIN_WINDOW], "set_device_name")?;
     Ok(state.core.set_device_name(&name))
 }
 
 #[tauri::command]
 pub fn set_auto_clipboard_sync(window: WebviewWindow, state: State<'_, AppState>, on: bool) -> Result<(), String> {
-    only(&window, &[SETTINGS_WINDOW], "set_auto_clipboard_sync")?;
+    only(&window, &[MAIN_WINDOW], "set_auto_clipboard_sync")?;
     state.core.set_auto_clipboard_sync(on);
     Ok(())
 }
 
 #[tauri::command]
 pub fn set_images_to_clipboard(window: WebviewWindow, state: State<'_, AppState>, on: bool) -> Result<(), String> {
-    only(&window, &[SETTINGS_WINDOW], "set_images_to_clipboard")?;
+    only(&window, &[MAIN_WINDOW], "set_images_to_clipboard")?;
     state.core.set_images_to_clipboard(on);
     Ok(())
 }
@@ -409,7 +391,7 @@ pub fn set_images_to_clipboard(window: WebviewWindow, state: State<'_, AppState>
 /// "Open links from phone automatically" (2B.1): on by default.
 #[tauri::command]
 pub fn set_open_links_automatically(window: WebviewWindow, state: State<'_, AppState>, on: bool) -> Result<(), String> {
-    only(&window, &[SETTINGS_WINDOW], "set_open_links_automatically")?;
+    only(&window, &[MAIN_WINDOW], "set_open_links_automatically")?;
     state.core.set_open_links_automatically(on);
     Ok(())
 }
@@ -418,7 +400,7 @@ pub fn set_open_links_automatically(window: WebviewWindow, state: State<'_, AppS
 /// the toasts and the registration. The phone is told by a new `hello` either way.
 #[tauri::command]
 pub async fn set_mirror_notifications(window: WebviewWindow, state: State<'_, AppState>, on: bool) -> Result<(), String> {
-    only(&window, &[SETTINGS_WINDOW], "set_mirror_notifications")?;
+    only(&window, &[MAIN_WINDOW], "set_mirror_notifications")?;
     let core = state.core.clone();
     // Registering with Windows touches the registry and starts threads: not on the thread that runs the window.
     tauri::async_runtime::spawn_blocking(move || core.set_mirror_notifications(on)).await.map_err(|e| e.to_string())
@@ -427,7 +409,7 @@ pub async fn set_mirror_notifications(window: WebviewWindow, state: State<'_, Ap
 /// The other switches of "Phone notifications": `sound`, `hideContent`, `dismissToPhone` and `textOnly`.
 #[tauri::command]
 pub fn set_mirror_option(window: WebviewWindow, state: State<'_, AppState>, name: String, on: bool) -> Result<(), String> {
-    only(&window, &[SETTINGS_WINDOW], "set_mirror_option")?;
+    only(&window, &[MAIN_WINDOW], "set_mirror_option")?;
     match name.as_str() {
         "sound" => state.core.set_mirror_sound(on),
         "hideContent" => state.core.set_mirror_hide_content(on),
@@ -442,7 +424,7 @@ pub fn set_mirror_option(window: WebviewWindow, state: State<'_, AppState>, name
 /// the reader or the flyout session, which touch Windows and start threads: not on the thread that runs the window.
 #[tauri::command]
 pub async fn set_media_option(window: WebviewWindow, state: State<'_, AppState>, name: String, on: bool) -> Result<(), String> {
-    only(&window, &[SETTINGS_WINDOW], "set_media_option")?;
+    only(&window, &[MAIN_WINDOW], "set_media_option")?;
     let core = state.core.clone();
     match name.as_str() {
         "share" => tauri::async_runtime::spawn_blocking(move || core.set_media_share(on)).await.map_err(|e| e.to_string()),
@@ -451,10 +433,10 @@ pub async fn set_media_option(window: WebviewWindow, state: State<'_, AppState>,
     }
 }
 
-/// Pause Kin (2B.4) from the Settings or the drop window: `1h`, `tomorrow`, `resumed` (until the user resumes) or `resume` (end the pause).
+/// Pause Kin (2B.4) from the Settings or Home: `1h`, `tomorrow`, `resumed` (until the user resumes) or `resume` (end the pause).
 #[tauri::command]
 pub async fn set_pause(window: WebviewWindow, state: State<'_, AppState>, choice: String) -> Result<(), String> {
-    only(&window, &[SETTINGS_WINDOW, DROP_WINDOW], "set_pause")?;
+    only(&window, &[MAIN_WINDOW], "set_pause")?;
     let choice = if choice == "resume" {
         None
     } else {
@@ -468,7 +450,7 @@ pub async fn set_pause(window: WebviewWindow, state: State<'_, AppState>, choice
 /// "Ring my phone" / "Stop ringing phone" (2B.4). The answer is the line the window shows. The PC makes no sound: this is a message to the phone.
 #[tauri::command]
 pub async fn ring_phone(window: WebviewWindow, state: State<'_, AppState>, start: bool) -> Result<String, String> {
-    only(&window, &[SETTINGS_WINDOW, DROP_WINDOW], "ring_phone")?;
+    only(&window, &[MAIN_WINDOW], "ring_phone")?;
     let core = state.core.clone();
     Ok(if start { core.ring_start().await } else { core.ring_stop().await })
 }
@@ -476,7 +458,7 @@ pub async fn ring_phone(window: WebviewWindow, state: State<'_, AppState>, start
 /// The three switches of "Presence" (2B.4), each on by default: `shareBattery`, `showPhone` and `lowBatteryNudge`.
 #[tauri::command]
 pub fn set_presence_option(window: WebviewWindow, state: State<'_, AppState>, name: String, on: bool) -> Result<(), String> {
-    only(&window, &[SETTINGS_WINDOW], "set_presence_option")?;
+    only(&window, &[MAIN_WINDOW], "set_presence_option")?;
     match name.as_str() {
         "shareBattery" => state.core.set_presence_share_battery(on),
         "showPhone" => state.core.set_presence_show_phone(on),
@@ -490,7 +472,7 @@ pub fn set_presence_option(window: WebviewWindow, state: State<'_, AppState>, na
 /// reads Windows Focus; these switches decide whether it reads it and tells the phone.
 #[tauri::command]
 pub fn set_focus_option(window: WebviewWindow, state: State<'_, AppState>, name: String, on: bool) -> Result<(), String> {
-    only(&window, &[SETTINGS_WINDOW], "set_focus_option")?;
+    only(&window, &[MAIN_WINDOW], "set_focus_option")?;
     match name.as_str() {
         "focusShare" => state.core.set_focus_share(on),
         "focusAlsoPresenting" => state.core.set_focus_also_presenting(on),
@@ -500,11 +482,11 @@ pub fn set_focus_option(window: WebviewWindow, state: State<'_, AppState>, name:
     Ok(())
 }
 
-/// The buttons of the drop window's media strip: `toggle`, `next` and `prev` of the phone's media (a `media.cmd` to the phone), `seek` (a position in ms) and
+/// The buttons of the media strip of Home: `toggle`, `next` and `prev` of the phone's media (a `media.cmd` to the phone), `seek` (a position in ms) and
 /// `volume` of the **phone** (a level 0 to 100), and `pc-volume` and `pc-mute` for the PC's own master volume (the user's own slider; in a test run it moves a fake).
 #[tauri::command]
 pub async fn media_command(window: WebviewWindow, state: State<'_, AppState>, action: String, value: Option<i64>) -> Result<(), String> {
-    only(&window, &[DROP_WINDOW], "media_command")?;
+    only(&window, &[MAIN_WINDOW], "media_command")?;
     use crate::media::wire::{CmdKind, VolumeOp};
     let core = state.core.clone();
     let level =
@@ -540,8 +522,8 @@ pub async fn media_command(window: WebviewWindow, state: State<'_, AppState>, ac
 /// "Choose folder…": the Windows folder picker, then the folder is checked and kept. `None` if the user closed the dialog.
 #[tauri::command]
 pub async fn choose_received_folder(window: WebviewWindow, app: AppHandle, state: State<'_, AppState>) -> Result<Option<String>, String> {
-    only(&window, &[SETTINGS_WINDOW], "choose_received_folder")?;
-    let owner = app.get_webview_window(SETTINGS_WINDOW).and_then(|w| w.hwnd().ok()).map(|h| h.0 as isize);
+    only(&window, &[MAIN_WINDOW], "choose_received_folder")?;
+    let owner = app.get_webview_window(MAIN_WINDOW).and_then(|w| w.hwnd().ok()).map(|h| h.0 as isize);
     let picked = tauri::async_runtime::spawn_blocking(move || pick_folder_dialog(owner))
         .await
         .map_err(|e| e.to_string())?
@@ -554,7 +536,7 @@ pub async fn choose_received_folder(window: WebviewWindow, app: AppHandle, state
 
 #[tauri::command]
 pub fn reset_received_folder(window: WebviewWindow, state: State<'_, AppState>) -> Result<String, String> {
-    only(&window, &[SETTINGS_WINDOW], "reset_received_folder")?;
+    only(&window, &[MAIN_WINDOW], "reset_received_folder")?;
     state.core.set_received_folder(None).map(|p| p.to_string_lossy().into_owned())
 }
 
@@ -567,13 +549,13 @@ pub fn set_hotkey(
     state: State<'_, AppState>,
     accelerator: String,
 ) -> Result<serde_json::Value, String> {
-    only(&window, &[SETTINGS_WINDOW], "set_hotkey")?;
+    only(&window, &[MAIN_WINDOW], "set_hotkey")?;
     crate::app::change_hotkey(&app, &state.core, accelerator.trim())
 }
 
 #[tauri::command]
 pub fn set_start_with_windows(window: WebviewWindow, state: State<'_, AppState>, on: bool) -> Result<bool, String> {
-    only(&window, &[SETTINGS_WINDOW], "set_start_with_windows")?;
+    only(&window, &[MAIN_WINDOW], "set_start_with_windows")?;
     state.autostart.set_enabled(on)?;
     // What the person chose, so that the repair at the next start (integration.rs) does not turn it back on.
     crate::integration::remember_start_with_windows(&state.core.config.data_dir, on);
@@ -708,45 +690,15 @@ fn save_file_dialog(owner: Option<isize>, default_name: &str) -> crate::Result<O
     }
 }
 
-/// The sidebar of the drop, history and settings windows (`drop` is Home) and the Settings window's "Debug…" button. `drop`, `history` and `settings` take the place
-/// of the window that asked (same position and size; if the target is open already it is brought to the front and the asking window goes), `debug` opens beside it.
+/// The sidebar's "Pair a phone" (`pairing`: a new pairing, in the pairing window) and the Settings page's "Debug…" button (`debug`). The pages of the main
+/// window are swapped by the page itself, not by a window.
 #[tauri::command]
 pub fn open_window(window: WebviewWindow, app: AppHandle, name: String) -> Result<(), String> {
-    only(&window, &[DROP_WINDOW, HISTORY_WINDOW, SETTINGS_WINDOW], "open_window")?;
-    let (label, title) = match name.as_str() {
-        "debug" => {
-            open_debug_window(&app);
-            return Ok(());
-        }
-        // The sidebar's "Pair a phone": a new pairing, in the pairing window (the sidebar window stays).
-        "pairing" => {
-            open_pairing_window(&app, true);
-            return Ok(());
-        }
-        "drop" => (DROP_WINDOW, "Send to phone"),
-        "history" => (HISTORY_WINDOW, "History"),
-        "settings" => (SETTINGS_WINDOW, "Settings"),
-        other => {
-            log::warn!("no window called {other:?}");
-            return Ok(());
-        }
-    };
-    if window.label() == label {
-        return Ok(());
-    }
-    if let Some(open) = app.get_webview_window(label) {
-        let _ = open.show();
-        let _ = open.set_focus();
-        let _ = window.destroy();
-        return Ok(());
-    }
-    let state = app.state::<AppState>();
-    if state.core.config.dev_no_windows {
-        return Ok(());
-    }
-    match placement_of(&window) {
-        Some(at) => open_page_at(&app, label, title, MAIN_SIZE, MAIN_MIN, None, Some((window, at))),
-        None => open_page(&app, label, title, MAIN_SIZE, MAIN_MIN),
+    only(&window, &[MAIN_WINDOW], "open_window")?;
+    match name.as_str() {
+        "debug" => open_debug_window(&app),
+        "pairing" => open_pairing_window(&app, true),
+        other => log::warn!("no window called {other:?}"),
     }
     Ok(())
 }
@@ -756,7 +708,7 @@ pub fn open_window(window: WebviewWindow, app: AppHandle, name: String) -> Resul
 /// The skin and the theme that every window shows. Every window reads it when it opens, and hears `appearance-changed` after that.
 #[tauri::command]
 pub fn appearance_view(window: WebviewWindow, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    only(&window, &[PAIRING_WINDOW, DROP_WINDOW, HISTORY_WINDOW, SETTINGS_WINDOW, DEBUG_WINDOW], "appearance_view")?;
+    only(&window, &[PAIRING_WINDOW, MAIN_WINDOW, DEBUG_WINDOW], "appearance_view")?;
     Ok(appearance_json(&state.core))
 }
 
@@ -781,7 +733,7 @@ pub fn set_appearance(
     skin: String,
     theme: String,
 ) -> Result<(), String> {
-    only(&window, &[SETTINGS_WINDOW], "set_appearance")?;
+    only(&window, &[MAIN_WINDOW], "set_appearance")?;
     set_appearance_and_tell(&app, &state.core, &skin, &theme)
 }
 
@@ -789,7 +741,7 @@ pub fn set_appearance(
 /// `isUrl` set for a web address, a file over 128 KiB). The answer is the line the window shows.
 #[tauri::command]
 pub async fn send_text(window: WebviewWindow, state: State<'_, AppState>, text: String) -> Result<String, String> {
-    only(&window, &[DROP_WINDOW], "send_text")?;
+    only(&window, &[MAIN_WINDOW], "send_text")?;
     use crate::sync::{Kind, SendResult, Tap};
     if text.trim().is_empty() {
         return Err("Type something to send.".to_string());
@@ -801,5 +753,27 @@ pub async fn send_text(window: WebviewWindow, state: State<'_, AppState>, text: 
         SendResult::NoPhonePaired => Err("No phone is paired yet.".to_string()),
         SendResult::Rejected(code) => Err(format!("Your phone didn't take it ({}).", code.replace('_', " "))),
         SendResult::TooLarge { .. } => Err("That text is too big to send.".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_main_window_url_names_the_page_and_carries_the_unlink_request() {
+        assert_eq!(main_url(MainPage::Home, None), "index.html?w=main&page=home");
+        assert_eq!(main_url(MainPage::History, None), "index.html?w=main&page=history");
+        assert_eq!(main_url(MainPage::Settings, Some("abc")), "index.html?w=main&page=settings#unlink=abc");
+    }
+
+    #[test]
+    fn a_main_page_round_trips_through_its_name() {
+        for page in [MainPage::Home, MainPage::History, MainPage::Settings] {
+            assert_eq!(MainPage::parse(page.name()), Some(page));
+        }
+        assert_eq!(MainPage::parse("drop"), None);
+        assert_eq!(MainPage::parse(""), None);
+        assert_eq!(MainPage::parse("Home"), None);
     }
 }

@@ -5,7 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { actionButton, el, flash, historyErrorText, size, when } from "./dom";
 import { emptyArt, icon } from "./icons";
-import { mountShell } from "./shell";
+import type { PageHost } from "./shell";
 
 type Item = {
   id: string;
@@ -46,8 +46,8 @@ function title(i: Item): string {
   return `${i.files} files`;
 }
 
-export function startHistoryWindow(root: HTMLElement): void {
-  const shell = mountShell(root, "history");
+export function startHistoryPage(host: PageHost): void {
+  const shell = host;
   const note = el("p", { className: "flash" });
   const list = el("div", { className: "items card" });
   shell.body.append(list, note);
@@ -122,7 +122,7 @@ export function startHistoryWindow(root: HTMLElement): void {
       busy = false;
     }
   };
-  void listen("history-changed", () => void refresh());
-  window.setInterval(() => void refresh(), 3000);
-  void refresh();
+  void listen("history-changed", () => host.visible() && void refresh());
+  host.every(3000, () => void refresh());
+  host.onShow(() => void refresh());
 }

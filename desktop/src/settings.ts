@@ -7,7 +7,7 @@ import { listen } from "@tauri-apps/api/event";
 import { effectiveMode, type Skin, type Theme } from "./appearance";
 import { button, el, flash, helpButton, sensitiveWhilePausedText } from "./dom";
 import { icon } from "./icons";
-import { mountShell } from "./shell";
+import type { PageHost } from "./shell";
 
 type Device = { deviceId: string; name: string; platform: string; connected: boolean };
 type Mirror = {
@@ -143,16 +143,30 @@ export function unlinkText(name: string, connected: boolean): string {
   );
 }
 
-export function startSettingsWindow(root: HTMLElement): void {
-  const shell = mountShell(root, "settings");
-  shell.sub.textContent = "Make Kin look and work the way you like.";
+// The tray's "Unlink phone…" asks for the confirmation of one device (`#unlink=<deviceId>` of the window's URL, or the `unlink-requested` event). `main.ts` passes
+// both on here, even while the page is hidden or not built yet: the page shows the confirmation when it is shown.
+let unlinkAsked: string | null = null;
+let unlinkHook: ((deviceId: string | null) => void) | null = null;
+
+/** Asks the Settings page to open the confirmation of Unlink for `deviceId` (anything but a device ID is ignored). */
+export function requestUnlink(deviceId: string): void {
+  const id = /^[A-Za-z0-9_-]{1,64}$/.test(deviceId) ? deviceId : null;
+  if (unlinkHook) unlinkHook(id);
+  else unlinkAsked = id;
+}
+
+export function startSettingsPage(host: PageHost): void {
+  host.sub.textContent = "Make Kin look and work the way you like.";
   const note = el("p", { className: "flash" });
   const body = el("div", { className: "settings" });
-  shell.body.append(body, note);
-  // The device whose "Unlink" confirmation is open. The tray's "Unlink phone…" opens the window with `#unlink=<deviceId>`, or tells an open one with an event.
-  let unlinkOpen: string | null = unlinkFromHash(window.location.hash);
-  // The device name was just saved: its button reads "Saved" until the name is edited again.
+  host.body.append(body, note);
+  // The device whose "Unlink" confirmation is open.
+  let unlinkOpen: string | null = unlinkAsked;
+  unlinkAsked = null;
+  // The device name was just saved: its button reads "Saved" until the name is edited again. `nameDraft` is what was typed and not saved yet, so it survives a redraw
+  // (such as the one when the page is shown again).
   let nameSaved = false;
+  let nameDraft: string | null = null;
 
   const call = async (command: string, args: Record<string, unknown> = {}): Promise<boolean> => {
     try {
@@ -253,9 +267,9 @@ export function startSettingsWindow(root: HTMLElement): void {
   };
 
   const draw = (v: View) => {
-    shell.setPc(v.deviceName, v.version);
+    host.setPc(v.deviceName, v.version);
     // device name
-    const name = el("input", { type: "text", id: "device-name", value: v.customDeviceName ?? "", placeholder: v.defaultDeviceName, maxLength: 64 });
+    const name = el("input", { type: "text", id: "device-name", value: nameDraft ?? v.customDeviceName ?? "", placeholder: v.defaultDeviceName, maxLength: 64 });
     // "Save" shows when the name differs from the saved one; after a save it stays as a disabled "Saved" until the next edit.
     let savedName = v.customDeviceName ?? "";
     const saveButton = button("Save", () => void saveName(), "small");
@@ -268,12 +282,16 @@ export function startSettingsWindow(root: HTMLElement): void {
     const saveName = async () => {
       if (name.value.trim() === savedName) return;
       nameSaved = await call("set_device_name", { name: name.value });
-      if (nameSaved) savedName = name.value.trim();
+      if (nameSaved) {
+        savedName = name.value.trim();
+        nameDraft = null;
+      }
       showSave();
       void refresh();
     };
     name.addEventListener("input", () => {
       nameSaved = false;
+      nameDraft = name.value;
       showSave();
     });
     name.addEventListener("keydown", (e) => {
@@ -445,15 +463,19 @@ export function startSettingsWindow(root: HTMLElement): void {
       busy = false;
     }
   };
-  void listen<string>("unlink-requested", (event) => {
-    unlinkOpen = /^[A-Za-z0-9_-]{1,64}$/.test(event.payload) ? event.payload : null;
-    void refresh();
-  });
+  // An unlink asked for while the page is hidden is kept and shown when the page is.
+  unlinkHook = (deviceId) => {
+    unlinkOpen = deviceId;
+    if (host.visible()) void refresh();
+  };
+  // A hidden page redraws when it is shown, so what happened meanwhile is not missed.
+  host.onShow(() => void refresh());
   void listen("settings-changed", () => {
     // Don't redraw while a field has the focus: that would throw away what is being typed.
-    if (!document.activeElement || document.activeElement === document.body) void refresh();
+    if (host.visible() && (!document.activeElement || document.activeElement === document.body)) void refresh();
   });
   // The look was changed (here, or by a script): the pictures and the choices follow.
-  void listen("appearance-changed", () => void refresh());
-  void refresh();
+  void listen("appearance-changed", () => {
+    if (host.visible()) void refresh();
+  });
 }
