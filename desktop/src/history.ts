@@ -5,6 +5,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { actionButton, el, flash, historyErrorText, size, when } from "./dom";
 import { emptyArt, icon } from "./icons";
+import { applyQuery } from "./historyFilter";
+import { mountHistoryFilter } from "./historyFilterPanel";
 import type { PageHost } from "./shell";
 
 type Item = {
@@ -50,10 +52,14 @@ function title(i: Item): string {
 }
 
 export function startHistoryPage(host: PageHost): void {
-  const shell = host;
   const note = el("p", { className: "flash" });
+  const above = el("div", { className: "fabove" });
   const list = el("div", { className: "items card" });
-  shell.body.append(list, note);
+  host.body.append(above, list, note);
+  // The Filter button, its popover and the chips live outside `list`, which draw() rebuilds, so typing in the search box keeps its focus.
+  let last: View | null = null;
+  const filter = mountHistoryFilter(host.acts, above, () => last && draw(last));
+  host.onHide(filter.close);
 
   const act = async (p: Promise<unknown>, done?: string) => {
     try {
@@ -108,11 +114,14 @@ export function startHistoryPage(host: PageHost): void {
 
   const draw = (view: View) => {
     const who = view.phone ? (view.connected ? `${view.phone} is connected.` : `${view.phone} is not connected.`) : "No phone is paired.";
-    shell.setPc(view.pcName, view.version);
-    shell.sub.textContent = `${who}${view.queued ? ` ${view.queued} waiting to be sent.` : ""} The newest ${view.cap} items are kept in this list.`;
-    list.classList.toggle("is-empty", view.items.length === 0);
+    host.setPc(view.pcName, view.version);
+    host.sub.textContent = `${who}${view.queued ? ` ${view.queued} waiting to be sent.` : ""} The newest ${view.cap} items are kept in this list.`;
+    last = view;
+    const shown = applyQuery(view.items, filter.query());
+    list.classList.toggle("is-empty", shown.length === 0);
     if (view.items.length === 0) list.replaceChildren(el("div", { className: "empty" }, emptyArt("history"), el("b", {}, "Nothing here yet"), el("p", {}, "Things you send and receive will show up here, newest first.")));
-    else list.replaceChildren(...view.items.map(row));
+    else if (shown.length === 0) list.replaceChildren(filter.nothingMatches());
+    else list.replaceChildren(...shown.map(row));
   };
 
   let busy = false;
