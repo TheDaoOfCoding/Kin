@@ -17,7 +17,10 @@ type Item = {
   totalBytes: number;
   error: string | null;
   files: number;
+  /** The first file names (up to 20). */
   names: string[];
+  /** The types of all its files, or `["text"]` or `["link"]` (history.rs `item_types`): what the Filter goes by. */
+  types: string[];
   text: string | null;
   isUrl: boolean;
   isLink: boolean;
