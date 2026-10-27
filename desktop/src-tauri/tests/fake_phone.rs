@@ -144,6 +144,29 @@ async fn ping_in_both_directions_and_duplicates() {
 }
 
 #[tokio::test]
+async fn probe_is_acked_shows_nothing_and_is_not_remembered() {
+    let mut w = World::new().await;
+    w.pair().await;
+    let mut ws = w.open_ws().await;
+    drain(&mut w.env.events);
+
+    // A liveness check (changelog 60): acked at once, every time, and nothing is shown.
+    let probe = json!({ "type": "probe", "id": "probe-1" });
+    send_json(&mut ws, &probe).await;
+    assert_eq!(next_json(&mut ws).await, json!({ "type": "ack", "ref": "probe-1" }));
+    send_json(&mut ws, &probe).await;
+    assert_eq!(next_json(&mut ws).await, json!({ "type": "ack", "ref": "probe-1" }));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(toasts(&drain(&mut w.env.events)).is_empty());
+
+    // Its id was not remembered: a ping with the same id is a new message, so it shows its toast (a remembered id would be a silent repeat).
+    send_json(&mut ws, &json!({ "type": "ping", "id": "probe-1", "sentAt": 1 })).await;
+    assert_eq!(next_json(&mut ws).await, json!({ "type": "ack", "ref": "probe-1" }));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(toasts(&drain(&mut w.env.events)), ["Ping from Test Phone"]);
+}
+
+#[tokio::test]
 async fn ping_without_a_phone_says_so() {
     let mut w = World::new().await;
     assert_eq!(w.core().ping_phone().await, PingReport::NotConnected);

@@ -109,6 +109,13 @@ interface LinkConnection : MirrorLink, MediaLink, PresenceLink {
     suspend fun ping(timeoutMillis: Long = 5_000L): PingResult
 
     /**
+     * Whether the PC still answers on this connection (protocol.md, `probe`): any reply to a `probe` proves it, an `ack` or an `error` such as
+     * `unsupported_type` from a PC that doesn't know the message. No reply in [timeoutMillis] means the connection is dead: it is abandoned (it ends,
+     * so the loop reconnects) and the answer is false. False also with no connection. True in tests that have no socket.
+     */
+    suspend fun probe(timeoutMillis: Long = 5_000L): Boolean = true
+
+    /**
      * Sends [frame] (whose `id` is [id]) and waits up to [timeoutMillis] for its `ack`. With no ack the
      * connection is treated as dead, as for any unacked message.
      */
@@ -315,6 +322,15 @@ class LinkSession(
         }
     }
 
+    /** Any reply proves the connection alive, also an `error` (`unsupported_type` from a PC that doesn't know `probe`). No reply: [sendAcked] has abandoned the socket. */
+    override suspend fun probe(timeoutMillis: Long): Boolean {
+        val id = MessageIds.newId()
+        return when (sendAcked(id, Frames.probe(id), timeoutMillis)) {
+            AckResult.Acked, is AckResult.Refused -> true
+            AckResult.NoReply, AckResult.NoConnection -> false
+        }
+    }
+
     override suspend fun sendAcked(id: String, frame: String, timeoutMillis: Long): AckResult {
         if (!isReady) return AckResult.NoConnection
         val reply = CompletableDeferred<Action>().also { pending[id] = it }
@@ -442,7 +458,7 @@ class LinkSession(
                 peerUnpaired = true
                 listener.onPeerUnpaired()
             }
-            is Action.IgnoreDuplicate, Action.CloseOnly, Action.Rejected -> Unit
+            is Action.IgnoreDuplicate, Action.AnswerProbe, Action.CloseOnly, Action.Rejected -> Unit
         }
         outcome.close?.let { closeOurs(it, "protocol") }
     }

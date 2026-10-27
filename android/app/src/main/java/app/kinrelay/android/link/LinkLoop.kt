@@ -21,6 +21,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** What the loop needs from the network it runs on. One environment per Wi-Fi network. */
 interface LinkEnvironment {
@@ -125,6 +126,8 @@ class LinkLoop(
     private var job: Job? = null
     @Volatile private var session: LinkConnection? = null
     @Volatile private var stopping = false
+    private val probing = AtomicBoolean(false)
+    @Volatile private var lastProbeEndedAt: Long? = null
 
     val currentSession: LinkConnection? get() = session
 
@@ -133,11 +136,48 @@ class LinkLoop(
         job = scope.launch { run() }
     }
 
-    /** The user did something: try again now, from the first backoff step. */
+    /**
+     * The user did something (opened Kin, unlocked the phone): try again now, from the first backoff step. While connected, the connection is
+     * probed instead ([probeConnection]): it may be one the PC closed long ago without the phone hearing it.
+     */
     fun userAction() {
-        if (mutableState.value is LinkState.Connected) return
+        if (mutableState.value is LinkState.Connected) {
+            probeConnection()
+            return
+        }
         backoff.reset()
         wake.trySend(Unit)
+    }
+
+    /**
+     * A connection can be half-open: the PC closed it (a message the sleeping phone never acked) and neither the close nor a TCP reset ever reached
+     * the phone, while the WebSocket ping that would notice runs on awake time and barely moves in sleep. A `probe` asks the PC itself: any reply
+     * keeps the connection, none in 5 s abandons it (the session ends) and the loop reconnects at once. One probe at a time, and none within
+     * [PROBE_INTERVAL_MILLIS] of the last one's end.
+     */
+    private fun probeConnection() {
+        val open = session ?: return
+        if (!probing.compareAndSet(false, true)) return
+        val last = lastProbeEndedAt
+        if (last != null && clock.elapsedMillis() - last < PROBE_INTERVAL_MILLIS) {
+            probing.set(false)
+            return
+        }
+        scope.launch {
+            val alive = try {
+                open.probe()
+            } finally {
+                lastProbeEndedAt = clock.elapsedMillis()
+                probing.set(false)
+            }
+            if (alive) {
+                log.i("link", "probe answered: the connection is alive")
+            } else {
+                log.i("link", "probe not answered: the connection was dead; reconnecting now")
+                backoff.reset()
+                wake.trySend(Unit)
+            }
+        }
     }
 
     /**
@@ -295,5 +335,8 @@ class LinkLoop(
 
         /** The longest wait between attempts while a transfer waits for the link. */
         const val WAITING_RETRY_MILLIS = 10_000L
+
+        /** A user action while connected probes the connection at most this often (the time since the last probe finished). */
+        const val PROBE_INTERVAL_MILLIS = 30_000L
     }
 }

@@ -27,6 +27,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -169,6 +170,51 @@ class LinkSessionTest {
         assertEquals(PingResult.NoConnection, blocking { session.ping() }) // opened, but the PC's hello has not been accepted
         session.closeNormally("test")
         assertTrue(pc.received.none { it.contains("\"ping\"") })
+    }
+
+    @Test
+    fun aProbeThatIsAckedIsTrueAndTheSessionStaysReady() {
+        val pc = pc()
+        val (session, _) = connected(pc)
+        assertTrue(blocking { session.probe() })
+        assertTrue(session.isReady)
+        pc.nextFrame() // hello
+        val probe = pc.nextFrame()!!
+        assertEquals("probe", probe.getValue("type").str())
+        assertEquals("only a type and an id", setOf("type", "id"), probe.keys)
+    }
+
+    @Test
+    fun aPcThatIgnoresTheProbeIsFalseAndTheSessionEndsWithinSixSeconds() {
+        // The PC closed this connection long ago (its own unacked message) and the phone never heard: only an application answer tells.
+        val pc = pc { ackProbes = false }
+        val (session, _) = connected(pc)
+        val started = System.nanoTime()
+        assertFalse(blocking { session.probe() })
+        val end = blocking { session.awaitEnd() }
+        val tookMillis = (System.nanoTime() - started) / 1_000_000
+        assertTrue("ended after $tookMillis ms", tookMillis < 6_500)
+        assertTrue(!session.isReady)
+        assertEquals(CloseAction.RECONNECT_WITH_BACKOFF, CloseRules.action(end.closeCode, end.upgradeStatus))
+    }
+
+    @Test
+    fun aPcThatDoesNotKnowTheProbeAnswersUnsupportedTypeAndThatProvesTheConnectionIsAlive() {
+        val pc = pc { probesUnknown = true }
+        val (session, _) = connected(pc)
+        assertTrue(blocking { session.probe() })
+        assertTrue(session.isReady)
+    }
+
+    @Test
+    fun aProbeWithoutAConnectionIsFalseAndSendsNothing() {
+        val pc = pc { sendHelloOnOpen = false }
+        val session = session(pc, Events())
+        assertFalse(blocking { session.probe() })
+        session.open()
+        assertFalse(blocking { session.probe() }) // opened, but the PC's hello has not been accepted
+        session.closeNormally("test")
+        assertTrue(pc.received.none { it.contains("\"probe\"") })
     }
 
     @Test

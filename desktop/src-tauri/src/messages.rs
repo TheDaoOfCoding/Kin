@@ -47,6 +47,9 @@ pub enum Action {
     },
     ShowErrorOnly,
     ShowPingToast,
+    /// A `probe` (changelog 60): the phone checks that the connection is alive. Acked at once (the reply), nothing else: nothing shown, nothing stored, the
+    /// `id` is not remembered.
+    AnswerProbe,
     /// A `text` message: put it on the clipboard and show it. (History comes in 1.4.) `sensitive`: no preview, never stored or logged.
     DeliverText {
         id: String,
@@ -140,6 +143,7 @@ impl Action {
             Action::MarkFailed { .. } => "mark_failed",
             Action::ShowErrorOnly => "show_error_only",
             Action::ShowPingToast => "show_ping_toast",
+            Action::AnswerProbe => "answer_probe",
             Action::DeliverText { .. } => "deliver_text",
             Action::DeliverLink { .. } => "deliver_link",
             Action::SetClipboard { .. } => "set_clipboard",
@@ -332,7 +336,7 @@ fn receivable(role: Role, ty: &str) -> bool {
         _ => {}
     }
     match ty {
-        "hello" | "ack" | "error" | "text" | "link" | "cancel" | "unpair" | "ping" => true,
+        "hello" | "ack" | "error" | "text" | "link" | "cancel" | "unpair" | "ping" | "probe" => true,
         "complete" => role == Role::Pc,
         "clipboard" | "offer" => role == Role::Phone,
         _ => false,
@@ -427,6 +431,7 @@ impl Receiver {
             "hello" => self.hello(&obj, reference),
             "ack" => ack(&obj),
             "error" => error(&obj),
+            "probe" => probe(reference),
             "ping" | "unpair" | "text" | "link" | "clipboard" | "offer" | "complete" | "cancel" => self.acked(ty, &obj, reference, dedup),
             _ => unreachable!("receivable() only lets known types through"),
         }
@@ -723,6 +728,14 @@ fn parse_offer(obj: &Map<String, Value>, id: &str) -> Option<Vec<OfferedFile>> {
         });
     }
     Some(out)
+}
+
+/// `probe` (changelog 60): only an `id`, acked at once. It skips the duplicate check: never looked up, never remembered (no database write).
+fn probe(reference: Option<&str>) -> Outcome {
+    match reference {
+        Some(id) => Outcome { reply: Some(ack_message(id)), action: Action::AnswerProbe, close: None },
+        None => bad_fields(None),
+    }
 }
 
 fn bad_fields(reference: Option<&str>) -> Outcome {

@@ -2,9 +2,11 @@ package app.kinrelay.android.link
 
 import android.app.NotificationManager
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Handler
@@ -37,6 +39,7 @@ class LinkService : Service() {
     private var runtime: LinkRuntime? = null
     @Volatile private var notificationFeed: LinkNotificationFeed? = null
     @Volatile private var destroyed = false
+    private var unlockReceiver: BroadcastReceiver? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -54,6 +57,16 @@ class LinkService : Service() {
             stopSelf()
             return
         }
+        // Unlocking the phone is a user action like opening Kin: while connected it probes the link, which may be one the PC closed during the
+        // phone's sleep (LinkLoop.userAction). No permission needed. Exported because SystemUI sends it, not the system uid that a not-exported
+        // receiver still hears; it is a protected broadcast, so no other app can send it.
+        val unlock = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (intent.action == Intent.ACTION_USER_PRESENT) graph.link.userAction()
+            }
+        }
+        ContextCompat.registerReceiver(this, unlock, IntentFilter(Intent.ACTION_USER_PRESENT), ContextCompat.RECEIVER_EXPORTED)
+        unlockReceiver = unlock
         scope.launch {
             val bootCount = Settings.Global.getInt(contentResolver, Settings.Global.BOOT_COUNT, -1)
             // Same single thread as the "stopped" marker of the previous run, so the two can't swap places.
@@ -117,6 +130,8 @@ class LinkService : Service() {
         // First of all: the collector runs on a background thread and can be in the middle of a change, and `runtime.stop()` / `Stopped` below are states it would turn into a post. After the feed is
         // destroyed no post can happen, however late it was queued (2B.4 and 2B.5 reviews; round 2 B1: this used to come after the stop and the notification stayed after an unlink).
         destroyed = true
+        unlockReceiver?.let { runCatching { unregisterReceiver(it) } }
+        unlockReceiver = null
         val feed = notificationFeed
         val stoppingRuntime = runtime
         LinkShutdown.run(

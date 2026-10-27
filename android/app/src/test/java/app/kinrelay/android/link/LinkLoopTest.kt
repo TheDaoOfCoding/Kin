@@ -36,6 +36,18 @@ class LinkLoopTest {
         override suspend fun ping(timeoutMillis: Long) = PingResult.NoConnection
         override suspend fun sendAcked(id: String, frame: String, timeoutMillis: Long) = AckResult.NoConnection
         override suspend fun sendUnpairAndClose() = Unit
+
+        var probes = 0
+        var probeAnswers = true
+        /** Holds the probe's answer back until completed (a probe in flight). */
+        var probeGate: CompletableDeferred<Unit>? = null
+        override suspend fun probe(timeoutMillis: Long): Boolean {
+            probes++
+            probeGate?.await()
+            // No reply: the real session abandons the socket, so the connection ends (it had been up for 10 s: not "stable").
+            if (!probeAnswers) ended.complete(end(null, helloFor = 10_000))
+            return probeAnswers
+        }
     }
 
     private class Env(private val scope: TestScope) : LinkEnvironment {
@@ -402,6 +414,102 @@ class LinkLoopTest {
         assertEquals("the disconnect is reported like any other", 1, host.disconnected.size)
         advance(3_600_000)
         assertEquals(1, env.sessions.size)
+    }
+
+    // ---------------------------------------------------------------- a user action while connected (a half-open link)
+
+    /** A loop connected to [known] with the hello accepted. */
+    private fun TestScope.connectedLoop(env: Env, host: Host = Host(listOf(known))): LinkLoop {
+        env.winners = setOf(known)
+        val loop = loop(env, host)
+        loop.start()
+        runCurrent()
+        env.sessions.single().listener.onHelloAccepted(peer)
+        runCurrent()
+        assertTrue(loop.state.value is LinkState.Connected)
+        return loop
+    }
+
+    @Test
+    fun aUserActionWhileConnectedProbesTheConnection() = runTest {
+        val env = Env(this)
+        val loop = connectedLoop(env)
+        loop.userAction()
+        runCurrent()
+        assertEquals(1, env.sessions.single().probes)
+        assertEquals("an answered probe leaves the connection alone", null, env.sessions.single().closedNormally)
+        assertEquals(LinkState.Connected("Desk PC", known), loop.state.value)
+        loop.stop("test")
+    }
+
+    @Test
+    fun aProbeThatFailsEndsTheConnectionAndTheLoopReconnectsAtOnce() = runTest {
+        val env = Env(this)
+        val loop = connectedLoop(env)
+        advance(10_000)
+        env.sessions[0].probeAnswers = false
+        val at = currentTime
+        loop.userAction()
+        runCurrent()
+        assertEquals(1, env.sessions[0].probes)
+        assertEquals("a new connection at once, not after a backoff step", 2, env.sessions.size)
+        assertEquals(at, env.sessionTimes[1])
+        loop.stop("test")
+    }
+
+    @Test
+    fun twoUserActionsWithin30SecondsProbeOnce() = runTest {
+        val env = Env(this)
+        val loop = connectedLoop(env)
+        val session = env.sessions.single()
+        loop.userAction()
+        runCurrent()
+        advance(LinkLoop.PROBE_INTERVAL_MILLIS - 1)
+        loop.userAction()
+        runCurrent()
+        assertEquals("the last probe finished less than 30 s ago", 1, session.probes)
+        advance(1)
+        loop.userAction()
+        runCurrent()
+        assertEquals(2, session.probes)
+        loop.stop("test")
+    }
+
+    @Test
+    fun onlyOneProbeIsInFlight() = runTest {
+        val env = Env(this)
+        val loop = connectedLoop(env)
+        val session = env.sessions.single()
+        val gate = CompletableDeferred<Unit>()
+        session.probeGate = gate
+        loop.userAction()
+        runCurrent()
+        advance(40_000)
+        loop.userAction()
+        runCurrent()
+        assertEquals(1, session.probes)
+        gate.complete(Unit)
+        runCurrent()
+        loop.userAction()
+        runCurrent()
+        assertEquals("the in-flight one just finished: still within 30 s", 1, session.probes)
+        loop.stop("test")
+    }
+
+    @Test
+    fun aUserActionWhileConnectingKeepsTodaysBehaviourAndProbesNothing() = runTest {
+        // A connection is open but the PC's hello hasn't been accepted: Connecting, so a user action only resets the backoff and wakes the loop.
+        val env = Env(this).apply { winners = setOf(known) }
+        val loop = loop(env, Host(listOf(known)))
+        loop.start()
+        runCurrent()
+        assertTrue(loop.state.value is LinkState.Connecting)
+        loop.userAction()
+        runCurrent()
+        assertEquals(0, env.sessions.single().probes)
+        assertEquals("the connection was not touched", null, env.sessions.single().closedNormally)
+        assertEquals(1, env.sessions.size)
+        loop.stop("test")
     }
 
     // ---------------------------------------------------------------- the network came back (1.4 review)

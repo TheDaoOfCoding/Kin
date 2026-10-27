@@ -87,6 +87,12 @@ object Frames {
         put("sentAt", sentAt)
     }
 
+    /** A liveness check (protocol.md, `probe`): the PC acks it and does nothing else. */
+    fun probe(id: String): String = obj {
+        put("type", "probe")
+        put("id", id)
+    }
+
     /**
      * An explicit send. The text goes out in its wire form ([wireText]). [sensitive] is written only when true (an optional
      * field is left out when absent). Returns null when the serialized frame is over 1 MiB: the sender switches to a `.txt`

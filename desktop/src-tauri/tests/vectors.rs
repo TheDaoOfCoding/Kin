@@ -468,6 +468,10 @@ const MESSAGES_SEQUENCE_SCOPE_2B3: &[&str] = &[
     "media-image-before-state",
     "media-invalid-state-keeps-the-connection-open",
 ];
+/// Changelog 60: `probe`, the phone's liveness check (acked at once, never remembered), received by both roles.
+const MESSAGES_VALID_SCOPE_PROBE: &[&str] = &["probe-*"];
+const MESSAGES_INVALID_SCOPE_PROBE: &[&str] = &["probe-*"];
+const MESSAGES_SEQUENCE_SCOPE_PROBE: &[&str] = &["probe-is-acked-and-not-remembered", "probe-to-the-phone-is-not-remembered"];
 const MESSAGES_SEQUENCE_SCOPE_1_2: &[&str] =
     &["handshake-then-text-then-duplicate", "invalid-message-keeps-connection-open", "rejected-message-id-is-not-remembered"];
 
@@ -507,14 +511,17 @@ fn messages_valid_and_invalid() {
             &with(&with(&with(MESSAGES_VALID_SCOPE, MESSAGES_VALID_SCOPE_1_2), MESSAGES_VALID_SCOPE_1_3), MESSAGES_VALID_SCOPE_2B1),
             MESSAGES_VALID_SCOPE_2B2,
         ),
-        &with(&with(MESSAGES_VALID_SCOPE_2B3, MESSAGES_VALID_SCOPE_2B4), MESSAGES_VALID_SCOPE_2B5),
+        &with(&with(&with(MESSAGES_VALID_SCOPE_2B3, MESSAGES_VALID_SCOPE_2B4), MESSAGES_VALID_SCOPE_2B5), MESSAGES_VALID_SCOPE_PROBE),
     );
     let invalid = with(
         &with(
             &with(&with(&with(MESSAGES_INVALID_SCOPE, MESSAGES_INVALID_SCOPE_1_2), MESSAGES_INVALID_SCOPE_1_3), MESSAGES_INVALID_SCOPE_2B1),
             MESSAGES_INVALID_SCOPE_2B2,
         ),
-        &with(&with(MESSAGES_INVALID_SCOPE_2B3, MESSAGES_INVALID_SCOPE_2B4), MESSAGES_INVALID_SCOPE_2B5),
+        &with(
+            &with(&with(MESSAGES_INVALID_SCOPE_2B3, MESSAGES_INVALID_SCOPE_2B4), MESSAGES_INVALID_SCOPE_2B5),
+            MESSAGES_INVALID_SCOPE_PROBE,
+        ),
     );
     for (key, scope) in [("valid", valid.as_slice()), ("invalid", invalid.as_slice())] {
         assert_patterns_match(key, scope, &names(&root[key]));
@@ -569,7 +576,10 @@ fn messages_sequences() {
             ),
             MESSAGES_SEQUENCE_SCOPE_2B2,
         ),
-        &with(&with(MESSAGES_SEQUENCE_SCOPE_2B3, MESSAGES_SEQUENCE_SCOPE_2B4), MESSAGES_SEQUENCE_SCOPE_2B5),
+        &with(
+            &with(&with(MESSAGES_SEQUENCE_SCOPE_2B3, MESSAGES_SEQUENCE_SCOPE_2B4), MESSAGES_SEQUENCE_SCOPE_2B5),
+            MESSAGES_SEQUENCE_SCOPE_PROBE,
+        ),
     );
     assert_patterns_match("sequences", &scope, &names(&root["sequences"]));
     let mut with_events = 0;
