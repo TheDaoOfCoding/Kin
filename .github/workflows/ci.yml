@@ -46,6 +46,7 @@ jobs:
         run: |
           bun install --frozen-lockfile
           bun run build
+          bun test tests
       - name: Windows app - fmt
         working-directory: desktop/src-tauri
         run: cargo fmt --check

@@ -336,3 +336,4 @@ main.debug > .flash { margin-top: 10px; }
 .fchip.fclear:hover { color: var(--on-surface); }
 .empty-act { margin-top: 14px; }
 .fopt:focus-visible, .flink:focus-visible, .fx:focus-visible, .fclear:focus-visible { outline: 2px solid var(--primary-text); outline-offset: 2px; }
+.fabove { display: contents; }
