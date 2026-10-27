@@ -24,6 +24,35 @@ use crate::transfers::Status;
 pub const HISTORY_CAP: usize = 500;
 /// A text item shows at most this much of its text.
 pub const TEXT_PREVIEW_CHARS: usize = 160;
+/// An item lists at most this many file names (a transfer can hold thousands). The History page filters and searches on these.
+pub const NAMES_PER_ITEM: usize = 20;
+
+/// The file types of the History filter: the type's id, then the extensions (lower case) that belong to it. Everything else, and a name
+/// without an extension, is `"other"`. The phone keeps its own copy of this table (`HistoryTypes.kt`), and both test the same sample names.
+const FILE_TYPES: &[(&str, &[&str])] = &[
+    ("photo", &["jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "bmp", "avif", "tif", "tiff"]),
+    ("video", &["mp4", "mov", "mkv", "webm", "avi", "m4v", "3gp", "wmv"]),
+    ("document", &["pdf", "doc", "docx", "odt", "rtf", "txt", "md", "xls", "xlsx", "ods", "csv", "ppt", "pptx", "odp", "epub"]),
+    ("app", &["apk", "apks", "xapk"]),
+];
+
+/// The type of a file by its last extension: `"photo"`, `"video"`, `"document"`, `"app"` or `"other"`.
+pub fn file_type(name: &str) -> &'static str {
+    let ext = name.rsplit_once('.').map_or("", |(_, e)| e).to_ascii_lowercase();
+    FILE_TYPES.iter().find(|(_, exts)| exts.contains(&ext.as_str())).map_or("other", |(t, _)| t)
+}
+
+/// The types an item belongs to, sorted and without repeats: those of all its files, or `["link"]` or `["text"]` for a text item (an alert
+/// is a text).
+fn item_types(r: &HistoryRow) -> Vec<&'static str> {
+    if r.kind == "text" {
+        return vec![if !r.is_alert && (r.is_link || r.is_url) { "link" } else { "text" }];
+    }
+    let mut types: Vec<&'static str> = r.files.iter().map(|f| file_type(&f.name)).collect();
+    types.sort_unstable();
+    types.dedup();
+    types
+}
 
 /// What a click on a history item does.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +93,37 @@ fn one_line(text: &str, max_chars: usize) -> String {
     clipboard::preview(&flat, max_chars)
 }
 
+fn item_json(r: &HistoryRow) -> Value {
+    let outgoing = r.direction == "out";
+    let can_retry = outgoing && r.status == "failed" && !r.retried;
+    json!({
+        "id": r.id,
+        "direction": r.direction,
+        "kind": r.kind,
+        "status": r.status,
+        "createdMs": r.created_at,
+        "finishedMs": r.finished_at,
+        "totalBytes": r.total_bytes,
+        "error": r.error_code,
+        "files": r.files.len(),
+        "names": r.files.iter().take(NAMES_PER_ITEM).map(|f| f.name.clone()).collect::<Vec<_>>(),
+        // For the filter of the page, which never sees every file name: the types of all the files.
+        "types": item_types(r),
+        "text": r.text.as_deref().map(|t| one_line(t, TEXT_PREVIEW_CHARS)),
+        "isUrl": r.is_url,
+        "isLink": r.is_link,
+        // 2B.5: a text the user's script sent as an alert ("Alert to Pixel 8"); a click still copies it, as for any text.
+        "isAlert": r.is_alert,
+        "title": r.title.as_deref().map(|t| one_line(t, TEXT_PREVIEW_CHARS)),
+        "retryOf": r.retry_of.as_deref().map(short_transfer),
+        "retried": r.retried,
+        "canOpen": !matches!(open_action(r), OpenAction::Nothing),
+        "opensText": r.kind == "text",
+        "canRetry": can_retry,
+        "canCancel": outgoing && matches!(r.status.as_str(), "queued" | "active"),
+    })
+}
+
 impl Core {
     /// What grows without limit is trimmed (at start and every hour): the rows of `sends` older than 90 days, and the **bodies** of texts beyond the
     /// newest 500 items, which is all the history shows. The `transfers` rows themselves stay for good (a transfer ID is never reused), and
@@ -86,7 +146,7 @@ impl Core {
             Vec::new()
         });
         let snap = self.snapshot();
-        let items: Vec<Value> = rows.iter().map(|r| self.history_item_json(r)).collect();
+        let items: Vec<Value> = rows.iter().map(item_json).collect();
         json!({
             "items": items,
             "cap": HISTORY_CAP,
@@ -96,35 +156,6 @@ impl Core {
             // For the sidebar the window shares with the drop and settings windows.
             "pcName": self.pc_name(),
             "version": crate::core::APP_VERSION,
-        })
-    }
-
-    fn history_item_json(&self, r: &HistoryRow) -> Value {
-        let outgoing = r.direction == "out";
-        let can_retry = outgoing && r.status == "failed" && !r.retried;
-        json!({
-            "id": r.id,
-            "direction": r.direction,
-            "kind": r.kind,
-            "status": r.status,
-            "createdMs": r.created_at,
-            "finishedMs": r.finished_at,
-            "totalBytes": r.total_bytes,
-            "error": r.error_code,
-            "files": r.files.len(),
-            "names": r.files.iter().take(3).map(|f| f.name.clone()).collect::<Vec<_>>(),
-            "text": r.text.as_deref().map(|t| one_line(t, TEXT_PREVIEW_CHARS)),
-            "isUrl": r.is_url,
-            "isLink": r.is_link,
-            // 2B.5: a text the user's script sent as an alert ("Alert to Pixel 8"); a click still copies it, as for any text.
-            "isAlert": r.is_alert,
-            "title": r.title.as_deref().map(|t| one_line(t, TEXT_PREVIEW_CHARS)),
-            "retryOf": r.retry_of.as_deref().map(short_transfer),
-            "retried": r.retried,
-            "canOpen": !matches!(open_action(r), OpenAction::Nothing),
-            "opensText": r.kind == "text",
-            "canRetry": can_retry,
-            "canCancel": outgoing && matches!(r.status.as_str(), "queued" | "active"),
         })
     }
 
@@ -244,6 +275,61 @@ mod tests {
             assert_eq!(open_action(&row("text", status, &[])), OpenAction::CopyText, "{status}");
         }
         assert_eq!(open_action(&row("file", "done", &[])), OpenAction::Nothing);
+    }
+
+    fn named_row(kind: &str, names: &[&str]) -> HistoryRow {
+        let mut r = row(kind, "done", &[]);
+        r.files = names.iter().map(|n| HistoryFile { name: (*n).into(), size: 1, local_path: None, finalized: true }).collect();
+        r
+    }
+
+    #[test]
+    fn a_file_has_the_type_of_its_last_extension() {
+        // The same samples as the phone's HistoryTest, so the two tables stay equal.
+        for (name, ty) in [
+            ("IMG_1.JPG", "photo"),
+            ("clip.MOV", "video"),
+            ("Report.pdf", "document"),
+            ("kin.apk", "app"),
+            ("song.mp3", "other"),
+            ("archive.tar.gz", "other"),
+            ("README", "other"),
+            ("photo.jpeg.exe", "other"),
+            ("trailing.", "other"),
+            (".jpg", "photo"),
+        ] {
+            assert_eq!(file_type(name), ty, "{name}");
+        }
+    }
+
+    #[test]
+    fn an_item_lists_the_types_of_all_its_files_sorted() {
+        assert_eq!(item_types(&named_row("file", &["b.pdf", "a.jpg", "c.JPG"])), vec!["document", "photo"]);
+        assert_eq!(item_types(&named_row("file", &["kin.apk", "x.zip", "y.mp4"])), vec!["app", "other", "video"]);
+        let mut link = named_row("text", &[]);
+        link.is_url = true;
+        link.is_link = true;
+        assert_eq!(item_types(&link), vec!["link"]);
+        let mut bare_url = named_row("text", &[]);
+        bare_url.is_url = true;
+        assert_eq!(item_types(&bare_url), vec!["link"]);
+        let mut alert = named_row("text", &[]);
+        alert.is_alert = true;
+        assert_eq!(item_types(&alert), vec!["text"]);
+        assert_eq!(item_types(&named_row("text", &[])), vec!["text"]);
+    }
+
+    #[test]
+    fn an_item_lists_at_most_twenty_names_but_the_types_of_every_file() {
+        let names: Vec<String> = (0..29).map(|i| format!("p{i}.png")).chain(["last.pdf".to_string()]).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let r = named_row("file", &refs);
+        assert_eq!(r.files.len(), 30);
+        assert_eq!(item_types(&r), vec!["document", "photo"]);
+        let json = item_json(&r);
+        assert_eq!(json["names"].as_array().map(Vec::len), Some(20));
+        assert_eq!(json["files"], 30);
+        assert_eq!(json["types"], serde_json::json!(["document", "photo"]));
     }
 
     #[test]
