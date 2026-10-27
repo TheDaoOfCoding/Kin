@@ -69,6 +69,10 @@ class FakePc(
     @Volatile var helloCapabilities: List<String>? = null
     @Volatile var ackPings = true
 
+    /** What the PC does with a `probe`: ack it (false: say nothing, a PC that closed this connection long ago), or answer `unsupported_type` like a PC that doesn't know it. */
+    @Volatile var ackProbes = true
+    @Volatile var probesUnknown = false
+
     /** What the PC does with a `text` from the phone: ack it, say nothing, or answer with this `error` code. */
     @Volatile var ackTexts = true
     @Volatile var errorForText: String? = null
@@ -178,6 +182,13 @@ class FakePc(
             files.onFrame(frame)?.let { webSocket.send(it) }
             when (type) {
                 "ping" -> if (ackPings && id != null) webSocket.send("""{"type":"ack","ref":"$id"}""")
+                "probe" -> if (id != null) {
+                    if (probesUnknown) {
+                        webSocket.send("""{"type":"error","ref":"$id","code":"unsupported_type","message":"Unknown message type."}""")
+                    } else if (ackProbes) {
+                        webSocket.send("""{"type":"ack","ref":"$id"}""")
+                    }
+                }
                 "text" -> if (id != null) {
                     val error = errorForText
                     if (error != null) {

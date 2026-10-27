@@ -32,6 +32,9 @@ sealed class Action(val category: String) {
     class MarkFailed(val ref: String, val code: String, val message: String) : Action("mark_failed")
     class ShowErrorOnly(val code: String, val message: String) : Action("show_error_only")
     class ShowPing(val id: String) : Action("show_ping_toast")
+
+    /** A `probe` (a liveness check, protocol.md): acked at once and nothing else. Nothing shown, nothing stored, the ID not remembered. */
+    data object AnswerProbe : Action("answer_probe")
     class DeliverText(val id: String, val text: String, val isUrl: Boolean, val sensitive: Boolean) : Action("deliver_text")
     class SetClipboard(val id: String, val text: String) : Action("set_clipboard")
 
@@ -174,7 +177,7 @@ class MessageReceiver(
     val helloAccepted: Boolean get() = peer != null
 
     private val handled: Set<String> = buildSet {
-        addAll(listOf("hello", "ack", "error", "ping", "unpair", "text", "link", "cancel"))
+        addAll(listOf("hello", "ack", "error", "ping", "probe", "unpair", "text", "link", "cancel"))
         // 2B.3: both sides send and receive every `media.*` type (each is the source of one direction and the viewer of the other).
         addAll(MediaWire.TYPES)
         // 2B.4: both sides send and receive `presence`; only the phone receives `ring.start`/`ring.stop`, only the PC receives `ring.status`.
@@ -254,6 +257,7 @@ class MessageReceiver(
             "ack" -> onAck(frame)
             "error" -> onError(frame)
             "ping" -> onPing(frame, ref)
+            "probe" -> onProbe(ref)
             "text" -> onText(frame, ref)
             "link" -> onLink(frame, ref)
             "clipboard" -> onClipboard(frame, ref)
@@ -315,6 +319,12 @@ class MessageReceiver(
             return rejected(ErrorCodes.BAD_REQUEST, "The ping needs an id and a sentAt.", ref)
         }
         return processOnce(ref, Action.ShowPing(ref))
+    }
+
+    /** `probe`: only an `id`, acked at once. It skips the duplicate check: never looked up, never remembered (no database write). */
+    private fun onProbe(ref: String?): Outcome {
+        if (ref == null) return rejected(ErrorCodes.BAD_REQUEST, "The probe needs an id.", ref)
+        return Outcome(listOf(Frames.ack(ref)), null, Action.AnswerProbe)
     }
 
     private fun onText(frame: JsonObject, ref: String?): Outcome {

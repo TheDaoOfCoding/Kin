@@ -102,6 +102,14 @@ The cases have a `to` role, and a receiver of that role has to answer them: `tex
 
 `check-vectors.ts` checks that every name above matches a case (the `scope-2b.5` group).
 
+**`probe` (changelog 60).** The liveness check the phone sends when the user opens Kin or unlocks the phone. Both sides run these on top of everything above.
+
+| File | In scope for `probe` |
+|---|---|
+| `messages.json` | `valid[]`, `invalid[]`: `probe-*`. `sequences[]`: `probe-is-acked-and-not-remembered`, `probe-to-the-phone-is-not-remembered`. Both roles are receivers; a valid probe is acked with `expect.action` `answer_probe`, a repeat is answered again (never `ignore_duplicate`) and its `id` is not remembered. |
+
+`check-vectors.ts` checks that every name above matches a case (the `scope-probe` group).
+
 ## Common format
 
 Every file is one JSON object. It starts with `description`, `specVersion` (the protocol version, `1`) and sometimes `howToRead`, then one or more arrays of cases. Every case has a `name` that is unique inside its array, and some have a `note` explaining why the case exists.

@@ -560,6 +560,8 @@ const DIRECTION: Record<string, Role | "both"> = {
   presence: "both", "ring.start": "pc", "ring.stop": "pc", "ring.status": "phone",
   // changelog 59: an alert goes from the PC to the phone only
   alert: "pc",
+  // a liveness check (changelog 60): both ways, acked, never remembered
+  probe: "both",
 };
 // notif.action is the one notif message that is acked; the other six are ephemeral (no ack, no de-duplication, never stored).
 // ring.start and ring.stop (changelog 58) are acked like notif.action; presence and ring.status are ephemeral.
@@ -573,6 +575,7 @@ const ACTION: Record<string, string> = {
   "media.status": "media_status", "media.state": "media_state", "media.image": "media_image", "media.clear": "media_clear", "media.volume": "media_volume", "media.cmd": "media_cmd",
   presence: "presence", "ring.start": "ring_start", "ring.stop": "ring_stop", "ring.status": "ring_status",
   alert: "deliver_alert",
+  probe: "answer_probe",
 };
 const MAX_PRESENCE_FRAME = 4096; // a presence or ring.status frame over this is error too_large (ring.status: the 2 KiB of every ring.* frame)
 const MAX_RING_FRAME = 2048;
@@ -660,6 +663,7 @@ function validateFields(type: string, o: any, badInts: Set<string>): boolean {
     case "cancel": return id() && isStr(o.transferId) && TRANSFER_ID.test(o.transferId) && isStr(o.reason);
     case "unpair": return id();
     case "ping": return id() && int("sentAt");
+    case "probe": return id();
     case "ring.start": case "ring.stop": return id();
     // changelog 59: text is a string that is not empty after cleaning; title and waitedMs are optional (null counts as absent)
     case "alert": return id() && isStr(o.text) && cleanLinkText(o.text, MAX_ALERT_TEXT) !== null && (o.title === undefined || o.title === null || isStr(o.title)) && (o.waitedMs === undefined || o.waitedMs === null || int("waitedMs"));
@@ -1492,6 +1496,8 @@ class Receiver {
     }
     // ack and error are never acked and have no id; an error without a ref has nothing to mark failed
     if (type === "error") return { reply: "none", action: o.ref ? "mark_failed" : "show_error_only", close: null };
+    // changelog 60: a probe is acked at once and does nothing else; it skips step 8 (never looked up, never remembered)
+    if (type === "probe") return { reply: "ack", ref: o.id, action: ACTION.probe, close: null };
     if (!ACKED.has(type)) return { reply: "none", action: ACTION[type], close: null };
     // step 8
     const seenKey = `${this.device}|${o.id}`;
@@ -3561,6 +3567,27 @@ function downloadAlertModel(c: any): any[] {
   const presence = load("presence.json");
   check(g, "presenceDnd[] is in presence.json", Array.isArray(presence.presenceDnd) && presence.presenceDnd.length >= 20);
   console.log(`milestone 2B.5 scope: ${inScope} alert cases in messages.json, plus alerts.json and presenceDnd[]`);
+}
+
+{
+  const g = "scope-probe";
+  const messages = load("messages.json");
+  const matches = (name: string, p: string) => (p.endsWith("*") ? name.startsWith(p.slice(0, -1)) : name === p);
+  const SCOPE: [string, any[], string[], number][] = [
+    ["messages.valid", messages.valid, ["probe-*"], 3],
+    ["messages.invalid", messages.invalid, ["probe-*"], 5],
+    ["messages.sequences", messages.sequences, ["probe-is-acked-and-not-remembered", "probe-to-the-phone-is-not-remembered"], 2],
+  ];
+  let inScope = 0;
+  for (const [label, cases, patterns, atLeast] of SCOPE) {
+    for (const p of patterns) check(g, `${label}: "${p}" matches a case`, cases.some((c) => matches(c.name, p)));
+    const hits = cases.filter((c) => patterns.some((p) => matches(c.name, p)));
+    inScope += hits.length;
+    check(g, `${label}: at least ${atLeast} cases in scope`, hits.length >= atLeast, () => String(hits.length));
+  }
+  check(g, "every valid probe is acked with answer_probe", messages.valid.filter((c: any) => c.frame?.type === "probe").every((c: any) => c.expect.reply === "ack" && c.expect.action === "answer_probe"));
+  check(g, "no probe step is ignore_duplicate", messages.sequences.flatMap((s: any) => s.steps).filter((st: any) => st.frame?.type === "probe").every((st: any) => st.expect.action !== "ignore_duplicate"));
+  console.log(`probe scope: ${inScope} probe cases in messages.json`);
 }
 
 // ---- fixtures/: DER certificates for the negative tls[] cases (made by fixtures/make-fixtures.ts)

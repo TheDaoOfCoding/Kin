@@ -43,6 +43,8 @@ class MessageVectorsTest {
         "presence-*", "ring-*",
         // 2B.5 (`alert` is PC to phone: the phone is the receiver)
         "alert-*",
+        // changelog 60: `probe` goes both ways, acked and never remembered
+        "probe-*",
     )
     private val invalidScope = listOf(
         "first-message-*", "hello-*", "ack-*", "error-*", "unpair-missing-id", "ping-*", "type-*",
@@ -63,6 +65,8 @@ class MessageVectorsTest {
         "presence-*", "ring-*",
         // 2B.5
         "alert-*",
+        // changelog 60
+        "probe-*",
     )
     private val sequenceScope = listOf(
         "second-hello-after-handshake-is-a-normal-message", "invalid-hello-does-not-count-as-accepted",
@@ -97,6 +101,8 @@ class MessageVectorsTest {
         "ring-start-is-not-resent-after-reconnect", "ring-start-is-acked-once", "ring-status-is-ephemeral", "ring-disabled-error-is-not-remembered",
         // 2B.5
         "alert-is-queued-and-acked", "alert-repeat-gets-the-first-answer", "alert-rate-limited-fails-the-item", "alert-quiet-when-paused", "alert-capability-is-the-senders-rule", "alert-expires-locally",
+        // changelog 60
+        "probe-is-acked-and-not-remembered", "probe-to-the-phone-is-not-remembered",
     )
 
     /** The invalid-UTF-8 case can only be checked on the PC side: OkHttp never shows the bad bytes. */

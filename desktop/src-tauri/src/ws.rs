@@ -353,6 +353,8 @@ impl Conn {
             Action::RingCommand { .. } => {}
             // An `alert` goes PC to phone only too (changelog 59): the PC answers `unsupported_type` before it gets here.
             Action::DeliverAlert { .. } => {}
+            // A `probe`: the `ack` that went out is all of it.
+            Action::AnswerProbe => {}
             // `clipboard` and `offer` only go PC to phone: the receiver answers `unsupported_type` before it gets here.
             Action::None
             | Action::ShowErrorOnly
