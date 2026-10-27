@@ -297,7 +297,7 @@ fn setup(app: &mut tauri::App, parsed: Parsed, aumid: std::result::Result<(), St
             loop {
                 tick.tick().await;
                 if core.has_active_transfers() {
-                    // The tray's tooltip ("sending 45%"), `status.json` and the drop window all follow the numbers.
+                    // The tray's tooltip ("sending 45%"), `status.json` and the main window all follow the numbers.
                     refresh(&handle, &core);
                     ui::transfers_changed(&handle);
                 }
@@ -326,7 +326,7 @@ fn start_native_pipe(app: &tauri::App, core: &Arc<Core>) -> Option<PipeServer> {
     let suffix = std::env::var("KIN_DEV_PIPE_SUFFIX").ok();
     let name = kind.pipe_name(&sid, suffix.as_deref());
     let handle = app.handle().clone();
-    // "Open Kin" of the extension: the window that shows pairing, or the drop window ("Send to phone"), Kin's one main window.
+    // "Open Kin" of the extension: the window that shows pairing, or the main window (on Home), Kin's one main window.
     let open: OpenHook = Arc::new(move |target| {
         // A request can arrive in the moment before the app's state is set up: then there is nothing to open yet.
         if handle.try_state::<AppState>().is_none() {
@@ -334,7 +334,7 @@ fn start_native_pipe(app: &tauri::App, core: &Arc<Core>) -> Option<PipeServer> {
         }
         match target {
             OpenTarget::Pairing => ui::open_pairing_window(&handle, true),
-            OpenTarget::Main => ui::open_drop_window(&handle),
+            OpenTarget::Main => ui::open_main(&handle, ui::MainPage::Home, None),
         }
     });
     let api = Arc::new(Api::new(core.clone(), Arc::new(HttpFetcher::new()), Some(open)));
@@ -695,12 +695,12 @@ pub fn on_menu(app: &AppHandle, id: &str) {
         tray::MENU_RESUME => handle_commands(app, &[Command::Pause(None)]),
         tray::MENU_RING => handle_commands(app, &[Command::Ring]),
         tray::MENU_RING_STOP => handle_commands(app, &[Command::RingStop]),
-        // The Settings window, with the confirmation of "Unlink" already open for the phone the tray talks about.
+        // The main window on Settings, with the confirmation of "Unlink" already open for the phone the tray talks about.
         tray::MENU_UNLINK => {
             if let Some(state) = app.try_state::<AppState>()
                 && let Some(device) = state.core.snapshot().headline_device()
             {
-                ui::open_unlink(app, &device.device_id);
+                ui::open_main(app, ui::MainPage::Settings, Some(&device.device_id));
             }
         }
         tray::MENU_PAIR => handle_commands(app, &[Command::Pair]),
@@ -749,9 +749,9 @@ pub fn handle_commands(app: &AppHandle, commands: &[Command]) {
                     core.send_paths(paths, "command").await;
                 });
             }
-            Command::Drop => ui::open_drop_window(app),
-            Command::History => ui::open_history_window(app),
-            Command::Settings => ui::open_settings_window(app),
+            Command::Drop => ui::open_main(app, ui::MainPage::Home, None),
+            Command::History => ui::open_main(app, ui::MainPage::History, None),
+            Command::Settings => ui::open_main(app, ui::MainPage::Settings, None),
             Command::DebugWindow => ui::open_debug_window(app),
             Command::DevDumpView(name) => {
                 let (app, name) = (app.clone(), name.clone());

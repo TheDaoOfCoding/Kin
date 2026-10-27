@@ -1,7 +1,0 @@
-{
-  "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "history-window",
-  "description": "The history window: it listens for the app's events and may call only its own commands, nothing else",
-  "windows": ["history"],
-  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten", "allow-history-view", "allow-history-open", "allow-history-cancel", "allow-history-retry", "allow-open-window", "allow-appearance-view", "allow-close-window"]
-}

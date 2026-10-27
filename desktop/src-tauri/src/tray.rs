@@ -1,5 +1,5 @@
 //! The tray icon: its icon and tooltip show the state (not paired, phone connected with its battery, phone offline with the time it was last seen and its last
-//! battery, whether this PC or the phone is paused, and the progress of a transfer), a left click opens the drop window (a Shift-click opens the debug window), and the
+//! battery, whether this PC or the phone is paused, and the progress of a transfer), a left click opens the main window (Home) (a Shift-click opens the debug window), and the
 //! menu is the one of docs/windows.md: the status line, "Send files...", "Send clipboard to phone", "Pause Kin" (or "Resume Kin"), "Ring my phone" (or "Stop ringing
 //! phone"), "Pair new phone", "Unlink phone...", "Open received folder", "History", "Settings" and "Quit". (Pinging the phone, the clipboard sync switch and the log
 //! folder are in the windows or on the command line.)
@@ -329,14 +329,14 @@ pub fn build(app: &App, snapshot: &Snapshot) -> tauri::Result<Tray> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| crate::app::on_menu(app, event.id().as_ref()))
-        // A left click opens the drop window: Windows doesn't support dropping files on a tray icon, so this window is the target. With
+        // A left click opens the main window (on Home): Windows doesn't support dropping files on a tray icon, so Home is the target. With
         // Shift held it opens the debug window instead (it is also reachable from the Settings window).
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
                 if shift_is_down() {
                     crate::ui::open_debug_window(tray.app_handle());
                 } else {
-                    crate::ui::open_drop_window(tray.app_handle());
+                    crate::ui::open_main(tray.app_handle(), crate::ui::MainPage::Home, None);
                 }
             }
         })

@@ -1,7 +1,7 @@
-# Drops a file on the real drop window, as a person would: a real OLE drag-and-drop (`DoDragDrop` with a file list) from a small window
-# of this script's own onto the Kin drop window, with the mouse moved by the script. The fake phone must then get an `offer` for the
+# Drops a file on the real main window (Home, and then again with the window on History), as a person would: a real OLE drag-and-drop (`DoDragDrop` with a file list) from a small window
+# of this script's own onto the Kin main window (titled "Kin"), with the mouse moved by the script. The fake phone must then get an `offer` for the
 # file and download it. (`check-1-3.ps1` covers everything else; this is its own script because it moves the mouse pointer for about
-# a second, so don't touch the mouse while it runs.)
+# a second, so don't touch the mouse while it runs.) A drag that enters while the window shows History switches it to Home: the file is sent either way.
 #
 #   cd desktop; powershell -STA -ExecutionPolicy Bypass -File check-dragdrop.ps1
 #
@@ -53,66 +53,79 @@ try {
     $log = Join-Path $work 'phone.log'
     $phoneProc = Start-Process $phoneExe -ArgumentList $url, '--host', '127.0.0.1', '--seconds', '90', '--save-dir', ('"{0}"' -f $save) -RedirectStandardOutput $log -NoNewWindow -PassThru
     for ($i = 0; $i -lt 50 -and -not ((Get-Content -LiteralPath (Join-Path $data 'status.json') -Raw) -match 'phone_connected'); $i++) { Start-Sleep -Milliseconds 200 }
-    # Pairing opens the "New device paired" window in the middle of the screen, where the drop window opens too. Close it, so that the drop
-    # lands on the drop window.
+    # Pairing opens the "New device paired" window in the middle of the screen, where the main window opens too. Close it, so that the drop
+    # lands on the main window.
     Start-Sleep -Seconds 2
     $paired = [Windows.Automation.AutomationElement]::RootElement.FindFirst([Windows.Automation.TreeScope]::Children, (Our-Window-Condition 'Pair new phone'))
     if ($paired) { $paired.GetCurrentPattern([Windows.Automation.WindowPattern]::Pattern).Close(); Start-Sleep -Milliseconds 800 }
+    # Drags $file from a small window of ours onto the middle of the main window and waits for the fake phone to download it. $label names the check.
+    function Drop-File([string]$file, [string]$label) {
+        $win = $null
+        for ($i = 0; $i -lt 40 -and -not $win; $i++) {
+            $win = [Windows.Automation.AutomationElement]::RootElement.FindFirst([Windows.Automation.TreeScope]::Children, (Our-Window-Condition 'Kin'))
+            if (-not $win) { Start-Sleep -Milliseconds 250 }
+        }
+        Check "the main window is open ($label)" ([bool]$win)
+        Start-Sleep -Seconds 2   # the page has to load before it listens for the drop (a person needs more than that to get the file there)
+        $r = $win.Current.BoundingRectangle
+        $target = @([int]($r.X + $r.Width / 2), [int]($r.Y + 130))   # the dashed zone on Home; on History a spot of the list: the drop is taken by the whole window
+        # A small window of ours, in the top left corner of the screen, that the drag starts from.
+        $form = New-Object Windows.Forms.Form
+        $form.FormBorderStyle = 'None'; $form.StartPosition = 'Manual'; $form.Location = New-Object Drawing.Point 20, 20; $form.Size = New-Object Drawing.Size 120, 60
+        $form.TopMost = $true; $form.BackColor = [Drawing.Color]::SteelBlue; $form.ShowInTaskbar = $false
+        $null = $form.Show(); [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 300
+        $data_object = New-Object Windows.Forms.DataObject ([Windows.Forms.DataFormats]::FileDrop), ([string[]]@($file))
+        # Button down on our own window, then DoDragDrop (it runs a loop until the button is released), with the pointer moved by a timer.
+        # Windows sometimes ends the drag at once when the button press hasn't reached the window yet, so it is tried again (up to three times).
+        $effect = 'None'
+        for ($attempt = 1; $attempt -le 3 -and $effect -eq 'None'; $attempt++) {
+            # A click first, so that the window of ours has the focus and the mouse (a drag from a window that has neither ends at once).
+            $null = [Mouse6]::SetForegroundWindow($form.Handle); $null = $form.Activate(); [Windows.Forms.Application]::DoEvents()
+            $null = [Mouse6]::SetCursorPos(60, 40); Start-Sleep -Milliseconds 300
+            [Mouse6]::Down(); Start-Sleep -Milliseconds 100; [Mouse6]::Up(); Start-Sleep -Milliseconds 300
+            [Windows.Forms.Application]::DoEvents()
+            [Mouse6]::Down(); Start-Sleep -Milliseconds 200
+            $script:steps = 0
+            $timer = New-Object Windows.Forms.Timer; $timer.Interval = 30
+            $timer.Add_Tick({
+                $script:steps++
+                $t = [math]::Min(1.0, $script:steps / 25.0)
+                $null = [Mouse6]::SetCursorPos([int](60 + ($target[0] - 60) * $t), [int](40 + ($target[1] - 40) * $t))
+                if ($script:steps -eq 40) { [Mouse6]::Up() }
+            })
+            $timer.Start()
+            $effect = [string]$form.DoDragDrop($data_object, [Windows.Forms.DragDropEffects]::Copy)
+            $timer.Stop(); [Mouse6]::Up()
+            Write-Host "  attempt ${attempt}: the drag ended with effect $effect after $($script:steps) timer ticks"
+            if ($effect -eq 'None') { Start-Sleep -Milliseconds 500 }
+        }
+        $form.Close()
+        $name = Split-Path -Leaf $file
+        $got = $false
+        for ($i = 0; $i -lt 40 -and -not $got; $i++) { $got = ((Get-Content -LiteralPath $log -Raw) -match ('downloaded ' + [regex]::Escape($name))); if (-not $got) { Start-Sleep -Milliseconds 250 } }
+        Check "the phone was offered the dropped file and downloaded it ($label)" $got
+        if (-not $got) {
+            Write-Host '  --- the end of the PC log:'; Get-Content -LiteralPath (Join-Path $data 'logs\kin.log') -ErrorAction SilentlyContinue | Select-Object -Last 8 | ForEach-Object { Write-Host "    $_" }
+            Write-Host '  --- the end of the phone log:'; Get-Content -LiteralPath $log -ErrorAction SilentlyContinue | Select-Object -Last 5 | ForEach-Object { Write-Host "    $_" }
+        }
+        Check "the downloaded bytes are the file's ($label)" ((Test-Path (Join-Path $save $name)) -and ((Get-FileHash $file).Hash -eq (Get-FileHash (Join-Path $save $name)).Hash))
+    }
+
+    # 1. the window on Home (the drop zone is under the pointer)
     $file = Join-Path $work 'dropped.txt'
-    [IO.File]::WriteAllText($file, "dropped on the drop window`n")
+    [IO.File]::WriteAllText($file, "dropped on the main window`n")
     Invoke-Kin --drop
-    $win = $null
-    for ($i = 0; $i -lt 40 -and -not $win; $i++) {
-        $win = [Windows.Automation.AutomationElement]::RootElement.FindFirst([Windows.Automation.TreeScope]::Children, (Our-Window-Condition 'Send to phone'))
-        if (-not $win) { Start-Sleep -Milliseconds 250 }
-    }
-    Check 'the drop window is open' ([bool]$win)
-    Start-Sleep -Seconds 2   # the page has to load before it listens for the drop (a person needs more than that to get the file there)
-    $r = $win.Current.BoundingRectangle
-    $target = @([int]($r.X + $r.Width / 2), [int]($r.Y + 130))   # the dashed zone
-    # A small window of ours, in the top left corner of the screen, that the drag starts from.
-    $form = New-Object Windows.Forms.Form
-    $form.FormBorderStyle = 'None'; $form.StartPosition = 'Manual'; $form.Location = New-Object Drawing.Point 20, 20; $form.Size = New-Object Drawing.Size 120, 60
-    $form.TopMost = $true; $form.BackColor = [Drawing.Color]::SteelBlue; $form.ShowInTaskbar = $false
-    $null = $form.Show(); [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 300
-    $data_object = New-Object Windows.Forms.DataObject ([Windows.Forms.DataFormats]::FileDrop), ([string[]]@($file))
-    # Button down on our own window, then DoDragDrop (it runs a loop until the button is released), with the pointer moved by a timer.
-    # Windows sometimes ends the drag at once when the button press hasn't reached the window yet, so it is tried again (up to three times).
-    $effect = 'None'
-    for ($attempt = 1; $attempt -le 3 -and $effect -eq 'None'; $attempt++) {
-        # A click first, so that the window of ours has the focus and the mouse (a drag from a window that has neither ends at once).
-        $null = [Mouse6]::SetForegroundWindow($form.Handle); $null = $form.Activate(); [Windows.Forms.Application]::DoEvents()
-        $null = [Mouse6]::SetCursorPos(60, 40); Start-Sleep -Milliseconds 300
-        [Mouse6]::Down(); Start-Sleep -Milliseconds 100; [Mouse6]::Up(); Start-Sleep -Milliseconds 300
-        [Windows.Forms.Application]::DoEvents()
-        [Mouse6]::Down(); Start-Sleep -Milliseconds 200
-        $script:steps = 0
-        $timer = New-Object Windows.Forms.Timer; $timer.Interval = 30
-        $timer.Add_Tick({
-            $script:steps++
-            $t = [math]::Min(1.0, $script:steps / 25.0)
-            $null = [Mouse6]::SetCursorPos([int](60 + ($target[0] - 60) * $t), [int](40 + ($target[1] - 40) * $t))
-            if ($script:steps -eq 40) { [Mouse6]::Up() }
-        })
-        $timer.Start()
-        $effect = [string]$form.DoDragDrop($data_object, [Windows.Forms.DragDropEffects]::Copy)
-        $timer.Stop(); [Mouse6]::Up()
-        Write-Host "  attempt ${attempt}: the drag ended with effect $effect after $($script:steps) timer ticks"
-        if ($effect -eq 'None') { Start-Sleep -Milliseconds 500 }
-    }
-    $form.Close()
-    $got = $false
-    for ($i = 0; $i -lt 40 -and -not $got; $i++) { $got = ((Get-Content -LiteralPath $log -Raw) -match 'downloaded dropped.txt'); if (-not $got) { Start-Sleep -Milliseconds 250 } }
-    Check 'the phone was offered the dropped file and downloaded it' $got
-    if (-not $got) {
-        Write-Host '  --- the end of the PC log:'; Get-Content -LiteralPath (Join-Path $data 'logs\kin.log') -ErrorAction SilentlyContinue | Select-Object -Last 8 | ForEach-Object { Write-Host "    $_" }
-        Write-Host '  --- the end of the phone log:'; Get-Content -LiteralPath $log -ErrorAction SilentlyContinue | Select-Object -Last 5 | ForEach-Object { Write-Host "    $_" }
-    }
-    Check 'the downloaded bytes are the file''s' ((Test-Path (Join-Path $save 'dropped.txt')) -and ((Get-FileHash $file).Hash -eq (Get-FileHash (Join-Path $save 'dropped.txt')).Hash))
+    Drop-File $file 'on Home'
+    # 2. the same window switched to History (the page switch of Kin.exe --history is in place: no new window), then a drop: the drag that enters switches it back to Home
+    $file2 = Join-Path $work 'dropped-on-history.txt'
+    [IO.File]::WriteAllText($file2, "dropped while History was showing`n")
+    Invoke-Kin --history
+    Start-Sleep -Seconds 2
+    Drop-File $file2 'on History'
 }
 finally {
     Stop-OwnProcess $phoneProc          # the fake phone this script started (by ID, never by name)
     Stop-DevKin 10                      # --quit to our data directory; a hung process of ours is stopped by its ID
-    Remove-DevDataDir $work   # (the web view of the drop window holds files in it for a moment after Kin has quit)
+    Remove-DevDataDir $work   # (the web view of the main window holds files in it for a moment after Kin has quit)
 }
 if (-not $ok) { Write-Host 'FAILED'; exit 1 } else { Write-Host 'all checks passed' }

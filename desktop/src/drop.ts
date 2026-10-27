@@ -9,7 +9,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { actionButton, el, errorText, flash, sensitiveWhilePausedText, size } from "./dom";
 import { boxArt, icon, mediaArt, phoneArt } from "./icons";
-import { mountShell } from "./shell";
+import type { PageHost } from "./shell";
 
 type Transfer = {
   id: string;
@@ -74,8 +74,7 @@ function describe(t: Transfer): string {
   return `${size(t.totalBytes)}${t.error && t.status !== "done" ? ` · ${errorText(t.error)}` : ""}`;
 }
 
-export function startDropWindow(root: HTMLElement): void {
-  const shell = mountShell(root, "drop");
+export function startDropPage(host: PageHost): void {
   const page = document.documentElement;
   const note = el("p", { className: "flash" });
   let last: View | null = null;
@@ -93,7 +92,7 @@ export function startDropWindow(root: HTMLElement): void {
   const seeAll = el("a", { href: "#" }, "See all");
   seeAll.addEventListener("click", (e) => {
     e.preventDefault();
-    void invoke("open_window", { name: "history" });
+    host.go("history");
   });
   const recent = el("section", { className: "card precent" }, el("div", { className: "sec-head" }, el("b", {}, "Recent transfers"), seeAll), list);
   const zoneTitle = el("h3", {}, "Drop files here");
@@ -113,7 +112,7 @@ export function startDropWindow(root: HTMLElement): void {
   zone.addEventListener("keydown", (e) => {
     if (e.key === "Enter" || e.key === " ") choose();
   });
-  shell.body.append(note, el("div", { className: "cols" }, el("div", { className: "lcol" }, hero, media, recent), zone));
+  host.body.append(note, el("div", { className: "cols" }, el("div", { className: "lcol" }, hero, media, recent), zone));
 
   // ----- the actions: Ring phone, Pause, Resume and the Send menu
   const act = async (command: string, args: Record<string, unknown>) => {
@@ -141,9 +140,11 @@ export function startDropWindow(root: HTMLElement): void {
   sendButton.append(icon("chev-d", "s16"));
   const pauseWrap = el("div", { className: "menuwrap" }, pauseButton);
   const sendWrap = el("div", { className: "menuwrap" }, sendButton);
-  shell.acts.append(ringButton, pauseWrap, resumeButton, sendWrap);
+  host.acts.append(ringButton, pauseWrap, resumeButton, sendWrap);
 
   let openMenu: HTMLElement | null = null;
+  /** Closes the Send a text dialog if it is open. */
+  let closeCompose: (() => void) | null = null;
   const closeMenu = () => {
     openMenu?.remove();
     openMenu = null;
@@ -179,6 +180,7 @@ export function startDropWindow(root: HTMLElement): void {
 
   // ----- the Text box of the Send menu
   const compose = () => {
+    closeCompose?.();
     const phone = last?.phone ?? null;
     const text = el("textarea", { rows: 5, placeholder: "Type a note or paste a link", ariaLabel: "Text to send" });
     const count = el("span", { className: "count" }, "0 characters");
@@ -188,7 +190,9 @@ export function startDropWindow(root: HTMLElement): void {
     const close = () => {
       scrim.remove();
       document.removeEventListener("keydown", onKey);
+      if (closeCompose === close) closeCompose = null;
     };
+    closeCompose = close;
     const submit = async () => {
       if (!text.value.trim() || send.disabled) return;
       send.disabled = true;
@@ -260,7 +264,7 @@ export function startDropWindow(root: HTMLElement): void {
     heroHint.replaceChildren(...lines.map((l) => el("div", {}, l)));
     heroHint.hidden = lines.length === 0;
 
-    shell.sub.textContent = name ? `${name} and this PC, side by side.` : "Pair a phone to start sending.";
+    host.sub.textContent = name ? `${name} and this PC, side by side.` : "Pair a phone to start sending.";
     ringButton.replaceChildren(icon("ring"), p.ring.active ? "Stop ringing" : "Ring phone");
     ringButton.disabled = !name || (!p.ring.active && !p.ring.can);
     ringButton.title = !p.ring.active && !p.ring.can ? (p.ring.reason ?? "") : "";
@@ -372,7 +376,7 @@ export function startDropWindow(root: HTMLElement): void {
 
   const draw = (view: View) => {
     last = view;
-    shell.setPc(view.pcName, view.version);
+    host.setPc(view.pcName, view.version);
     drawHero(view);
     zoneText.textContent = !view.phone
       ? "No phone is paired yet."
@@ -396,17 +400,24 @@ export function startDropWindow(root: HTMLElement): void {
     }
   };
 
-  // Files dragged from Explorer onto the window. The page gets the paths from Tauri's event, never from the DOM.
+  // Files dragged from Explorer onto the window. The page gets the paths from Tauri's event, never from the DOM. A drag that enters while another page shows
+  // switches to Home, so the person sees the drop zone and the progress.
   void getCurrentWebview().onDragDropEvent((event) => {
     const type = event.payload.type;
+    if (type === "enter" && !host.visible()) host.go("home");
     if (type === "enter" || type === "over") zone.classList.add("over");
     else zone.classList.remove("over");
     if (type === "drop" && event.payload.paths.length > 0) void invoke("send_files", { paths: event.payload.paths });
   });
 
-  void listen("transfers-changed", () => void refresh());
-  void listen("media-changed", () => void refresh());
-  // A transfer's numbers move all the time and a change of state is announced; this keeps the bars moving smoothly.
-  window.setInterval(() => void refresh(), 700);
-  void refresh();
+  // A hidden page asks for nothing: what it missed is read when it is shown.
+  void listen("transfers-changed", () => host.visible() && void refresh());
+  void listen("media-changed", () => host.visible() && void refresh());
+  // A transfer's numbers move all the time and a change of state is announced; this keeps the bars moving smoothly (while the page shows).
+  host.every(700, () => void refresh());
+  host.onShow(() => void refresh());
+  host.onHide(() => {
+    closeMenu();
+    closeCompose?.();
+  });
 }
