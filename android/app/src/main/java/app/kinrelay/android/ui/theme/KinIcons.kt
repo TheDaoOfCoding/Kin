@@ -51,6 +51,8 @@ object KinIcons {
     val Shield: ImageVector by lazy { icon("Shield", line("M12 3 5 5.8v5.7c0 4.3 2.9 7.8 7 9.5 4.1-1.7 7-5.2 7-9.5V5.8L12 3z"), line("m9 12 2 2 4-4")) }
     val Sun: ImageVector by lazy { icon("Sun", line("M8 12A4 4 0 1 0 16 12A4 4 0 1 0 8 12Z"), line("M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4")) }
     val Moon: ImageVector by lazy { icon("Moon", line("M19.5 14.6A7.8 7.8 0 1 1 9.4 4.5a6.3 6.3 0 0 0 10.1 10.1z")) }
+    val Filter: ImageVector by lazy { icon("Filter", line("M4 5h16l-6.2 7.4V19l-3.6 1.5v-8.1L4 5z")) }
+    val Search: ImageVector by lazy { icon("Search", line("M4.5 11A6.5 6.5 0 1 0 17.5 11A6.5 6.5 0 1 0 4.5 11Z"), line("m16 16 4.5 4.5")) }
     val Auto: ImageVector by lazy { icon("Auto", line("M3.5 12A8.5 8.5 0 1 0 20.5 12A8.5 8.5 0 1 0 3.5 12Z"), filled("M12 3.5v17a8.5 8.5 0 0 0 0-17z")) }
 
     private class Part(val data: String, val fill: Boolean)

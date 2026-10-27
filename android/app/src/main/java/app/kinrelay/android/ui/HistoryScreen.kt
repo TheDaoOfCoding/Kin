@@ -1,9 +1,7 @@
 package app.kinrelay.android.ui
 
-import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -12,12 +10,11 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
-import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -25,12 +22,11 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -45,7 +41,8 @@ import app.kinrelay.android.ui.theme.KinTheme
 import app.kinrelay.android.ui.theme.KinTint
 
 /**
- * The history (milestone 1.4): what was sent to and received from the PC, both directions, newest first (the last 500), in days. A sensitive text
+ * The history (milestone 1.4): what was sent to and received from the PC, both directions, newest first (the last 500), in days. **Filter** (a bottom
+ * sheet) searches, picks types and direction, and sorts; the choices show as chips under the title. A sensitive text
  * and the automatic clipboard sync never appear. Tap a finished item to open the file or copy the text; **Retry** on a failed send, **Cancel**
  * on one that still waits. [onSend] is the "Send something" button of the empty state; without it the button is left out.
  */
@@ -61,9 +58,14 @@ fun HistoryScreen(
     /** Room left under the list for the floating nav. */
     bottomPadding: Dp = 0.dp,
 ) {
-    var filter by rememberSaveable { mutableStateOf(HistoryFilter.ALL) }
+    var query by rememberSaveable(stateSaver = historyQuerySaver) { mutableStateOf(HistoryQuery()) }
+    var sheetOpen by rememberSaveable { mutableStateOf(false) }
+    val shown = remember(items, query) { HistoryView.apply(items, query) }
     Column(modifier.fillMaxSize().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        PageTitle("History", Modifier.padding(top = 12.dp, bottom = 2.dp))
+        Row(Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+            PageTitle("History", Modifier.weight(1f))
+            if (items.isNotEmpty()) KinButton("Filter", { sheetOpen = true }, style = KinButtonStyle.SOFT, icon = KinIcons.Filter, small = true)
+        }
         if (items.isEmpty()) {
             HistoryEmpty(
                 title = "Nothing here yet", text = "Things you send and receive will show up here, newest first.", onSend = onSend,
@@ -71,53 +73,56 @@ fun HistoryScreen(
             )
             return@Column
         }
-        FilterRow(filter) { filter = it }
-        val shown = items.filter(filter::matches)
+        ChipsRow(query) { query = it }
         if (shown.isEmpty()) {
             HistoryEmpty(
-                title = "Nothing here", text = "No ${filter.label.lowercase()} items yet.", onSend = null,
+                title = "Nothing matches.", text = "Try other words or fewer filters.", onSend = null,
                 modifier = Modifier.weight(1f).padding(bottom = bottomPadding),
+                action = "Clear filters" to { query = HistoryQuery() },
             )
-            return@Column
-        }
-        LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            groups(HistoryView.group(shown, nowMillis), nowMillis, onOpen, onRetry, onCancel)
-            item { Spacer(Modifier.height(bottomPadding)) }
+        } else {
+            LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                if (HistoryView.byDay(query.sort)) {
+                    groups(HistoryView.group(shown, nowMillis), nowMillis, onOpen, onRetry, onCancel)
+                } else {
+                    item(key = "all") { KinCard { Rows(shown, nowMillis, onOpen, onRetry, onCancel) } }
+                }
+                item { Spacer(Modifier.height(bottomPadding)) }
+            }
         }
     }
+    if (sheetOpen) HistoryFilterSheet(query, shown = shown.size, total = items.size, onChange = { query = it }, onDismiss = { sheetOpen = false })
 }
 
 /** The empty state: the happy box (Warm) or a plain icon (Simple), a title, a line, and a button to send the first thing. */
 @Composable
-private fun HistoryEmpty(title: String, text: String, onSend: (() -> Unit)?, modifier: Modifier = Modifier) {
+private fun HistoryEmpty(title: String, text: String, onSend: (() -> Unit)?, modifier: Modifier = Modifier, action: Pair<String, () -> Unit>? = null) {
     Column(modifier.fillMaxWidth().padding(horizontal = 22.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
         EmptyArt(Modifier.size(170.dp, 128.dp))
         Spacer(Modifier.height(14.dp))
         Text(title, style = MaterialTheme.typography.titleLarge.copy(fontSize = 19.sp), color = KinTheme.colors.onSurface, textAlign = TextAlign.Center)
         Text(text, style = MaterialTheme.typography.bodyMedium, color = KinTheme.colors.onSurfaceVariant, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 6.dp, bottom = 18.dp))
         if (onSend != null) KinButton("Send something", onSend, icon = KinIcons.Send)
+        if (action != null) KinButton(action.first, action.second, style = KinButtonStyle.SOFT)
     }
 }
 
+/** The choices that are on, as chips with an x that resets that one choice; "Clear" resets all of them when there are two or more. */
 @Composable
-private fun FilterRow(selected: HistoryFilter, onSelect: (HistoryFilter) -> Unit) {
+private fun ChipsRow(query: HistoryQuery, onChange: (HistoryQuery) -> Unit) {
+    val chips = HistoryView.chips(query)
+    if (chips.isEmpty()) return
     val colors = KinTheme.colors
-    val shape = KinTheme.style.full
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        HistoryFilter.entries.forEach { filter ->
-            val on = filter == selected
-            Row(
-                Modifier
-                    .heightIn(min = 34.dp)
-                    .clip(shape)
-                    .let { if (on) it.background(colors.primaryContainer) else it.background(colors.surface).border(BorderStroke(1.dp, colors.outline), shape) }
-                    .selectable(selected = on, role = Role.Tab, onClick = { onSelect(filter) })
-                    .padding(horizontal = 14.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically,
-            ) {
-                if (on) Icon(KinIcons.Check, contentDescription = null, tint = colors.onPrimaryContainer, modifier = Modifier.size(15.dp))
-                Text(filter.label, style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp), color = if (on) colors.onPrimaryContainer else colors.onSurfaceVariant)
-            }
+    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+        for (chip in chips) {
+            KinChip(
+                chip.label, colors.primaryContainer, colors.onPrimaryContainer,
+                Modifier.clickable(onClickLabel = "Remove ${chip.label}", role = Role.Button) { onChange(chip.remove(query)) },
+                leading = { Icon(KinIcons.X, contentDescription = null, tint = colors.onPrimaryContainer, modifier = Modifier.size(13.dp)) },
+            )
+        }
+        if (chips.size >= 2) {
+            KinChip("Clear", colors.surfaceContainerHigh, colors.onSurfaceVariant, Modifier.clickable(role = Role.Button) { onChange(HistoryQuery()) })
         }
     }
 }
@@ -132,13 +137,17 @@ private fun LazyListScope.groups(
     groups.forEach { group ->
         item(key = "g:" + group.label) { GroupLabel(group.label) }
         item(key = "c:" + group.label) {
-            KinCard {
-                group.items.forEachIndexed { index, item ->
-                    if (index > 0) HorizontalDivider(color = KinTheme.colors.outlineVariant)
-                    HistoryRow(item, nowMillis, onOpen, onRetry, onCancel)
-                }
-            }
+            KinCard { Rows(group.items, nowMillis, onOpen, onRetry, onCancel) }
         }
+    }
+}
+
+/** The rows of one card, a divider between them. */
+@Composable
+private fun Rows(items: List<HistoryItem>, nowMillis: Long, onOpen: (HistoryItem) -> Unit, onRetry: (HistoryItem) -> Unit, onCancel: (HistoryItem) -> Unit) {
+    items.forEachIndexed { index, item ->
+        if (index > 0) HorizontalDivider(color = KinTheme.colors.outlineVariant)
+        HistoryRow(item, nowMillis, onOpen, onRetry, onCancel)
     }
 }
 

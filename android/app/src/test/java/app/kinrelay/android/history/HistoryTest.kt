@@ -231,4 +231,73 @@ class HistoryTest {
         assertEquals(HistoryStatus.FAILED, old.status)
         assertTrue(items.single { it.id == "new" }.canCancel)
     }
+
+    // ---------------------------------------------------------------- types for the Filter (plan 01, C3)
+
+    @Test
+    fun theSampleNamesAreClassifiedLikeOnThePc() {
+        // The same samples as the PC's tests (history.rs): the two tables must stay equal.
+        fun type(name: String) = HistoryTypes.classify(name, null)
+        assertEquals(HistoryType.PHOTO, type("IMG_1.JPG"))
+        assertEquals(HistoryType.VIDEO, type("clip.MOV"))
+        assertEquals(HistoryType.DOCUMENT, type("Report.pdf"))
+        assertEquals(HistoryType.APP, type("kin.apk"))
+        assertEquals(HistoryType.OTHER, type("song.mp3"))
+        assertEquals(HistoryType.OTHER, type("archive.tar.gz"))
+        assertEquals(HistoryType.OTHER, type("README"))
+        assertEquals(HistoryType.OTHER, type("photo.jpeg.exe"))
+        assertEquals(HistoryType.OTHER, type("trailing."))
+    }
+
+    @Test
+    fun everyExtensionOfTheTableIsInItsType() {
+        val table = mapOf(
+            HistoryType.PHOTO to "jpg jpeg png gif webp heic heif bmp avif tif tiff",
+            HistoryType.VIDEO to "mp4 mov mkv webm avi m4v 3gp wmv",
+            HistoryType.DOCUMENT to "pdf doc docx odt rtf txt md xls xlsx ods csv ppt pptx odp epub",
+            HistoryType.APP to "apk apks xapk",
+        )
+        for ((type, list) in table) for (ext in list.split(' ')) assertEquals(".$ext", type, HistoryTypes.classify("a.$ext", null))
+    }
+
+    @Test
+    fun theMimeWinsOverAMissingOrOtherExtension() {
+        assertEquals(HistoryType.PHOTO, HistoryTypes.classify("noextension", "image/png"))
+        assertEquals(HistoryType.VIDEO, HistoryTypes.classify("clip.bin", "video/mp4"))
+        assertEquals(HistoryType.APP, HistoryTypes.classify("download", "application/vnd.android.package-archive"))
+        assertEquals("an octet-stream falls back to the extension", HistoryType.DOCUMENT, HistoryTypes.classify("Report.pdf", "application/octet-stream"))
+        assertEquals("a document MIME is not used", HistoryType.OTHER, HistoryTypes.classify("noextension", "application/pdf"))
+    }
+
+    @Test
+    fun aTransfersTypesCoverAllItsFilesAndItKeepsEveryName() {
+        val files = listOf(file("m", "a.jpg", 0, mime = "image/jpeg"), file("m", "b.pdf", 1, mime = "application/pdf"), file("m", "c.zip", 2, mime = "application/zip"), file("m", "d.png", 3, mime = "image/png"))
+        val item = HistoryBuilder.build(listOf(transfer("m", 5)), files, emptyList()).single()
+        assertEquals(setOf(HistoryType.PHOTO, HistoryType.DOCUMENT, HistoryType.OTHER), item.types)
+        assertEquals(listOf("a.jpg", "b.pdf", "c.zip", "d.png"), item.names)
+        assertFalse(item.isLink)
+    }
+
+    @Test
+    fun theNamesFollowTheFinalNameAndTheOrdinalNotTheOrderOfTheRows() {
+        val renamed = file("n", "photo.jpg", 1).copy(finalName = "photo (1).jpg")
+        val item = HistoryBuilder.build(listOf(transfer("n", 5)), listOf(renamed, file("n", "first.png", 0)), emptyList()).single()
+        assertEquals(listOf("first.png", "photo (1).jpg"), item.names)
+    }
+
+    @Test
+    fun textsAndLinksAndAlertsHaveTheirOwnTypes() {
+        val plain = text("t", 5)
+        val link = text("l", 4).copy(kind = app.kinrelay.android.data.TextKind.LINK, title = "Kin")
+        val marked = text("u", 3, body = "https://example.com").copy(isUrl = true)
+        val alert = text("a", 2, direction = "down", body = "Done", source = TextSource.PC).copy(kind = app.kinrelay.android.data.TextKind.ALERT)
+        val items = HistoryBuilder.build(emptyList(), emptyList(), listOf(plain, link, marked, alert)).associateBy { it.id }
+        assertEquals(setOf(HistoryType.TEXT), items.getValue("t").types)
+        assertEquals(setOf(HistoryType.LINK), items.getValue("l").types)
+        assertEquals(setOf(HistoryType.LINK), items.getValue("u").types)
+        assertEquals("an alert counts as a text", setOf(HistoryType.TEXT), items.getValue("a").types)
+        assertTrue(items.getValue("l").isLink && items.getValue("u").isLink)
+        assertFalse(items.getValue("t").isLink || items.getValue("a").isLink)
+        assertTrue(items.getValue("t").names.isEmpty())
+    }
 }
